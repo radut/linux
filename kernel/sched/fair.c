@@ -130,6 +130,13 @@ int __weak arch_asym_cpu_priority(int cpu)
  * (default: 5 msec, units: microseconds)
  */
 static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
+
+/*
+ * Enforce cpu.max as a limit on the number of CPUs a group runs on at once
+ * instead of a time quota, see account_cfs_rq_width(). Applies to a group
+ * when its bandwidth is next written.
+ */
+static unsigned int sysctl_sched_cfs_bandwidth_width;
 #endif
 
 #ifdef CONFIG_NUMA_BALANCING
@@ -147,6 +154,15 @@ static const struct ctl_table sched_fair_sysctls[] = {
 		.mode           = 0644,
 		.proc_handler   = proc_dointvec_minmax,
 		.extra1         = SYSCTL_ONE,
+	},
+	{
+		.procname       = "sched_cfs_bandwidth_width",
+		.data           = &sysctl_sched_cfs_bandwidth_width,
+		.maxlen         = sizeof(unsigned int),
+		.mode           = 0644,
+		.proc_handler   = proc_douintvec_minmax,
+		.extra1         = SYSCTL_ZERO,
+		.extra2         = SYSCTL_ONE,
 	},
 #endif
 #ifdef CONFIG_NUMA_BALANCING
@@ -6780,6 +6796,29 @@ void cfs_bandwidth_usage_inc(void) {}
 void cfs_bandwidth_usage_dec(void) {}
 #endif /* !CONFIG_JUMP_LABEL */
 
+/* Enabled while any group is in width mode */
+static DEFINE_STATIC_KEY_FALSE(cfs_width_key);
+
+static inline bool cfs_width_used(void)
+{
+	return static_branch_unlikely(&cfs_width_key);
+}
+
+void cfs_width_usage_inc(void)
+{
+	static_branch_inc_cpuslocked(&cfs_width_key);
+}
+
+void cfs_width_usage_dec(void)
+{
+	static_branch_dec_cpuslocked(&cfs_width_key);
+}
+
+bool cfs_width_mode(void)
+{
+	return READ_ONCE(sysctl_sched_cfs_bandwidth_width);
+}
+
 static inline u64 sched_cfs_bandwidth_slice(void)
 {
 	return (u64)sysctl_sched_cfs_bandwidth_slice * NSEC_PER_USEC;
@@ -6844,9 +6883,252 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 }
 
 static bool throttle_cfs_rq(struct cfs_rq *cfs_rq);
+static void __throttle_cfs_rq(struct cfs_rq *cfs_rq);
+
+/*
+ * Width mode
+ *
+ * With sysctl_sched_cfs_bandwidth_width set, the quota / period L of a group
+ * is enforced as a limit on the number of CPUs which run tasks of the group at
+ * the same time instead of as CPU time per period. A cfs_rq of the group needs
+ * a slot to run: it takes one when its first entity is picked (cfs_rq->h_curr
+ * gets set) and gives it back in put_prev_task_fair() when the group stops
+ * running on that CPU. floor(L) slots have no time limit. A fractional L adds
+ * one more slot, which is rate limited: its holder is charged against a
+ * budget of (L - floor(L)) * window every window of min(period,
+ * CFS_WIDTH_WINDOW), using the runtime machinery.
+ *
+ * A cfs_rq which finds no free slot is throttled the usual way and waits on
+ * cfs_b->throttled_cfs_rq. A throttled cfs_rq holds no slot. Giving a slot
+ * back kicks the slack timer, which unthrottles as many waiters as there are
+ * free slots, in FIFO order; the period timer does the same every window. An
+ * unthrottled waiter takes a slot when its next task is picked; if someone
+ * else took it first, it is throttled and queued again at the head.
+ *
+ * While other cfs_rqs wait, a cfs_rq gives its slot up and queues at the tail
+ * once it has run for a turn of sched_cfs_bandwidth_slice() per runnable task
+ * of the group on its CPU, so that the CPUs, and roughly the tasks, take
+ * turns. A cfs_rq throttled before the end of its turn queues at the head.
+ * A task needs a slot in each limited group it is in.
+ */
+#define CFS_WIDTH_WINDOW	(10 * NSEC_PER_MSEC)
+
+enum {
+	CFS_WIDTH_NONE,
+	CFS_WIDTH_SLOT,		/* one of the floor(L) slots */
+	CFS_WIDTH_EXTRA,	/* the rate limited slot */
+};
+
+static int cfs_width_free(struct cfs_bandwidth *cfs_b)
+{
+	int free = max(cfs_b->width_slots - cfs_b->width_active, 0);
+
+	if (cfs_b->width_extra && !cfs_b->width_extra_busy && cfs_b->runtime)
+		free++;
+
+	return free;
+}
+
+static void __cfs_width_release(struct cfs_bandwidth *cfs_b, struct cfs_rq *cfs_rq)
+{
+	lockdep_assert_held(&cfs_b->lock);
+
+	if (cfs_rq->width_slot == CFS_WIDTH_SLOT) {
+		cfs_b->width_active--;
+	} else if (cfs_rq->width_slot == CFS_WIDTH_EXTRA) {
+		cfs_b->width_extra_busy = 0;
+		/* return what is left, a debt stays with the cfs_rq */
+		if (cfs_rq->runtime_remaining > 0) {
+			cfs_b->runtime = min(cfs_b->runtime + cfs_rq->runtime_remaining,
+					     cfs_b->width_budget);
+			cfs_rq->runtime_remaining = 0;
+		}
+	}
+	cfs_rq->width_slot = CFS_WIDTH_NONE;
+}
+
+/* Have the slack timer hand free slots to waiters */
+static void cfs_width_kick(struct cfs_bandwidth *cfs_b)
+{
+	lockdep_assert_held(&cfs_b->lock);
+
+	if (cfs_b->slack_started || list_empty(&cfs_b->throttled_cfs_rq) ||
+	    !cfs_width_free(cfs_b))
+		return;
+
+	cfs_b->slack_started = true;
+	hrtimer_start(&cfs_b->slack_timer, 0, HRTIMER_MODE_REL);
+}
+
+/* Returns true if @cfs_rq holds a slot it can run on */
+static bool cfs_width_acquire(struct cfs_bandwidth *cfs_b, struct cfs_rq *cfs_rq)
+{
+	u8 slot = cfs_rq->width_slot;
+
+	lockdep_assert_held(&cfs_b->lock);
+
+	if (slot == CFS_WIDTH_SLOT)
+		return true;
+
+	if (cfs_b->width_active < cfs_b->width_slots) {
+		/* also trades the rate limited slot for a full one */
+		__cfs_width_release(cfs_b, cfs_rq);
+		cfs_b->width_active++;
+		cfs_rq->width_slot = CFS_WIDTH_SLOT;
+	} else {
+		if (!cfs_b->width_extra)
+			return false;
+		if (slot != CFS_WIDTH_EXTRA && cfs_b->width_extra_busy)
+			return false;
+		if (cfs_rq->runtime_remaining <= 0 &&
+		    !__assign_cfs_rq_runtime(cfs_b, cfs_rq,
+					     sched_cfs_bandwidth_slice()))
+			return false;
+		cfs_b->width_extra_busy = 1;
+		cfs_rq->width_slot = CFS_WIDTH_EXTRA;
+	}
+
+	cfs_rq->width_woken = 0;
+
+	return true;
+}
+
+static u64 cfs_width_turn(struct cfs_rq *cfs_rq)
+{
+	return sched_cfs_bandwidth_slice() * max(cfs_rq->h_nr_runnable, 1U);
+}
+
+/*
+ * Throttle @cfs_rq unless it can take a slot or, when @rotate, unless nobody
+ * waits, and pass its slot on.
+ */
+static bool throttle_cfs_rq_width(struct cfs_rq *cfs_rq, bool rotate)
+{
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+
+	scoped_guard(raw_spinlock, &cfs_b->lock) {
+		if (rotate ? list_empty(&cfs_b->throttled_cfs_rq) :
+			     cfs_width_acquire(cfs_b, cfs_rq))
+			return false;
+
+		if (cfs_rq->width_woken ||
+		    (!rotate && cfs_rq->width_used &&
+		     cfs_rq->width_used < cfs_width_turn(cfs_rq))) {
+			list_add_rcu(&cfs_rq->throttled_list,
+				     &cfs_b->throttled_cfs_rq);
+		} else {
+			list_add_tail_rcu(&cfs_rq->throttled_list,
+					  &cfs_b->throttled_cfs_rq);
+			cfs_rq->width_used = 0;
+		}
+		cfs_rq->width_woken = 0;
+
+		__cfs_width_release(cfs_b, cfs_rq);
+		cfs_width_kick(cfs_b);
+		start_cfs_bandwidth(cfs_b);
+	}
+
+	__throttle_cfs_rq(cfs_rq);
+
+	return true;
+}
+
+/*
+ * Called from update_curr() with the time cfs_rq->h_curr ran, and with 0 when
+ * an entity of @cfs_rq is picked or enqueued. Returns true if throttled.
+ */
+static bool account_cfs_rq_width(struct cfs_rq *cfs_rq, u64 delta_exec)
+{
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+
+	if (cfs_rq->throttled)
+		return true;
+
+	/* only a running cfs_rq needs a slot */
+	if (!cfs_rq->h_curr)
+		return false;
+
+	if (cfs_rq->width_slot)
+		cfs_rq->width_used += delta_exec;
+	if (cfs_rq->width_slot == CFS_WIDTH_EXTRA)
+		cfs_rq->runtime_remaining -= delta_exec;
+
+	if (cfs_rq->width_slot == CFS_WIDTH_NONE ||
+	    (cfs_rq->width_slot == CFS_WIDTH_EXTRA &&
+	     cfs_rq->runtime_remaining <= 0))
+		return throttle_cfs_rq_width(cfs_rq, false);
+
+	/* take turns with the waiters */
+	if (delta_exec && !list_empty(&cfs_b->throttled_cfs_rq) &&
+	    cfs_rq->width_used >= cfs_width_turn(cfs_rq))
+		return throttle_cfs_rq_width(cfs_rq, true);
+
+	return false;
+}
+
+static void __cfs_width_put(struct cfs_rq *cfs_rq)
+{
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+
+	guard(raw_spinlock)(&cfs_b->lock);
+	__cfs_width_release(cfs_b, cfs_rq);
+	cfs_width_kick(cfs_b);
+}
+
+/* @cfs_rq stopped running on its CPU, give its slot back */
+static __always_inline void cfs_width_put(struct cfs_rq *cfs_rq)
+{
+	if (cfs_width_used() && cfs_rq->width_slot)
+		__cfs_width_put(cfs_rq);
+}
+
+/* Set up width mode from cfs_b->quota and cfs_b->period */
+void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width)
+{
+	u64 period = ktime_to_ns(cfs_b->period), window, slots;
+
+	lockdep_assert_held(&cfs_b->lock);
+
+	cfs_b->width = width;
+	cfs_b->width_slots = 0;
+	cfs_b->width_extra = 0;
+	cfs_b->width_budget = 0;
+	if (!width)
+		return;
+
+	slots = div64_u64(cfs_b->quota, period);
+	window = min_t(u64, period, CFS_WIDTH_WINDOW);
+	cfs_b->width_slots = min_t(u64, slots, INT_MAX);
+	cfs_b->width_window = ns_to_ktime(window);
+	if (slots < INT_MAX)
+		cfs_b->width_budget = mul_u64_u64_div_u64(cfs_b->quota - slots * period,
+							  window, period);
+	cfs_b->width_extra = cfs_b->width_budget > 0;
+	cfs_b->runtime = cfs_b->width_budget;
+	cfs_b->runtime_snap = cfs_b->runtime;
+}
+
+/* Called with the rq lock held, after cfs_width_config() */
+void cfs_width_config_rq(struct cfs_rq *cfs_rq, bool width)
+{
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+
+	cfs_rq->width_enabled = width;
+	cfs_rq->width_used = 0;
+	cfs_rq->width_woken = 0;
+	if (!cfs_rq->width_slot)
+		return;
+
+	/* taken again on the next update_curr() if still running */
+	guard(raw_spinlock)(&cfs_b->lock);
+	__cfs_width_release(cfs_b, cfs_rq);
+}
 
 static bool __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
 {
+	if (cfs_width_used() && cfs_rq->width_enabled)
+		return account_cfs_rq_width(cfs_rq, delta_exec);
+
 	/* dock delta_exec before expiring quota (as it could span periods) */
 	cfs_rq->runtime_remaining -= delta_exec;
 
@@ -7158,7 +7440,6 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
 	struct sched_entity *curr = cfs_rq->h_curr;
-	struct rq *rq = rq_of(cfs_rq);
 
 	scoped_guard(raw_spinlock, &cfs_b->lock) {
 		u64 target_runtime = 1;
@@ -7195,6 +7476,16 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 				  &cfs_b->throttled_cfs_rq);
 	}
 
+	__throttle_cfs_rq(cfs_rq);
+
+	return true;
+}
+
+static void __throttle_cfs_rq(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->h_curr;
+	struct rq *rq = rq_of(cfs_rq);
+
 	/* freeze hierarchy runnable averages while throttled */
 	scoped_guard(rcu)
 		walk_tg_tree_from(cfs_rq->tg, tg_throttle_down, tg_nop, (void *)rq);
@@ -7215,8 +7506,6 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	 */
 	if (curr && curr->on_rq)
 		task_throttle_setup_work(rq->donor);
-
-	return true;
 }
 
 void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
@@ -7238,7 +7527,8 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	 * checking runtime remaining.
 	 */
 	update_curr(cfs_rq);
-	if (cfs_rq->runtime_enabled && cfs_rq->runtime_remaining <= 0)
+	if (cfs_rq->runtime_enabled && !cfs_rq->width_enabled &&
+	    cfs_rq->runtime_remaining <= 0)
 		return;
 
 	cfs_rq->throttled = 0;
@@ -7255,6 +7545,12 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	/* update hierarchical throttle state */
 	walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
+
+	/* nothing to run here, let another waiter have the slot */
+	if (cfs_rq->width_enabled && !cfs_rq->h_nr_queued) {
+		scoped_guard(raw_spinlock, &cfs_b->lock)
+			cfs_width_kick(cfs_b);
+	}
 
 	if (!cfs_rq->load.weight) {
 		if (!cfs_rq->on_list)
@@ -7364,7 +7660,7 @@ static bool distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
 
 		guard(rq_lock_irqsave)(rq);
 
-		if (!cfs_rq_throttled(cfs_rq))
+		if (!cfs_rq_throttled(cfs_rq) || cfs_rq->width_enabled)
 			continue;
 
 		/* Already queued for async unthrottle */
@@ -7424,6 +7720,84 @@ static bool distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
 	}
 
 	return throttled;
+}
+
+/* Unthrottle as many waiters as there are free slots, see cfs_width_kick() */
+static void distribute_cfs_width(struct cfs_bandwidth *cfs_b)
+{
+	int free, this_cpu = smp_processor_id();
+	bool unthrottle_local = false;
+	struct cfs_rq *cfs_rq;
+
+	scoped_guard(raw_spinlock_irqsave, &cfs_b->lock)
+		free = cfs_width_free(cfs_b);
+
+	guard(rcu)();
+
+	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
+				throttled_list) {
+		struct rq *rq = rq_of(cfs_rq);
+
+		if (free <= 0)
+			break;
+
+		guard(rq_lock_irqsave)(rq);
+
+		if (!cfs_rq_throttled(cfs_rq) || !cfs_rq->width_enabled)
+			continue;
+
+		free--;
+
+		/* Already queued for async unthrottle */
+		if (!list_empty(&cfs_rq->throttled_csd_list))
+			continue;
+
+		/* queues at the head if it loses the slot to someone else */
+		cfs_rq->width_woken = 1;
+
+		if (cpu_of(rq) != this_cpu) {
+			__unthrottle_cfs_rq_async(cfs_rq);
+			continue;
+		}
+
+		/* as in distribute_cfs_runtime() */
+		unthrottle_local = list_empty(&rq->cfsb_csd_list);
+		list_add_tail(&cfs_rq->throttled_csd_list, &rq->cfsb_csd_list);
+	}
+
+	if (unthrottle_local) {
+		scoped_guard(irqsave)
+			__cfsb_csd_unthrottle(cpu_rq(this_cpu));
+	}
+}
+
+/* Refill the budget of the rate limited slot and wake waiters if possible */
+static int do_cfs_width_period_timer(struct cfs_bandwidth *cfs_b, int overrun,
+				     unsigned long flags)
+	__must_hold(&cfs_b->lock)
+{
+	cfs_b->nr_periods += overrun;
+	cfs_b->runtime = cfs_b->width_budget;
+
+	if (list_empty(&cfs_b->throttled_cfs_rq)) {
+		if (cfs_b->idle)
+			return 1;
+		cfs_b->idle = 1;
+		return 0;
+	}
+
+	cfs_b->nr_throttled += overrun;
+	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+	distribute_cfs_width(cfs_b);
+	raw_spin_lock_irqsave(&cfs_b->lock, flags);
+	cfs_b->idle = 0;
+
+	return 0;
+}
+
+static inline ktime_t cfs_b_period(struct cfs_bandwidth *cfs_b)
+{
+	return cfs_b->width ? cfs_b->width_window : cfs_b->period;
 }
 
 /*
@@ -7565,7 +7939,8 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 	if (!cfs_bandwidth_used())
 		return;
 
-	if (!cfs_rq->runtime_enabled || cfs_rq->nr_queued)
+	if (!cfs_rq->runtime_enabled || cfs_rq->nr_queued ||
+	    cfs_rq->width_enabled)
 		return;
 
 	__return_cfs_rq_runtime(cfs_rq);
@@ -7650,6 +8025,13 @@ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
 	struct cfs_bandwidth *cfs_b =
 		container_of(timer, struct cfs_bandwidth, slack_timer);
 
+	if (READ_ONCE(cfs_b->width)) {
+		scoped_guard(raw_spinlock_irqsave, &cfs_b->lock)
+			cfs_b->slack_started = false;
+		distribute_cfs_width(cfs_b);
+		return HRTIMER_NORESTART;
+	}
+
 	do_sched_cfs_slack_timer(cfs_b);
 
 	return HRTIMER_NORESTART;
@@ -7666,9 +8048,15 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 	CLASS(raw_spinlock_irqsave, cfsb_guard)(&cfs_b->lock);
 
 	for (;;) {
-		overrun = hrtimer_forward_now(timer, cfs_b->period);
+		overrun = hrtimer_forward_now(timer, cfs_b_period(cfs_b));
 		if (!overrun)
 			break;
+
+		if (cfs_b->width) {
+			idle = do_cfs_width_period_timer(cfs_b, overrun,
+							 cfsb_guard.flags);
+			continue;
+		}
 
 		idle = do_sched_cfs_period_timer(cfs_b, overrun, cfsb_guard.flags);
 
@@ -7731,11 +8119,16 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *paren
 	hrtimer_setup(&cfs_b->slack_timer, sched_cfs_slack_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL);
 	cfs_b->slack_started = false;
+	cfs_b->width = 0;
+	cfs_b->width_active = 0;
+	cfs_b->width_extra_busy = 0;
 }
 
 static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 {
 	cfs_rq->runtime_enabled = 0;
+	cfs_rq->width_enabled = 0;
+	cfs_rq->width_slot = CFS_WIDTH_NONE;
 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
 	INIT_LIST_HEAD(&cfs_rq->throttled_csd_list);
 	INIT_LIST_HEAD(&cfs_rq->throttled_limbo_list);
@@ -7749,7 +8142,7 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 		return;
 
 	cfs_b->period_active = 1;
-	hrtimer_forward_now(&cfs_b->period_timer, cfs_b->period);
+	hrtimer_forward_now(&cfs_b->period_timer, cfs_b_period(cfs_b));
 	hrtimer_start_expires(&cfs_b->period_timer, HRTIMER_MODE_ABS_PINNED);
 }
 
@@ -7805,8 +8198,10 @@ static void __maybe_unused update_runtime_enabled(struct rq *rq)
 		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
 		struct cfs_rq *cfs_rq = tg_cfs_rq(tg, cpu_of(rq));
 
-		scoped_guard(raw_spinlock, &cfs_b->lock)
+		scoped_guard(raw_spinlock, &cfs_b->lock) {
 			cfs_rq->runtime_enabled = cfs_b->quota != RUNTIME_INF;
+			cfs_rq->width_enabled = cfs_b->width;
+		}
 	}
 }
 
@@ -7841,6 +8236,7 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
 		 * in take_cpu_down(), so we prevent new cfs throttling here.
 		 */
 		cfs_rq->runtime_enabled = 0;
+		cfs_rq->width_enabled = 0;
 
 		if (!cfs_rq_throttled(cfs_rq))
 			continue;
@@ -7902,6 +8298,7 @@ static bool account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec) { retu
 static void check_enqueue_throttle(struct cfs_rq *cfs_rq) {}
 static inline void sync_throttle(struct task_group *tg, int cpu) {}
 static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+static __always_inline void cfs_width_put(struct cfs_rq *cfs_rq) {}
 static void task_throttle_setup_work(struct task_struct *p) {}
 static bool task_is_throttled(struct task_struct *p) { return false; }
 static void dequeue_throttled_task(struct task_struct *p, int flags) {}
@@ -10357,6 +10754,8 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 			}
 		}
 #endif
+		/* the group stops running here unless @next is in it */
+		cfs_width_put(cfs_rq);
 		se = parent_entity(se);
 	}
 

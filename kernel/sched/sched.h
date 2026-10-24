@@ -465,6 +465,19 @@ struct cfs_bandwidth {
 	struct hrtimer		slack_timer;
 	struct list_head	throttled_cfs_rq;
 
+	/*
+	 * Width mode, see account_cfs_rq_width(): at most width_slots cfs_rqs
+	 * of the group run at once, plus one rate limited extra slot which is
+	 * given width_budget of runtime every width_window.
+	 */
+	u8			width;
+	u8			width_extra;
+	u8			width_extra_busy;
+	int			width_slots;
+	int			width_active;
+	u64			width_budget;
+	ktime_t			width_window;
+
 	/* Statistics: */
 	int			nr_periods;
 	int			nr_throttled;
@@ -769,6 +782,10 @@ struct cfs_rq {
 	u64			throttled_clock_self_time;
 	bool			throttled:1;
 	bool			pelt_clock_throttled:1;
+	u8			width_enabled;
+	u8			width_slot;
+	u8			width_woken;
+	u64			width_used;
 	int			throttle_count;
 	struct list_head	throttled_list;
 	struct list_head	throttled_csd_list;
@@ -3514,6 +3531,14 @@ extern void init_dl_rq(struct dl_rq *dl_rq);
 
 extern void cfs_bandwidth_usage_inc(void);
 extern void cfs_bandwidth_usage_dec(void);
+
+#ifdef CONFIG_CFS_BANDWIDTH
+extern bool cfs_width_mode(void);
+extern void cfs_width_usage_inc(void);
+extern void cfs_width_usage_dec(void);
+extern void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width);
+extern void cfs_width_config_rq(struct cfs_rq *cfs_rq, bool width);
+#endif
 
 #ifdef CONFIG_NO_HZ_COMMON
 

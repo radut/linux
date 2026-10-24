@@ -122,6 +122,27 @@ This is tunable via procfs::
 Larger slice values will reduce transfer overheads, while smaller values allow
 for more fine-grained consumption.
 
+Width mode
+----------
+Instead of CPU time per period, quota / period can be enforced as a limit on
+the number of CPUs which run tasks of the group at the same time::
+
+	/proc/sys/kernel/sched_cfs_bandwidth_width (default=0)
+
+With 1, a group whose bandwidth is written afterwards (e.g. by writing its
+cpu.max again) is in width mode; groups keep their mode until their next
+write, so changing the value has no immediate effect. A group with a limit
+of L = quota / period has floor(L) slots without a time limit. A cfs_rq of
+the group takes a slot when its tasks start running on a CPU and gives it
+back when they stop; without a free slot it is throttled until one is given
+back. A fractional limit adds one more slot whose use is limited to
+(L - floor(L)) * window of CPU time every window of min(period, 10ms), so a
+limit below one CPU is still enforced as time, over that shorter window.
+While other CPUs wait for a slot of the group, a CPU holding one gives it up
+after running the group's tasks for the slice per task, so that the CPUs
+take turns. Limits apply at every level of the hierarchy. cpu.cfs_burst_us
+is ignored in width mode, and nr_periods and nr_throttled count windows.
+
 Statistics
 ----------
 A group's bandwidth statistics are exported via 5 fields in cpu.stat.
