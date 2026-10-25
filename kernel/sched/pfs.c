@@ -901,26 +901,204 @@ static void pfs_group_retry(struct pfs_group *lg)
 }
 
 /**************************************************************
- * Admitted tasks on a CPU.
+ * Weights.
+ *
+ * The hierarchy is flattened (see sched-pfs.rst): a group is active while a
+ * task of its subtree is admitted, and its hierarchical weight is
+ *
+ *   H(g) = W(g)                          if g's parent is the root
+ *   H(g) = H(parent) * W(g) / D(parent)  otherwise
+ *
+ * with D(p) the weights of p's active children plus the nice weights of p's
+ * own admitted tasks. An admitted task t of g gets H(g) * w(t) / D(g), so the
+ * admitted tasks of a group share its weight, however many wait.
  */
 
+/* protects pfs_group::weight, ::nr_active and ::child_weight_sum */
+static DEFINE_RAW_SPINLOCK(pfs_weight_lock);
+/* bumped when the active groups or a weight change, expires hweights */
+static atomic_long_t pfs_hweight_gen = ATOMIC_LONG_INIT(1);
+
+#define PFS_HWEIGHT_REFRESH_NS	NSEC_PER_MSEC
+
+/*
+ * Count @g in or out of its parent's active weight sum and propagate while
+ * the parents' states change. Increments and decrements commute, so the
+ * races of a group's tasks going in and out from several CPUs leave the sums
+ * consistent: a group's weight is in its parent's sum exactly while its
+ * nr_active is positive.
+ */
+static void pfs_update_active(struct pfs_group *g, bool active)
+{
+	struct pfs_group *parent;
+	bool propagate;
+
+	for (; g->depth > 0; g = parent) {
+		parent = pfs_parent(g);
+		propagate = false;
+
+		raw_spin_lock(&pfs_weight_lock);
+		if (active) {
+			if (!g->nr_active++) {
+				parent->child_weight_sum += g->weight;
+				propagate = true;
+			}
+		} else {
+			if (!--g->nr_active) {
+				parent->child_weight_sum -= g->weight;
+				propagate = true;
+			}
+		}
+		raw_spin_unlock(&pfs_weight_lock);
+
+		if (!propagate)
+			break;
+	}
+	atomic_long_inc(&pfs_hweight_gen);
+}
+
+static inline unsigned long pfs_group_load(struct pfs_group *g)
+{
+	return READ_ONCE(g->child_weight_sum) + atomic_long_read(&g->own_weight);
+}
+
+/*
+ * @g's hierarchical weight, recomputed when the generation changed but at
+ * most once per PFS_HWEIGHT_REFRESH_NS: on a busy host groups go idle and
+ * busy all the time. The inputs are read without the lock, the result is
+ * approximate by nature.
+ */
+static unsigned long pfs_hweight(struct pfs_group *g, unsigned long gen, u64 now)
+{
+	struct pfs_group *parent = pfs_parent(g);
+	unsigned long h, d;
+
+	if (READ_ONCE(g->hweight_gen) == gen)
+		return READ_ONCE(g->hweight);
+	if (READ_ONCE(g->hweight) &&
+	    now - READ_ONCE(g->hweight_at) < PFS_HWEIGHT_REFRESH_NS)
+		return READ_ONCE(g->hweight);
+
+	h = READ_ONCE(g->weight);
+	if (parent->depth > 0 && g->depth <= PFS_MAX_DEPTH) {
+		d = pfs_group_load(parent);
+		if (d)
+			h = mul_u64_u64_div_u64(pfs_hweight(parent, gen, now), h, d);
+	}
+	h = max(h, scale_load(MIN_SHARES));
+
+	WRITE_ONCE(g->hweight, h);
+	WRITE_ONCE(g->hweight_at, now);
+	WRITE_ONCE(g->hweight_gen, gen);
+	return h;
+}
+
+/* The weight @p is scheduled with, @p is counted in its group. */
 static unsigned long pfs_effective_weight(struct task_struct *p)
 {
-	return p->se.load.weight;
+	struct sched_pfs_entity *pe = &p->pfs;
+	struct pfs_group *g = pe->grp;
+	unsigned long w = p->se.load.weight, d;
+
+	if (!g || !g->depth)
+		return w;
+
+	d = pfs_group_load(g);
+	if (d)
+		w = mul_u64_u64_div_u64(pfs_hweight(g, atomic_long_read(&pfs_hweight_gen),
+						    pfs_now()), w, d);
+	return clamp(w, scale_load(MIN_SHARES), scale_load(MAX_SHARES));
 }
+
+/* @p becomes or stops being an admitted task of its group */
+static void pfs_account(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	struct pfs_group *g = pe->grp;
+
+	if (!g || !g->depth)
+		return;
+	pe->run_weight = p->se.load.weight;
+	atomic_long_add(pe->run_weight, &g->own_weight);
+	if (atomic_inc_return(&g->nr_own) == 1)
+		pfs_update_active(g, true);
+}
+
+static void pfs_unaccount(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	struct pfs_group *g = pe->grp;
+
+	if (!g || !g->depth)
+		return;
+	atomic_long_sub(pe->run_weight, &g->own_weight);
+	if (atomic_dec_return(&g->nr_own) == 0)
+		pfs_update_active(g, false);
+}
+
+/* Rescale the lag and a relative deadline of @pe to the weight @w. */
+static void pfs_set_weight(struct sched_pfs_entity *pe, unsigned long w)
+{
+	unsigned long old = pe->weight.weight;
+
+	if (old && old != w) {
+		long o = max(scale_load_down(old), 1UL);
+		long n = max(scale_load_down(w), 1UL);
+
+		pe->vlag = div64_long(pe->vlag * o, n);
+		if (pe->rel_deadline)
+			pe->deadline = div64_long((s64)pe->deadline * o, n);
+	}
+	pe->weight.weight = w;
+	pe->weight.inv_weight = 0;
+}
+
+/*
+ * Refresh the effective weight of the running task, preserving its lag and
+ * its relative deadline (see reweight_eevdf() in fair.c). It is not in the
+ * tree, its weight enters the averages only through pfs_curr_entity().
+ */
+static void pfs_reweight_curr(struct rq *rq, struct task_struct *curr)
+{
+	struct pfs_rq *prq = &rq->pfs;
+	struct sched_pfs_entity *pe = &curr->pfs;
+	unsigned long old = pe->weight.weight, w;
+	u64 avruntime;
+	s64 vlag, vdl;
+	long o, n;
+
+	w = pfs_effective_weight(curr);
+	if (w == old)
+		return;
+
+	avruntime = pfs_avg_vruntime(prq);
+	vlag = (s64)(avruntime - pe->vruntime);
+	vdl = (s64)(pe->deadline - avruntime);
+	o = max(scale_load_down(old), 1UL);
+	n = max(scale_load_down(w), 1UL);
+
+	pe->weight.weight = w;
+	pe->weight.inv_weight = 0;
+	prq->load += w - old;
+
+	pe->vruntime = avruntime - div64_long(vlag * o, n);
+	pe->deadline = avruntime + div64_long(vdl * o, n);
+}
+
+/**************************************************************
+ * Admitted tasks on a CPU.
+ */
 
 /* Put an admitted task on @rq: the tree, or as the running task. */
 static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct pfs_rq *prq = &rq->pfs;
 	struct sched_pfs_entity *pe = &p->pfs;
-	unsigned long w = pfs_effective_weight(p);
+	unsigned long w;
 
-	if (pe->weight.weight && pe->weight.weight != w && pe->vlag)
-		pe->vlag = div64_long(pe->vlag * (long)scale_load_down(pe->weight.weight),
-				      (long)max(scale_load_down(w), 1UL));
-	pe->weight.weight = w;
-	pe->weight.inv_weight = 0;
+	pfs_account(p);
+	w = pfs_effective_weight(p);
+	pfs_set_weight(pe, w);
 
 	pfs_place_entity(prq, pe, flags);
 	pe->state = PFS_QUEUED;
@@ -953,6 +1131,7 @@ static void pfs_unqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	prq->nr_queued--;
 	prq->load -= pe->weight.weight;
 	sub_nr_running(rq, 1);
+	pfs_unaccount(p);
 }
 
 /* Ask for retries of the levels of @g's path which have waiting tasks. */
@@ -1292,6 +1471,8 @@ static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 		resched_curr(rq);
 		return;
 	}
+
+	pfs_reweight_curr(rq, curr);
 
 	/*
 	 * A task of a limited group gives its slots back at the end of its
@@ -1822,8 +2003,25 @@ void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 		pfs_group_retry(g);
 }
 
+/* cpu.weight changed: tg->shares holds the new weight */
 void pfs_group_set_weight(struct task_group *tg)
 {
+	struct pfs_group *g = &tg->pfs, *parent;
+	unsigned long w, flags;
+
+	if (!pfs_enabled() || !tg->parent)
+		return;
+
+	parent = pfs_parent(g);
+	w = max(READ_ONCE(tg->shares), scale_load(MIN_SHARES));
+
+	raw_spin_lock_irqsave(&pfs_weight_lock, flags);
+	if (g->nr_active > 0)
+		parent->child_weight_sum += w - g->weight;
+	g->weight = w;
+	raw_spin_unlock_irqrestore(&pfs_weight_lock, flags);
+
+	atomic_long_inc(&pfs_hweight_gen);
 }
 
 /**************************************************************
