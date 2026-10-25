@@ -655,6 +655,7 @@ static enum pfs_reserve pfs_reserve(struct task_struct *p, struct pfs_group *g,
 		pfs_stat(PFS_STAT_ADMIT);
 	pe->slot_mask = mask;
 	pe->unslotted = 0;
+	pe->woken = 0;
 	pe->grp = g;
 	pe->run_start = p->se.sum_exec_runtime;
 	pe->run_limit = run_limit;
@@ -823,7 +824,13 @@ static void pfs_kick_cpu(int cpu)
 static void __pfs_link_waiter(struct sched_pfs_entity *pe, struct pfs_group *lg)
 {
 	raw_spin_lock(&lg->lock);
-	list_add_tail(&pe->wait_node, &lg->waiters);
+	pe->wake_list = pe->woken;
+	if (pe->wake_list) {
+		list_add_tail(&pe->wait_node, &lg->wake_waiters);
+		WRITE_ONCE(lg->nr_woken, lg->nr_woken + 1);
+	} else {
+		list_add_tail(&pe->wait_node, &lg->waiters);
+	}
 	WRITE_ONCE(lg->nr_waiting, lg->nr_waiting + 1);
 	raw_spin_unlock(&lg->lock);
 	pe->wait_grp = lg;
@@ -835,6 +842,9 @@ static void __pfs_unlink_waiter(struct sched_pfs_entity *pe)
 
 	raw_spin_lock(&lg->lock);
 	list_del_init(&pe->wait_node);
+	if (pe->wake_list)
+		WRITE_ONCE(lg->nr_woken, lg->nr_woken - 1);
+	pe->wake_list = 0;
 	WRITE_ONCE(lg->nr_waiting, lg->nr_waiting - 1);
 	raw_spin_unlock(&lg->lock);
 	pe->wait_grp = NULL;
@@ -898,13 +908,16 @@ static int pfs_try_waiter(struct rq *rq, struct task_struct *p,
 {
 	struct sched_pfs_entity *pe = &p->pfs;
 	struct pfs_group *g = task_pfs_group(p), *fail = NULL;
+	bool woken = pe->woken;
 	enum pfs_reserve ret;
 
 	lockdep_assert_rq_held(rq);
 
 	ret = pfs_reserve(p, g, false, &fail);
-	if (ret == PFS_RES_OK)
+	if (ret == PFS_RES_OK) {
+		pe->fresh = woken;
 		return 1;
+	}
 
 	if (fail == lg) {
 		if (ret == PFS_RES_BUDGET)
@@ -950,30 +963,48 @@ static u64 pfs_waiter_vtime(struct pfs_group *lg, struct task_struct *p)
 	return (s64)(vtime - floor) < 0 ? floor : vtime;
 }
 
+/* woken waiting tasks admitted in a row while others wait */
+#define PFS_WOKEN_STREAK	4
+/* rotations after a wakeup which keep the wakeup priority */
+#define PFS_FRESH_ROUNDS	2
+
 /*
- * The next task to admit at @lg: among the first PFS_WAITER_SCAN waiting
- * tasks, the first one of the child (or own tasks) of @lg which received the
- * least slot service for its weight. Within a child the order is FIFO.
- * Waiting tasks are freed after a grace period, the caller is in an RCU
- * read-side section.
+ * The next task to admit at @lg. Tasks which woke up and found no slot wait
+ * in ->wake_waiters and go first (but not more than PFS_WOKEN_STREAK times in
+ * a row while tasks which gave their slot back at the end of a slice wait):
+ * they slept, while the others just used up a slice. Within the chosen list,
+ * among the first PFS_WAITER_SCAN tasks, the first one of the child (or own
+ * tasks) of @lg which received the least slot service for its weight; within
+ * a child the order is FIFO. Waiting tasks are freed after a grace period,
+ * the caller is in an RCU read-side section.
  */
 static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
 {
 	struct task_struct *best = NULL;
 	struct sched_pfs_entity *pe;
+	struct list_head *list;
 	unsigned long flags;
 	u64 best_vt = 0;
 	int n = 0;
 
 	raw_spin_lock_irqsave(&lg->lock, flags);
-	list_for_each_entry(pe, &lg->waiters, wait_node) {
+	list = &lg->wake_waiters;
+	if (list_empty(list) ||
+	    (lg->woken_streak >= PFS_WOKEN_STREAK && !list_empty(&lg->waiters)))
+		list = &lg->waiters;
+	if (list == &lg->wake_waiters)
+		lg->woken_streak++;
+	else
+		lg->woken_streak = 0;
+
+	list_for_each_entry(pe, list, wait_node) {
 		struct task_struct *p = pfs_task_of(pe);
 		u64 vt;
 
 		if (n++ >= PFS_WAITER_SCAN)
 			break;
 		/* one waiting group is the common case */
-		if (n == 1 && list_is_singular(&lg->waiters)) {
+		if (n == 1 && list_is_singular(list)) {
 			best = p;
 			break;
 		}
@@ -987,6 +1018,18 @@ static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
 		WRITE_ONCE(lg->slot_vmin, best_vt);
 	raw_spin_unlock_irqrestore(&lg->lock, flags);
 	return best;
+}
+
+/* A limited level of @g's path has woken tasks waiting. */
+static bool pfs_woken_waiting(struct pfs_group *g)
+{
+	struct pfs_group *lg;
+
+	for_each_pfs_level(lg, g) {
+		if (pfs_level_limited(lg) && READ_ONCE(lg->nr_woken))
+			return true;
+	}
+	return false;
 }
 
 static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags);
@@ -1382,7 +1425,9 @@ static void pfs_admit_or_park(struct rq *rq, struct task_struct *p, int flags,
 
 	ret = pfs_reserve(p, g, true, &fail);
 	if (ret == PFS_RES_OK) {
-		pe->unslotted = 0;
+		pe->fresh = !!(flags & ENQUEUE_WAKEUP);
+		if (pe->fresh)
+			pe->fresh_rounds = 0;
 		pfs_queue_task(rq, p, flags);
 		return;
 	}
@@ -1395,6 +1440,9 @@ static void pfs_admit_or_park(struct rq *rq, struct task_struct *p, int flags,
 	pfs_stat(PFS_STAT_CREDIT);
 	pe->grp = g;
 	pe->unslotted = 1;
+	pe->woken = !!(flags & ENQUEUE_WAKEUP);
+	if (pe->woken)
+		pe->fresh_rounds = 0;
 	pe->run_start = p->se.sum_exec_runtime;
 	pe->run_limit = 0;
 	pfs_queue_task(rq, p, flags);
@@ -1436,7 +1484,8 @@ static void pfs_user_workfn(struct callback_head *work)
 	update_curr_pfs(rq);
 	if (pe->unslotted && !pe->slot_mask) {
 		if (pfs_reserve(p, task_pfs_group(p), true, &fail) == PFS_RES_OK) {
-			pe->unslotted = 0;
+			/* it ran on credit since it woke up */
+			pe->fresh = 1;
 			goto unlock;
 		}
 	} else if (!pfs_should_rotate(p)) {
@@ -1448,6 +1497,26 @@ static void pfs_user_workfn(struct callback_head *work)
 	resched_curr(rq);
 unlock:
 	task_rq_unlock(rq, p, &rf);
+}
+
+/* a task which woke up waits for a slot at most about this long */
+#define PFS_WAKE_GRAN_NS	(NSEC_PER_MSEC / 2)
+
+/*
+ * The running task used up its run limit, or ran at least PFS_WAKE_GRAN_NS
+ * while a task which woke up waits for one of its slots. A task which got its
+ * slot after a wakeup itself keeps it for its run limit, it is not cut short
+ * by the next one.
+ */
+static bool pfs_run_limit_reached(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	u64 ran = p->se.sum_exec_runtime - pe->run_start;
+
+	if (ran >= pe->run_limit)
+		return true;
+	return ran >= PFS_WAKE_GRAN_NS && pe->slot_mask && !pe->fresh &&
+	       pfs_woken_waiting(pe->grp);
 }
 
 /* The run limit of a task which keeps its slots for another round. */
@@ -1772,7 +1841,7 @@ static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 	 * run limit if somebody waits for them, see pfs_should_rotate().
 	 */
 	if (atomic_read(&pfs_nr_limited) && !pe->rotate &&
-	    curr->se.sum_exec_runtime - pe->run_start >= pe->run_limit) {
+	    pfs_run_limit_reached(curr)) {
 		if (pfs_should_rotate(curr)) {
 			/*
 			 * Only park a task preempted on its way to user space,
@@ -1787,6 +1856,7 @@ static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 		} else {
 			pe->run_start = curr->se.sum_exec_runtime;
 			pe->run_limit = pfs_run_limit(curr);
+			pe->fresh = 0;
 		}
 	}
 
@@ -1961,6 +2031,16 @@ static int pfs_newidle(struct rq *this_rq, struct rq_flags *rf)
 	if (this_rq->ttwu_pending || !cpu_active(this_cpu))
 		return 0;
 
+	/*
+	 * As the fair class does: the core measures how long this CPU stays
+	 * idle from idle_stamp (rq->avg_idle). If it is usually woken again
+	 * before a migration pays off, e.g. two tasks passing a token back and
+	 * forth, don't pull.
+	 */
+	this_rq->idle_stamp = rq_clock(this_rq);
+	if (this_rq->avg_idle < sysctl_sched_migration_cost)
+		return 0;
+
 	src = pfs_find_busiest(this_rq);
 	if (!src)
 		return 0;
@@ -1983,6 +2063,8 @@ static int pfs_newidle(struct rq *this_rq, struct rq_flags *rf)
 		return -1;
 	if (this_rq->pfs.nr_queued)
 		pulled = 1;
+	if (pulled)
+		this_rq->idle_stamp = 0;
 	return pulled;
 }
 
@@ -2160,6 +2242,16 @@ static void pfs_rotate_out(struct rq *rq, struct task_struct *prev)
 	pfs_release_slots(rq, prev, true);
 	pe->state = PFS_PARKING;
 	pfs_stat(PFS_STAT_ROTATE);
+
+	/*
+	 * A task cut short in the burst it woke up for (e.g. by the budget of
+	 * a fractional limit) keeps its wakeup priority for a couple of
+	 * rounds, see pfs_next_waiter().
+	 */
+	if (pe->fresh && pe->fresh_rounds < PFS_FRESH_ROUNDS) {
+		pe->woken = 1;
+		pe->fresh_rounds++;
+	}
 }
 
 /*
@@ -2285,6 +2377,7 @@ void pfs_init_group(struct task_group *tg, struct task_group *parent)
 
 	raw_spin_lock_init(&g->lock);
 	INIT_LIST_HEAD(&g->waiters);
+	INIT_LIST_HEAD(&g->wake_waiters);
 	g->depth = parent ? parent->pfs.depth + 1 : 0;
 	g->weight = NICE_0_LOAD;
 	hrtimer_setup(&g->window_timer, pfs_window_timer_fn, CLOCK_MONOTONIC,
@@ -2306,7 +2399,7 @@ void pfs_free_group(struct task_group *tg)
 	 */
 	while (irq_work_is_busy(&g->retry_work))
 		cpu_relax();
-	WARN_ON_ONCE(!list_empty(&g->waiters));
+	WARN_ON_ONCE(!list_empty(&g->waiters) || !list_empty(&g->wake_waiters));
 }
 
 /*
@@ -2378,6 +2471,10 @@ void pfs_init_entity(struct task_struct *p)
 	pe->rotate = 0;
 	pe->rel_deadline = 0;
 	pe->unslotted = 0;
+	pe->woken = 0;
+	pe->wake_list = 0;
+	pe->fresh = 0;
+	pe->fresh_rounds = 0;
 	init_task_work(&pe->user_work, pfs_user_workfn);
 	/* not queued, see pfs_has_user_work() */
 	pe->user_work.next = &pe->user_work;

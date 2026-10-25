@@ -679,6 +679,14 @@ struct sched_pfs_entity {
 	unsigned char			rel_deadline;
 	/* admitted without its slots while in the kernel */
 	unsigned char			unslotted;
+	/* woke up and waits for a slot, see pfs_next_waiter() */
+	unsigned char			woken;
+	/* linked in pfs_group::wake_waiters */
+	unsigned char			wake_list;
+	/* got its slots after a wakeup, not by rotation */
+	unsigned char			fresh;
+	/* rotations since the wakeup which kept its wakeup priority */
+	unsigned char			fresh_rounds;
 	/* parks or rotates on its way back to user space */
 	struct callback_head		user_work;
 };

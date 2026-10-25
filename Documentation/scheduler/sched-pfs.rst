@@ -146,6 +146,22 @@ A task which is preempted by another task of its CPU keeps its slots while it
 waits on that CPU's run queue, and is pushed to an idle CPU if one is allowed;
 see `Slot holding while preempted`_ for why.
 
+Wakeup priority
+---------------
+
+Waiting tasks are of two kinds: tasks that woke up and found no free slot
+(typically a thread serving a request), and tasks that gave their slot back
+at the end of a slice (busy threads taking turns). Each level keeps the first
+kind in a separate queue which is served first, but not more than four times
+in a row while tasks of the second kind wait. While a woken task waits, a
+task holding a slot of the same level since a rotation gives it back after
+0.5 ms instead of at the end of its slice; a task holding its slot since its
+own wakeup is not cut short. A woken task whose burst is cut short, e.g. by
+the budget of a fractional limit, keeps its priority for two more rounds.
+With a limit of 1 CPU, four request threads (1 ms of work every 20 ms) next
+to two busy threads of the same group see a median latency of 3-5 ms instead
+of 10 ms with plain rotation.
+
 Same-CPU hand-off
 -----------------
 
@@ -292,10 +308,11 @@ Lock order::
   (``smp_mb()``) checks for a free slot and starts a retry if there is one;
   the releasing side gives the slot back, then (``smp_mb__after_atomic()``)
   checks the queue.
-- To admit a waiting task found under ``pfs_group::lock``, the scheduler takes
-  a reference, drops the group lock, takes the task's run queue lock (plus its
-  own, with ``double_lock_balance()``), and checks that the task is still
-  waiting in that queue before touching it.
+- To admit a waiting task found under ``pfs_group::lock``, the scheduler drops
+  the group lock, takes the task's run queue lock (plus its own, with
+  ``double_lock_balance()``), and checks that the task is still waiting in
+  that queue before touching it. A waiting task cannot exit, and its
+  ``task_struct`` stays valid in the RCU read-side section around this.
 - The running task is parked only from ``put_prev_task()``, after which the
   run queue lock is held until ``finish_task_switch()`` has cleared
   ``p->on_cpu``. A remote CPU holding a run queue lock therefore never sees a
@@ -372,14 +389,18 @@ balancer is not used.
   affinity mask, else the previous CPU. A task of a limited group whose
   levels have no free slot stays on its previous CPU (it would only park).
 - Newly idle pull (``pick_task`` with an empty tree): pull a queued, not
-  running, allowed task from the busiest CPU (by queued count, then load),
-  searching the LLC first.
+  running, allowed task from the busiest CPU (by queued count), searching the
+  LLC first. As in the fair class, a CPU whose idle periods are usually
+  shorter than ``sched_migration_cost`` (``rq->avg_idle``) doesn't pull, so
+  that two tasks handing work back and forth don't get migrated all the
+  time.
 - Push (a balance callback after a context switch, at most once per tick per
   CPU, and right away for a preempted task of a limited group): move a
   queued task to an idle CPU, or to a CPU whose load is lower by more than the
   task's weight.
-- Idle CPUs that need to pull are kicked with ``resched_cpu()``; they pull in
-  their newly idle pick.
+- Idle CPUs that need to pull are kicked with ``resched_cpu()`` from an
+  ``irq_work`` (the kicking side holds a run queue lock); they pull in their
+  newly idle pick.
 
 Waiting tasks are never on a CPU tree, so no balancer can run them before
 they are admitted. Load is the sum of the effective weights of the admitted
@@ -424,13 +445,19 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    ``park_budget``, ``park_fifo`` (waits by reason), ``rotate`` (slots given
    back at the end of a slice), ``handoff`` (waiting task pulled to the CPU
    that freed the slot), ``handoff_local`` (it was already there), ``inplace``
-   (admitted on its own CPU), ``retry``, ``pull``, ``push``, ``kick``; plus
-   the number of limited groups and of waiting tasks.
+   (admitted on its own CPU), ``retry``, ``pull``, ``push``, ``kick``,
+   ``credit`` (admitted without slots while in the kernel), ``user_park``
+   (parked or rotated on the way back to user space); plus the number of
+   limited groups and of waiting tasks.
 
 ``groups``
    limited groups and groups with waiting tasks: limit in milli-CPUs, slots
    taken, waiting tasks, budget used in the current window, weight,
    hierarchical weight, active count and path.
+
+``waiters``
+   the waiting tasks of each CPU with their state and the state of the level
+   they wait at (root only).
 
 ``window_us``
    length of the budget window, 1000 to 1000000 (default 10000).

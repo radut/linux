@@ -499,7 +499,11 @@ struct pfs_group {
 	raw_spinlock_t		lock;
 	/* FIFO of tasks waiting for a slot at this level */
 	struct list_head	waiters;
+	/* the ones which woke up, admitted first */
+	struct list_head	wake_waiters;
 	unsigned int		nr_waiting;
+	unsigned int		nr_woken;
+	unsigned int		woken_streak;
 	/* slots taken by tasks of the subtree */
 	atomic_t		nr_slots;
 	/* limit in milli-CPUs, 0 if none */
