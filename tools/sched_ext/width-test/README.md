@@ -1,7 +1,8 @@
 # Testing CPU-limit enforcement without Kubernetes
 
 This kit compares three ways of enforcing a cgroup v2 CPU limit (`cpu.max`) on
-one machine, using either plain cgroups or Docker/Podman:
+one machine, using plain cgroups, systemd units (`systemd-run`) or
+Docker/Podman:
 
 | Variant  | What enforces `cpu.max = Q P`                                                     |
 |----------|-----------------------------------------------------------------------------------|
@@ -9,8 +10,9 @@ one machine, using either plain cgroups or Docker/Podman:
 | `scx`    | `scx_width` (sched_ext): at most floor(Q/P) threads on CPUs at once, no time budget; a fractional remainder is one extra slot with a budget per 10 ms window. `cpu.weight` sets the share under contention. |
 | `kwidth` | The same policy inside CFS, enabled with `sysctl kernel.sched_cfs_bandwidth_width=1` on a kernel carrying that patch. |
 
-Kubernetes, Docker and Podman all express a CPU limit as `cpu.max`, so nothing
-else changes: a container started with `--cpus=1.5` gets `150000 100000`.
+Kubernetes, Docker, Podman and systemd all express a CPU limit as `cpu.max`,
+so nothing else changes: a container started with `--cpus=1.5`, or a unit
+with `CPUQuota=150%`, gets `150000 100000`.
 
 ## Requirements
 
@@ -22,7 +24,9 @@ else changes: a container started with `--cpus=1.5` gets `150000 100000`.
   `/proc/sys/kernel/sched_cfs_bandwidth_width` exists.
 - gcc with static glibc (`libc6-dev`), python3 (concurrency column), tracefs
   (optional, `WT_TRACE=0` skips the trace).
-- Docker path: Docker or Podman, any cgroup driver.
+- Docker path: Docker or Podman (rootful or rootless), systemd or cgroupfs
+  cgroup driver.
+- systemd path: systemd as init (`systemd-run`).
 
 ## Build
 
@@ -47,8 +51,11 @@ and `$PATH`.
 | `reqlat THREADS WORK_US PERIOD_US SECS [BURN]` | Open-loop requests: each thread does WORK_US of CPU work every PERIOD_US; latency from scheduled start to completion (p50/p90/p99/p99.9/max). BURN busy threads in the same process stand for GC or background work sharing the limit. |
 | `conc.py COMM TRACE CAP` | From a `sched_switch` trace: how many CPUs ran COMM at once (average, maximum, share of time above the limit). |
 | `cg-run.sh`        | One case on plain cgroup v2. |
-| `docker-run.sh`    | One case in a container. |
-| `compare.sh`       | The whole matrix, CSV and a summary table. |
+| `systemd-run.sh`   | One case as a transient systemd scope or service (`CPUQuota=`, `CPUWeight=`). |
+| `docker-run.sh`    | One case in a container (Docker or Podman). |
+| `compare.sh`       | The whole matrix or chosen cells, repeated if asked; CSV and a summary table. |
+| `summary.py`       | Summary of a results.csv: median (min-max) per case and variant. |
+| `scx_width.service` | Example systemd unit for running scx_width on a host. |
 | `docker-image.sh`  | Builds a local FROM-scratch image with the static binaries (`docker import`, no registry). |
 | `scx-container.sh` | Runs scx_width as a privileged container (`--privileged --pid=host`), the Docker shape of a DaemonSet. |
 
@@ -82,7 +89,23 @@ To try scx_width on your own workload instead, start it in one terminal
 kwidth applies at the moment `cpu.max` is written: flip the sysctl, then
 rewrite existing limits (`cat cpu.max > cpu.max`).
 
-## Path B: Docker (or Podman)
+## Path B: systemd units, no containers
+
+`CPUQuota=` writes `cpu.max` (period 100 ms, `CPUQuotaPeriodSec=` changes
+it), `CPUWeight=` writes `cpu.weight`:
+
+    sudo systemd-run --scope -p CPUQuota=150% -p CPUWeight=100 ./bin/spin 8 10
+    sudo systemd-run --unit=wt-demo -p CPUQuota=50% ./bin/spin 8 10
+    cat /sys/fs/cgroup$(systemctl show -P ControlGroup wt-demo.service)/cpu.stat
+
+    sudo ./systemd-run.sh -H cfs 1.5 8               # transient scope
+    sudo ./systemd-run.sh -m service -n noisy scx 1.5 8
+    sudo ./compare.sh -p systemd -m scope
+
+The units go into `widthtest.slice` (a `-` in a slice name means nesting to
+systemd, `a-b.slice` is a child of `a.slice`).
+
+## Path C: Docker (or Podman)
 
     sudo ./docker-image.sh                   # image width-test:local
     sudo docker run --rm --cpus=1.5 width-test:local /spin 8 10
@@ -103,8 +126,14 @@ conversion (512 shares gave weight 59 with Docker 29). The cgroup disappears
 with the container, so read it while the container runs; `docker-run.sh`
 polls `cpu.stat` every 0.2 s and reports the last reading.
 
-Start the scheduler either on the host (`sudo ./bin/scx_width`) or as a
-container, which mirrors the Kubernetes DaemonSet:
+Start the scheduler on the host (`sudo ./bin/scx_width`), as a systemd
+unit, or as a container, which mirrors the Kubernetes DaemonSet:
+
+    sudo install -m 755 bin/scx_width /usr/local/sbin/scx_width
+    sudo install -m 644 scx_width.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl start scx_width          # stop: back to the kernel scheduler
+
 
     sudo ./scx-container.sh start            # needs a static scx_width in the image
     sudo ./scx-container.sh status
@@ -119,19 +148,42 @@ Cases and the matrix:
     sudo ./docker-run.sh -H cfs 1.5 8
     sudo ./docker-run.sh -P 100000 -S 512 kwidth 0.5 8
     sudo SCX_MODE=container ./docker-run.sh scx 1 64
+    sudo SCX_MODE=service ./docker-run.sh scx 1 64   # uses scx_width.service
     sudo ./compare.sh -p docker
 
-Podman: `DOCKER=podman` for every script; the flags are the same. Rootless
-Podman needs the cpu controller delegated to the user (systemd
-`Delegate=cpu`), and loading scx_width always needs root.
+`SCX_MODE` (host, service, container) works with every script. The `path`
+column names the runtime and its cgroup driver (`docker-systemd`,
+`podman-cgroupfs`, `podman-rootless-systemd`, ...).
+
+Podman: `DOCKER=podman` for every script; the flags are the same.
+
+    sudo DOCKER=podman ./docker-image.sh
+    sudo DOCKER=podman ./compare.sh -p docker
+    sudo DOCKER="podman --cgroup-manager=cgroupfs" ./docker-run.sh cfs 1 8
+
+Rootless Podman: the scripts still run as root (tracing, sysctl, scheduler)
+and drive the user's Podman through `DOCKER`:
+
+    R="sudo -u USER XDG_RUNTIME_DIR=/run/user/$(id -u USER) podman"
+    sudo DOCKER="$R" ./docker-image.sh
+    sudo DOCKER="$R" ./compare.sh -p docker
+
+`--cpus` needs the cpu controller delegated to the user's systemd instance:
+`cat /sys/fs/cgroup/user.slice/user-UID.slice/user@UID.service/cgroup.controllers`
+must list `cpu` (default on recent systemd; otherwise add a drop-in for
+`user@.service` with `[Service]` `Delegate=cpu cpuset io memory pids`).
+`loginctl enable-linger USER` keeps the user's systemd running between logins.
+Loading scx_width always needs root.
 
 ## The matrix
 
     sudo ./compare.sh                        # cgroup path, all available variants
     sudo ./compare.sh -v cfs,scx -l 0.5,1 -t 8 -s 10
+    sudo ./compare.sh -C 1:8,1.5:8,2:64 -L 0.5 -r 3   # key cells, 3 runs each
 
 Limits 0.5, 1, 2 and 4 CPUs, 1, 8 and 64 threads, no neighbour or a noisy
-one, then the latency test at 0.5 and 1 CPU. Results go to
+one, then the latency test at 0.5 and 1 CPU. `summary.txt` gives median
+(min-max) when cases repeat. Results go to
 `results/<timestamp>-<path>/results.csv` with these columns:
 
 | Column | Meaning |
@@ -176,8 +228,13 @@ one, then the latency test at 0.5 and 1 CPU. Results go to
   for children (no internal processes rule), or a real-time task holds the cpu
   controller back.
 - Docker cgroupfs vs systemd driver: only the cgroup path differs
-  (`docker info | grep -i cgroup`); always find it through the container's PID
-  as above.
+  (`docker info | grep -i cgroup`): `system.slice/docker-<id>.scope` or
+  `docker/<id>`; Podman uses `machine.slice/libpod-<id>.scope`,
+  `libpod_parent/libpod-<id>` (cgroupfs) or
+  `user.slice/user-UID.slice/user@UID.service/user.slice/libpod-<id>.scope`
+  (rootless). Always find it through the container's PID as above.
+- Rootless Podman fails with a cpu controller error: the controller is not
+  delegated to the user, see above.
 - scx_width exits with a stall error: the kernel watchdog ejects a sched_ext
   scheduler that leaves a runnable task waiting too long
   (`runnable task stall` in `dmesg`), and all tasks fall back to the normal

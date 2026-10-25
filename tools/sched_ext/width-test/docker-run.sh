@@ -31,7 +31,10 @@ options:
 environment:
   DOCKER=podman   use podman (same flags)
   IMAGE=...       image with /spin /noisy /reqlat (default $IMAGE, see docker-image.sh)
-  SCX_MODE=container  run scx_width as a privileged container instead of on the host
+  DOCKER="sudo -u USER XDG_RUNTIME_DIR=/run/user/UID podman"   rootless Podman
+  DOCKER="podman --cgroup-manager=cgroupfs"   Podman with the cgroupfs manager
+  SCX_MODE=container|service   run scx_width as a privileged container or a
+                  systemd unit instead of from this script (default host)
 
 Prints one CSV line ($CSV_HEADER).
 EOF
@@ -40,7 +43,10 @@ EOF
 # run_docker_case VARIANT LIMIT THREADS SECS WORKLOAD NEIGHBOUR PERIOD SHARES
 run_docker_case() {
 	local variant=$1 limit=$2 threads=$3 secs=$4 wl=$5 neigh=$6 period=$7 shares=$8
-	local name=wt-ctr-$$ noisy=wt-noisy-$$ cpuopt cg out st conc tmp
+	local name noisy cpuopt cg out st conc tmp c
+	# fresh names per case: Podman frees a name only once removal completes
+	WT_SEQ=$((${WT_SEQ:-0} + 1))
+	name=wt-ctr-$$-$WT_SEQ noisy=wt-noisy-$$-$WT_SEQ
 	tmp=$(mktemp -d)
 	if [ -n "$period" ]; then
 		cpuopt="--cpu-period=$period --cpu-quota=$(awk -v l="$limit" -v p="$period" 'BEGIN { printf "%d", l * p }')"
@@ -74,20 +80,13 @@ run_docker_case() {
 	done
 	trace_stop "$tmp/trace"
 	out=$($DOCKER logs "$name" 2>&1 | tail -1)
-	$DOCKER rm -f "$name" "$noisy" > /dev/null 2>&1 || true
+	for c in "$name" "$noisy"; do
+		$DOCKER rm -f "$c" > /dev/null 2>&1 || true
+	done
 	conc=$(conc_of "$wl" "$tmp/trace" "$limit")
 	rm -rf "$tmp"
 	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | conc avg/max/%over: $conc"
-	emit_row docker "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc"
-}
-
-docker_variant_start() {
-	if [ "$1" = scx ] && [ "${SCX_MODE:-host}" = container ]; then
-		have_kwidth && kwidth_set 0
-		scx_container_start
-	else
-		variant_start "$1"
-	fi
+	emit_row "$(runtime_label)" "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc"
 }
 
 docker_main() {
@@ -106,12 +105,11 @@ docker_main() {
 	done
 	shift $((OPTIND - 1))
 	[ $# -eq 3 ] || { usage >&2; exit 2; }
-	command -v "$DOCKER" > /dev/null || die "$DOCKER not found"
-	$DOCKER image inspect "$IMAGE" > /dev/null 2>&1 || die "image $IMAGE missing, run $KIT/docker-image.sh"
+	docker_check
 	need_root
 	check_cgroup2
 	trap cleanup EXIT INT TERM
-	docker_variant_start "$1"
+	variant_start "$1"
 	[ "$header" = 0 ] || echo "$CSV_HEADER"
 	run_docker_case "$1" "$2" "$3" "$secs" "$wl" "$neigh" "$period" "$shares"
 }
