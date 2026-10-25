@@ -857,6 +857,8 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 	if (!cgc)
 		return WK_EMPTY;
 
+	/* global functions aren't verified as running under RCU */
+	bpf_rcu_read_lock();
 	bpf_for_each(scx_dsq, p, dsq_id, 0) {
 		enum reserve_result ret;
 		struct pfs_task_ctx *taskc;
@@ -988,6 +990,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			bpf_cgroup_release(fail_cgrp);
 		}
 	}
+	bpf_rcu_read_unlock();
 
 	return res;
 }
