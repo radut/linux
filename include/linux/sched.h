@@ -656,6 +656,8 @@ struct sched_pfs_entity {
 	u64				min_vruntime;
 	u64				vruntime;
 	s64				vlag;
+	/* protected until, see pfs_protected() */
+	u64				vprot;
 	u64				slice;
 	/* se.sum_exec_runtime at admission and the runtime until rotation */
 	u64				run_start;
@@ -675,6 +677,10 @@ struct sched_pfs_entity {
 	/* the slice ended and the slots must be given back, see balance */
 	unsigned char			rotate;
 	unsigned char			rel_deadline;
+	/* admitted without its slots while in the kernel */
+	unsigned char			unslotted;
+	/* parks or rotates on its way back to user space */
+	struct callback_head		user_work;
 };
 #endif
 

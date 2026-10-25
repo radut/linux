@@ -1405,6 +1405,9 @@ struct rq {
 
 	struct sched_avg	avg_rt;
 	struct sched_avg	avg_dl;
+#ifdef CONFIG_SCHED_PFS
+	struct sched_avg	avg_pfs;
+#endif
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 	struct sched_avg	avg_irq;
 #endif
@@ -3854,6 +3857,15 @@ static inline unsigned long cpu_util_dl(struct rq *rq)
 
 extern unsigned long cpu_util_cfs(int cpu);
 extern unsigned long cpu_util_cfs_boost(int cpu);
+
+#ifdef CONFIG_SCHED_PFS
+/* utilization of the normal class when PFS replaces the fair class */
+static inline unsigned long cpu_util_pfs(int cpu)
+{
+	return min(READ_ONCE(cpu_rq(cpu)->avg_pfs.util_avg),
+		   arch_scale_cpu_capacity(cpu));
+}
+#endif
 
 static inline unsigned long cpu_util_rt(struct rq *rq)
 {

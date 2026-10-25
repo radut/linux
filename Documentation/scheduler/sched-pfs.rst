@@ -120,13 +120,26 @@ any CPU run queue, is not counted in ``rq->nr_running`` and is invisible to
 load balancing. Tasks of groups without a limit anywhere on their path are
 admitted unconditionally and behave as described in `Scheduling`_.
 
+A task is only parked where it holds nothing others may wait for: when it is
+preempted on its way back to user space. A task that wakes up, a new task, or
+one moved to another cgroup is in the kernel at that point, may hold locks or
+be inside an RCU read-side section (with preemptible RCU), and a long wait
+for a slot would block everybody waiting for those, or stall RCU grace
+periods. If such a task finds no free slot, it is admitted *on credit*,
+without slots, and a task work makes it take its slots or park when it
+returns to user space. This is the same model as the task based throttling
+of CFS bandwidth control. Kernel threads, which never return to user space,
+keep running on credit until they block.
+
 A task gives its slots back when it
 
 - blocks, exits, or moves to another cgroup;
 - reaches the end of its slice (``sched_base_slice``) while one of its levels
   has waiting tasks, has no budget left, or holds more slots than its limit
-  allows (after the limit was lowered). It then has to be admitted again, and
-  goes to the tail of the queue if it cannot be;
+  allows (after the limit was lowered). If the slice ends while the task runs
+  in user space it rotates at once, otherwise when it returns to user space.
+  It then has to be admitted again, and goes to the tail of the queue if it
+  cannot be;
 - is a waiting task's slot hand-off source, see below.
 
 A task which is preempted by another task of its CPU keeps its slots while it
@@ -180,12 +193,30 @@ threads take turns on the slots at slice granularity, which gives them their
 share of the group's weight over time.
 
 Effective weights are computed when a task is admitted and refreshed on every
-tick for the running task. Hierarchical weights are cached per group and
-recomputed at most once per millisecond when the set of active groups or a
-weight has changed (a global generation counter). w_eff is clamped to
-``[scale_load(2), scale_load(MAX_SHARES)]``; the floor of 2 bounds the wait of
-a task of a group with a tiny share (the starvation floor), as ``MIN_SHARES``
-does in the fair class.
+tick for the running task, with its lag and deadline rescaled. Hierarchical
+weights are cached per group and recomputed at most once per millisecond when
+the set of active groups or a weight has changed (a global generation
+counter). w_eff is clamped to ``[scale_load(MIN_SHARES),
+scale_load(MAX_SHARES)]``.
+
+Starvation floor: w_eff of a task of a non-root group is at least the load of
+its CPU times ``slice / 1 s``, so a task of a group with a tiny share still
+gets a slice about once a second. Without it, a thread of a group with
+``cpu.weight`` 1 next to groups of weight 10000 would wait for many seconds
+(as it does under the fair class). ``SCHED_IDLE`` tasks are exempt.
+
+Weights inside a limited group
+------------------------------
+
+The slots of a limited group are themselves a contended resource. Waiting
+tasks of a limited level are therefore not admitted in plain FIFO order: the
+runtime of tasks holding slots is accounted to the child of each limited level
+they belong to, scaled by that child's weight (*slot service*), and the next
+task admitted at the level is the first waiting task of the child with the
+least slot service, among the first 16 waiting tasks. Within one child the
+order is FIFO. A child that comes back after a pause starts at most two slices
+behind the last admitted one. Two children of a group limited to 3 CPUs with
+``cpu.weight`` 100 and 300, each with 8 busy threads, get 0.77 and 2.27 CPUs.
 
 
 Scheduling
@@ -200,10 +231,15 @@ an earlier deadline, no wakeup preemption by ``SCHED_BATCH`` and
 ``SCHED_IDLE`` tasks. The effective weight takes the place of the fair class'
 ``se->h_load`` weight.
 
-Not carried over: delayed dequeue, next/short buddies, protected slices
-(``RUN_TO_PARITY``), PELT per task and per group, util_est, energy aware
-placement, misfit migration, NUMA balancing and ``cpu.idle`` (treated as a
-plain weight).
+As with ``RUN_TO_PARITY`` and ``PREEMPT_SHORT`` in the fair class, a running
+task is not preempted by a waking task before its request is used up, unless
+the waking task has a shorter slice.
+
+Not carried over: delayed dequeue, next/short buddies, PELT per task and per
+group, util_est, energy aware placement, misfit migration, NUMA balancing and
+``cpu.idle`` (treated as a plain weight). For schedutil, PFS keeps one PELT
+utilisation signal per CPU, like the RT class does, and ``cpu_util_cfs()``
+returns it while PFS is active.
 
 
 Data structures
@@ -263,9 +299,8 @@ Lock order::
 - The running task is parked only from ``put_prev_task()``, after which the
   run queue lock is held until ``finish_task_switch()`` has cleared
   ``p->on_cpu``. A remote CPU holding a run queue lock therefore never sees a
-  waiting task that is still switching out. A task parked while it keeps
-  running (a cgroup move of the running task) is admitted in place by a hand-
-  off or retry, never migrated.
+  waiting task that is still switching out. Hand-offs and retries still check
+  ``task_on_cpu()`` and admit such a task in place instead of migrating it.
 - ``pick_task()`` and ``balance()`` drop the run queue lock only through
   ``rq_unpin_lock()``/``double_lock_balance()`` after ``rq_modified_begin()``,
   and return ``RETRY_TASK`` when a higher class became runnable meanwhile, as
@@ -280,8 +315,9 @@ both followed by a pick on *C*:
 
 - ``dequeue_task(DEQUEUE_SLEEP)`` from ``__schedule()`` when it blocks;
 - ``balance()`` when its slice has ended and it must rotate (marked by the
-  tick, which also requests the reschedule). *prev* becomes ``PFS_PARKING``:
-  no slots, not pickable, on no list.
+  tick when it interrupted user space, or by the task work on the way back to
+  user space, which also request the reschedule). *prev* becomes
+  ``PFS_PARKING``: no slots, not pickable, on no list.
 
 ``balance()`` then hands the freed slots to the first waiting task(s) with
 *C* as the target. Finally ``put_prev_task()`` resolves a parking *prev*: it
@@ -381,10 +417,23 @@ throttling, the fair load balancer, task PELT.
 Statistics
 ==========
 
-``/sys/kernel/debug/sched/pfs/stats`` sums per-CPU counters: admissions,
-parks (full, budget, FIFO), hand-offs (same CPU, in place), retries,
-rotations, pulls and pushes. ``/sys/kernel/debug/sched/pfs/groups`` lists
-limited groups with limit, slots taken, waiting tasks and budget usage.
+Under ``/sys/kernel/debug/sched/pfs/``:
+
+``stats``
+   sums of per-CPU counters: ``admit`` (slots taken), ``park_full``,
+   ``park_budget``, ``park_fifo`` (waits by reason), ``rotate`` (slots given
+   back at the end of a slice), ``handoff`` (waiting task pulled to the CPU
+   that freed the slot), ``handoff_local`` (it was already there), ``inplace``
+   (admitted on its own CPU), ``retry``, ``pull``, ``push``, ``kick``; plus
+   the number of limited groups and of waiting tasks.
+
+``groups``
+   limited groups and groups with waiting tasks: limit in milli-CPUs, slots
+   taken, waiting tasks, budget used in the current window, weight,
+   hierarchical weight, active count and path.
+
+``window_us``
+   length of the budget window, 1000 to 1000000 (default 10000).
 
 
 Limits of this implementation
@@ -395,8 +444,21 @@ Limits of this implementation
 - Active-set changes of groups take one global spin lock (only on 0 <-> 1
   transitions of a group's admitted count).
 - The budget slot is accounted per tick; a group can overrun its budget by up
-  to a tick per running thread per window, which is carried over.
+  to a tick per running thread per window, which is carried over (as debt of
+  up to ten budgets, so that limits much smaller than a tick per window are
+  still met on average).
+- Tasks running in the kernel on credit can exceed the limit for as long as
+  they stay in the kernel, as under CFS bandwidth control.
 - Effective weights of queued, not running tasks are refreshed only when they
-  are next admitted or start running.
+  start running or are admitted again.
+- Within a limited group, slots are shared by weight between its children, but
+  among the threads of one child in FIFO order, i.e. per thread, not by nice
+  value.
+- CPU utilisation for schedutil is a per-CPU signal; there is no per-task
+  utilisation, so util_est, uclamp of individual tasks on frequency selection
+  and energy aware placement don't apply to PFS tasks.
+- NUMA balancing is not run for PFS tasks.
+- With ``nohz_full``, a CPU running a single task of a limited group keeps its
+  tick so that the group's slots can rotate.
 - Group hierarchies deeper than 63 levels are only limited on their top 63
   levels.

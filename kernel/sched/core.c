@@ -8842,8 +8842,9 @@ static void dump_rq_tasks(struct rq *rq, const char *loglvl)
 #ifdef CONFIG_SCHED_PFS
 /*
  * Tasks waiting for a PFS slot are not on the CPU's run queue tree and are
- * not pushed away by balance_push(). Move the ones still assigned to the dead
- * CPU to a CPU they may run on, where they are admitted or wait again.
+ * not pushed away by balance_push(). Move the ones still assigned to the dying
+ * CPU to a CPU they may run on, where they are admitted or wait again. Runs on
+ * the dying CPU from stop_machine(), with interrupts disabled.
  */
 static void pfs_migrate_dying_waiters(unsigned int cpu)
 {
@@ -8854,23 +8855,25 @@ static void pfs_migrate_dying_waiters(unsigned int cpu)
 	if (!pfs_enabled())
 		return;
 
+	lockdep_assert_irqs_disabled();
+
 	while ((p = pfs_get_dying_waiter(cpu_rq(cpu)))) {
 		bool moved = false;
+		int dest_cpu;
 
-		raw_spin_lock_irq(&p->pi_lock);
+		raw_spin_lock(&p->pi_lock);
+		/* may change the affinity, which takes the rq lock: not held yet */
+		dest_cpu = select_fallback_rq(cpu, p);
 		rq = cpu_rq(cpu);
 		rq_lock(rq, &rf);
 		update_rq_clock(rq);
-		if (task_rq(p) == rq && task_on_rq_queued(p) && !task_on_cpu(rq, p)) {
-			int dest_cpu = select_fallback_rq(cpu, p);
-
-			if (dest_cpu != cpu) {
-				rq = __migrate_task(rq, &rf, p, dest_cpu);
-				moved = task_cpu(p) != cpu;
-			}
+		if (task_rq(p) == rq && task_on_rq_queued(p) && !task_on_cpu(rq, p) &&
+		    dest_cpu != cpu) {
+			rq = __migrate_task(rq, &rf, p, dest_cpu);
+			moved = task_cpu(p) != cpu;
 		}
 		rq_unlock(rq, &rf);
-		raw_spin_unlock_irq(&p->pi_lock);
+		raw_spin_unlock(&p->pi_lock);
 		put_task_struct(p);
 
 		if (WARN_ON_ONCE(!moved))

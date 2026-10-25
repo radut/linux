@@ -359,6 +359,27 @@ int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
 	return 0;
 }
 
+#ifdef CONFIG_SCHED_PFS
+/*
+ * pfs:
+ *
+ *   util_sum = cpu_scale * load_sum
+ *   util_avg = util_sum / divider
+ *
+ * As for rt_rq, the utilization of PFS tasks on a CPU is tracked as one
+ * signal of the run queue, there is no per-task PELT under PFS.
+ */
+int update_pfs_rq_load_avg(u64 now, struct rq *rq, int running)
+{
+	if (___update_load_sum(now, &rq->avg_pfs, running, running, running)) {
+		___update_load_avg(&rq->avg_pfs, 1);
+		return 1;
+	}
+
+	return 0;
+}
+#endif
+
 /*
  * dl_rq:
  *

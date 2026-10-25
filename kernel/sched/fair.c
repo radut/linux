@@ -9807,11 +9807,19 @@ cpu_util(int cpu, struct task_struct *p, int dst_cpu, int boost)
 
 unsigned long cpu_util_cfs(int cpu)
 {
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		return cpu_util_pfs(cpu);
+#endif
 	return cpu_util(cpu, NULL, -1, 0);
 }
 
 unsigned long cpu_util_cfs_boost(int cpu)
 {
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		return cpu_util_pfs(cpu);
+#endif
 	return cpu_util(cpu, NULL, -1, 1);
 }
 
