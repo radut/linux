@@ -51,6 +51,9 @@ enum pfs_state {
 	PFS_PARKING,	/* running task which gave its slots back */
 };
 
+/* groups with a limit; while there are none, admission is a no-op */
+static atomic_t pfs_nr_limited;
+
 /* earliest interval between two pushes from the same CPU */
 #define PFS_PUSH_INTERVAL	1	/* jiffies */
 /* tasks examined when looking for one to migrate */
@@ -374,8 +377,531 @@ found:
 	return best;
 }
 
+static int pfs_find_idle_cpu(struct task_struct *p, int target);
+
 /**************************************************************
- * Admission. In this version every task is admitted at once.
+ * Groups and slots.
+ */
+
+/* see sched-pfs.rst: window of the budget slot */
+static u64 pfs_window_ns = 10 * NSEC_PER_MSEC;
+/* less budget than this left counts as none (unless the budget is smaller) */
+#define PFS_MIN_BUDGET_NS	(100 * NSEC_PER_USEC)
+/* waiting tasks examined per hand-off and per retry */
+#define PFS_HANDOFF_TRIES	8
+#define PFS_RETRY_MAX		32
+/* levels which can hold a slot, see sched_pfs_entity::slot_mask */
+#define PFS_MAX_DEPTH		63
+
+enum pfs_reserve {
+	PFS_RES_OK,
+	PFS_RES_FULL,		/* all slots of a level are taken */
+	PFS_RES_BUDGET,		/* the budget slot has no budget left */
+	PFS_RES_FIFO,		/* others wait at the level */
+};
+
+static inline struct task_group *pfs_tg(struct pfs_group *g)
+{
+	return container_of(g, struct task_group, pfs);
+}
+
+static inline struct pfs_group *pfs_parent(struct pfs_group *g)
+{
+	struct task_group *parent = pfs_tg(g)->parent;
+
+	return parent ? &parent->pfs : NULL;
+}
+
+static inline struct pfs_group *task_pfs_group(struct task_struct *p)
+{
+	return &p->sched_task_group->pfs;
+}
+
+/* walk @g and its ancestors which can hold slots: not the root */
+#define for_each_pfs_level(lg, g) \
+	for (lg = (g); lg && lg->depth > 0; lg = pfs_parent(lg))
+
+static inline bool pfs_level_limited(struct pfs_group *lg)
+{
+	return READ_ONCE(lg->limit) && lg->depth <= PFS_MAX_DEPTH;
+}
+
+static inline unsigned int pfs_width(unsigned int limit)
+{
+	return DIV_ROUND_UP(limit, 1000);
+}
+
+static inline u64 pfs_now(void)
+{
+	return ktime_get_mono_fast_ns();
+}
+
+static inline u64 pfs_budget(unsigned int limit)
+{
+	return div_u64((u64)limit * pfs_window_ns, 1000);
+}
+
+/*
+ * The part of @lg's budget left in the current window. Windows are aligned
+ * to multiples of the window length so that one timer per group finds the
+ * budget refilled. Usage beyond the budget is carried into the next window,
+ * up to one budget, so that the average stays at the limit.
+ */
+static u64 pfs_window_left(struct pfs_group *lg, u64 now)
+{
+	u64 id = div64_u64(now, pfs_window_ns);
+	s64 old = atomic64_read(&lg->window_id);
+	u64 budget = pfs_budget(READ_ONCE(lg->limit));
+	u64 used;
+
+	if ((u64)old != id && atomic64_try_cmpxchg(&lg->window_id, &old, id)) {
+		used = atomic64_read(&lg->window_used);
+		if (id == (u64)old + 1 && used > budget)
+			used = min(used - budget, budget);
+		else
+			used = 0;
+		atomic64_set(&lg->window_used, used);
+	}
+
+	used = atomic64_read(&lg->window_used);
+	return used < budget ? budget - used : 0;
+}
+
+/*
+ * Take one slot at the limited level @lg. The first floor(limit) slots are
+ * free, the last slot of a fractional limit needs budget left in the window,
+ * and clips *@run_limit to it.
+ */
+static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
+				      u64 *run_limit)
+{
+	unsigned int limit = READ_ONCE(lg->limit);
+	unsigned int taken;
+	u64 left, min_left;
+
+	taken = atomic_inc_return(&lg->nr_slots) - 1;
+	if (taken >= pfs_width(limit)) {
+		atomic_dec(&lg->nr_slots);
+		return PFS_RES_FULL;
+	}
+
+	if (taken >= limit / 1000) {
+		left = pfs_window_left(lg, now);
+		min_left = min_t(u64, pfs_budget(limit), PFS_MIN_BUDGET_NS);
+		if (!left || left < min_left) {
+			atomic_dec(&lg->nr_slots);
+			return PFS_RES_BUDGET;
+		}
+		*run_limit = min(*run_limit, left);
+	}
+	return PFS_RES_OK;
+}
+
+static void pfs_queue_retry(struct pfs_group *lg);
+
+/*
+ * Give back the slots in @mask on @g's path. Like a wait queue wake-up, the
+ * waiters are checked after the slot counts went down, see pfs_park().
+ * Returns true if a level has waiting tasks.
+ */
+static bool pfs_put_slots(struct pfs_group *g, u64 mask, bool retry)
+{
+	struct pfs_group *lg;
+	bool waiters = false;
+
+	if (!mask)
+		return false;
+
+	for_each_pfs_level(lg, g) {
+		if (lg->depth <= PFS_MAX_DEPTH && (mask & BIT_ULL(lg->depth)))
+			atomic_dec(&lg->nr_slots);
+	}
+
+	/* order the slot counts before the waiter check, see pfs_waiter_linked() */
+	smp_mb__after_atomic();
+
+	for_each_pfs_level(lg, g) {
+		if (lg->depth > PFS_MAX_DEPTH || !(mask & BIT_ULL(lg->depth)))
+			continue;
+		if (READ_ONCE(lg->nr_waiting)) {
+			waiters = true;
+			if (retry)
+				pfs_queue_retry(lg);
+		}
+	}
+	return waiters;
+}
+
+/*
+ * Take a slot at every limited level of @g's path, deepest first. On failure
+ * nothing is held and *@fail is the refusing level. With @fifo a level with
+ * waiting tasks refuses, so that newcomers don't overtake them.
+ */
+static enum pfs_reserve pfs_reserve(struct task_struct *p, struct pfs_group *g,
+				    bool fifo, struct pfs_group **fail)
+{
+	enum pfs_reserve ret = PFS_RES_OK;
+	struct sched_pfs_entity *pe = &p->pfs;
+	u64 run_limit = pfs_task_slice(p);
+	u64 now = 0, mask = 0;
+	struct pfs_group *lg;
+
+	for_each_pfs_level(lg, g) {
+		if (!pfs_level_limited(lg))
+			continue;
+
+		if (fifo && READ_ONCE(lg->nr_waiting)) {
+			ret = PFS_RES_FIFO;
+			break;
+		}
+
+		if (!now)
+			now = pfs_now();
+		ret = pfs_take_slot(lg, now, &run_limit);
+		if (ret != PFS_RES_OK)
+			break;
+		mask |= BIT_ULL(lg->depth);
+	}
+
+	if (ret != PFS_RES_OK) {
+		/* a level above may have refused while waiters were held off */
+		pfs_put_slots(g, mask, true);
+		*fail = lg;
+		return ret;
+	}
+
+	pe->slot_mask = mask;
+	pe->grp = g;
+	pe->run_start = p->se.sum_exec_runtime;
+	pe->run_limit = run_limit;
+	return PFS_RES_OK;
+}
+
+/* A limited level of @g's path has no free slot or waiters, roughly. */
+static bool pfs_path_full(struct pfs_group *g)
+{
+	struct pfs_group *lg;
+
+	for_each_pfs_level(lg, g) {
+		if (!pfs_level_limited(lg))
+			continue;
+		if (READ_ONCE(lg->nr_waiting) ||
+		    (unsigned int)atomic_read(&lg->nr_slots) >=
+		    pfs_width(READ_ONCE(lg->limit)))
+			return true;
+	}
+	return false;
+}
+
+/* A level of @lg can take one more task right now, roughly. */
+static bool pfs_slot_free(struct pfs_group *lg)
+{
+	unsigned int limit = READ_ONCE(lg->limit);
+
+	if (!limit)
+		return true;
+	return (unsigned int)atomic_read(&lg->nr_slots) < pfs_width(limit);
+}
+
+/*
+ * The running task @p has used up its run limit: should it give its slots
+ * back? Yes if a level of its path has waiting tasks, holds more slots than
+ * its limit allows (the limit went down), is out of budget while its budget
+ * slot is taken, or became limited after @p took its slots.
+ */
+static bool pfs_should_rotate(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	struct pfs_group *lg;
+	u64 now = 0;
+
+	for_each_pfs_level(lg, pe->grp) {
+		unsigned int limit = READ_ONCE(lg->limit);
+		unsigned int taken;
+
+		if (!pfs_level_limited(lg))
+			continue;
+		if (!(pe->slot_mask & BIT_ULL(lg->depth)))
+			return true;
+		if (READ_ONCE(lg->nr_waiting))
+			return true;
+		taken = atomic_read(&lg->nr_slots);
+		if (taken > pfs_width(limit))
+			return true;
+		if (taken > limit / 1000) {
+			if (!now)
+				now = pfs_now();
+			if (!pfs_window_left(lg, now))
+				return true;
+		}
+	}
+	return false;
+}
+
+/* charge @delta of runtime to the budget windows of @g's limited levels */
+static void pfs_charge(struct pfs_group *g, u64 delta)
+{
+	struct pfs_group *lg;
+	u64 now = 0;
+
+	for_each_pfs_level(lg, g) {
+		if (!pfs_level_limited(lg))
+			continue;
+		if (!now)
+			now = pfs_now();
+		pfs_window_left(lg, now);
+		atomic64_add(delta, &lg->window_used);
+	}
+}
+
+/**************************************************************
+ * Waiting.
+ */
+
+static enum hrtimer_restart pfs_window_timer_fn(struct hrtimer *timer);
+static void pfs_group_retry(struct pfs_group *g);
+
+/* Start @lg's timer for the next window, for tasks waiting for budget. */
+static void pfs_arm_window_timer(struct pfs_group *lg)
+{
+	u64 now, next;
+
+	if (atomic_cmpxchg(&lg->timer_armed, 0, 1))
+		return;
+
+	now = pfs_now();
+	next = (div64_u64(now, pfs_window_ns) + 1) * pfs_window_ns;
+	hrtimer_start(&lg->window_timer, ns_to_ktime(next), HRTIMER_MODE_ABS_PINNED_HARD);
+}
+
+static enum hrtimer_restart pfs_window_timer_fn(struct hrtimer *timer)
+{
+	struct pfs_group *lg = container_of(timer, struct pfs_group, window_timer);
+
+	atomic_set(&lg->timer_armed, 0);
+	pfs_group_retry(lg);
+	return HRTIMER_NORESTART;
+}
+
+static void pfs_retry_workfn(struct irq_work *work)
+{
+	pfs_group_retry(container_of(work, struct pfs_group, retry_work));
+}
+
+/* Admit @lg's waiting tasks soon, from a context without run queue locks. */
+static void pfs_queue_retry(struct pfs_group *lg)
+{
+	irq_work_queue(&lg->retry_work);
+}
+
+static DEFINE_PER_CPU(struct cpumask, pfs_kick_mask);
+
+static void pfs_kick_workfn(struct irq_work *work)
+{
+	struct cpumask *mask = this_cpu_ptr(&pfs_kick_mask);
+	int cpu;
+
+	for_each_cpu(cpu, mask) {
+		cpumask_clear_cpu(cpu, mask);
+		resched_cpu(cpu);
+	}
+}
+
+static DEFINE_PER_CPU(struct irq_work, pfs_kick_work) =
+	IRQ_WORK_INIT_HARD(pfs_kick_workfn);
+
+/*
+ * Make @cpu reschedule, e.g. an idle CPU which should pull a task. Callers
+ * hold a run queue lock, so it is done from an irq_work.
+ */
+static void pfs_kick_cpu(int cpu)
+{
+	cpumask_set_cpu(cpu, this_cpu_ptr(&pfs_kick_mask));
+	irq_work_queue(this_cpu_ptr(&pfs_kick_work));
+}
+
+static void __pfs_link_waiter(struct sched_pfs_entity *pe, struct pfs_group *lg)
+{
+	raw_spin_lock(&lg->lock);
+	list_add_tail(&pe->wait_node, &lg->waiters);
+	WRITE_ONCE(lg->nr_waiting, lg->nr_waiting + 1);
+	raw_spin_unlock(&lg->lock);
+	pe->wait_grp = lg;
+}
+
+static void __pfs_unlink_waiter(struct sched_pfs_entity *pe)
+{
+	struct pfs_group *lg = pe->wait_grp;
+
+	raw_spin_lock(&lg->lock);
+	list_del_init(&pe->wait_node);
+	WRITE_ONCE(lg->nr_waiting, lg->nr_waiting - 1);
+	raw_spin_unlock(&lg->lock);
+	pe->wait_grp = NULL;
+}
+
+/*
+ * After linking a waiter, check for a free slot that a concurrent release
+ * may have left without seeing the waiter (paired with pfs_put_slots()).
+ */
+static void pfs_waiter_linked(struct pfs_group *lg, enum pfs_reserve why)
+{
+	if (why == PFS_RES_BUDGET)
+		pfs_arm_window_timer(lg);
+
+	/* order linking before the slot check, see pfs_put_slots() */
+	smp_mb();
+	if (pfs_slot_free(lg))
+		pfs_queue_retry(lg);
+}
+
+/* @p, runnable on @rq, waits for a slot at @lg. */
+static void pfs_park(struct rq *rq, struct task_struct *p, struct pfs_group *lg,
+		     enum pfs_reserve why)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+
+	pe->state = PFS_WAITING;
+	__pfs_link_waiter(pe, lg);
+	list_add_tail(&pe->rq_wait_node, &rq->pfs.waiters);
+	rq->pfs.nr_waiting++;
+	pfs_waiter_linked(lg, why);
+}
+
+static void pfs_unpark(struct rq *rq, struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+
+	__pfs_unlink_waiter(pe);
+	list_del_init(&pe->rq_wait_node);
+	rq->pfs.nr_waiting--;
+	pe->state = PFS_NONE;
+}
+
+/*
+ * Try to reserve slots for the task @p waiting at @lg, @rq is task_rq(p) and
+ * locked. Returns 1 when @p holds its slots (still linked), 0 when another
+ * level refused and @p now waits there, -1 when @lg itself refused.
+ */
+static int pfs_try_waiter(struct rq *rq, struct task_struct *p,
+			  struct pfs_group *lg)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	struct pfs_group *g = task_pfs_group(p), *fail = NULL;
+	enum pfs_reserve ret;
+
+	lockdep_assert_rq_held(rq);
+
+	ret = pfs_reserve(p, g, false, &fail);
+	if (ret == PFS_RES_OK)
+		return 1;
+
+	if (fail == lg) {
+		if (ret == PFS_RES_BUDGET)
+			pfs_arm_window_timer(lg);
+		return -1;
+	}
+
+	/* wait at the level which refused */
+	__pfs_unlink_waiter(pe);
+	__pfs_link_waiter(pe, fail);
+	pfs_waiter_linked(fail, ret);
+	return 0;
+}
+
+static bool pfs_waiting_at(struct rq *rq, struct task_struct *p,
+			   struct pfs_group *lg)
+{
+	return task_rq(p) == rq && task_on_rq_queued(p) &&
+	       p->pfs.state == PFS_WAITING && p->pfs.wait_grp == lg;
+}
+
+static struct task_struct *pfs_first_waiter(struct pfs_group *lg)
+{
+	struct sched_pfs_entity *pe;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&lg->lock, flags);
+	pe = list_first_entry_or_null(&lg->waiters, struct sched_pfs_entity,
+				      wait_node);
+	raw_spin_unlock_irqrestore(&lg->lock, flags);
+	return pe ? pfs_task_of(pe) : NULL;
+}
+
+static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags);
+
+/*
+ * Admit the waiting task @p, which holds its slots now, on its own CPU, and
+ * kick an idle CPU if @p has to wait behind other tasks there.
+ */
+static void pfs_admit_in_place(struct rq *rq, struct task_struct *p)
+{
+	int cpu;
+
+	pfs_unpark(rq, p);
+	pfs_queue_task(rq, p, 0);
+	wakeup_preempt(rq, p, 0);
+
+	if (rq->curr == rq->idle || task_current_donor(rq, p) ||
+	    rq->pfs.nr_queued < 2)
+		return;
+
+	cpu = pfs_find_idle_cpu(p, cpu_of(rq));
+	if (cpu >= 0)
+		pfs_kick_cpu(cpu);
+}
+
+/*
+ * Admit waiting tasks of @lg on their own CPUs while it has free slots. Runs
+ * without run queue locks held: from the cpu.max write, the window timer and
+ * the retry irq_work. A waiting task can't exit, and its task_struct stays
+ * valid under RCU while it is looked up.
+ */
+static void pfs_group_retry(struct pfs_group *lg)
+{
+	int n;
+
+	for (n = 0; n < PFS_RETRY_MAX; n++) {
+		struct task_struct *p;
+		struct rq_flags rf;
+		struct rq *rq;
+		int ret = -1;
+
+		rcu_read_lock();
+		p = pfs_first_waiter(lg);
+		if (!p) {
+			rcu_read_unlock();
+			return;
+		}
+
+		rq = task_rq_lock(p, &rf);
+		if (pfs_waiting_at(rq, p, lg)) {
+			if (!sched_task_cpu_allowed(p, cpu_of(rq))) {
+				/* hotplug moves it, see pfs_get_dying_waiter() */
+				ret = -1;
+			} else {
+				update_rq_clock(rq);
+				ret = pfs_try_waiter(rq, p, lg);
+				if (ret > 0)
+					pfs_admit_in_place(rq, p);
+			}
+		} else {
+			/* raced with a hand-off, look again */
+			ret = 0;
+		}
+		task_rq_unlock(rq, p, &rf);
+		rcu_read_unlock();
+
+		if (ret < 0)
+			return;
+	}
+
+	/* more waiters, continue later */
+	pfs_queue_retry(lg);
+}
+
+/**************************************************************
+ * Admitted tasks on a CPU.
  */
 
 static unsigned long pfs_effective_weight(struct task_struct *p)
@@ -401,8 +927,6 @@ static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 	if (prq->curr != p)
 		__pfs_enqueue_entity(prq, pe);
 
-	pe->run_start = p->se.sum_exec_runtime;
-	pe->run_limit = pfs_task_slice(p);
 	pe->rotate = 0;
 
 	if (!prq->nr_queued++)
@@ -431,6 +955,52 @@ static void pfs_unqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	sub_nr_running(rq, 1);
 }
 
+/* Give back the slots @p holds. */
+static void pfs_release_slots(struct rq *rq, struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	u64 mask = pe->slot_mask;
+
+	pe->slot_mask = 0;
+	pe->granted = 0;
+	if (mask)
+		pfs_put_slots(pe->grp, mask, true);
+}
+
+/* Admit @p on @rq if it gets its slots, otherwise make it wait. */
+static void pfs_admit_or_park(struct rq *rq, struct task_struct *p, int flags)
+{
+	struct pfs_group *g = task_pfs_group(p), *fail = NULL;
+	enum pfs_reserve ret;
+
+	ret = pfs_reserve(p, g, true, &fail);
+	if (ret == PFS_RES_OK)
+		pfs_queue_task(rq, p, flags);
+	else
+		pfs_park(rq, p, fail, ret);
+}
+
+/* The run limit of a task which keeps its slots for another round. */
+static u64 pfs_run_limit(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	u64 limit = pfs_task_slice(p), now = 0;
+	struct pfs_group *lg;
+
+	for_each_pfs_level(lg, pe->grp) {
+		unsigned int l = READ_ONCE(lg->limit);
+
+		if (!pfs_level_limited(lg) || !(l % 1000))
+			continue;
+		if ((unsigned int)atomic_read(&lg->nr_slots) <= l / 1000)
+			continue;
+		if (!now)
+			now = pfs_now();
+		limit = min(limit, pfs_window_left(lg, now));
+	}
+	return max_t(u64, limit, TICK_NSEC);
+}
+
 /**************************************************************
  * Runtime accounting.
  */
@@ -452,6 +1022,8 @@ static void update_curr_pfs(struct rq *rq)
 	dl_server_update(&rq->fair_server, delta);
 
 	pe = &curr->pfs;
+	if (pe->slot_mask)
+		pfs_charge(pe->grp, delta);
 	if (pe->state != PFS_QUEUED)
 		return;
 
@@ -468,6 +1040,9 @@ static void enqueue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_pfs_entity *pe = &p->pfs;
 
+	/* a waiting task stays in its queue across a save/restore */
+	if (pe->state == PFS_WAITING)
+		return;
 	if (WARN_ON_ONCE(pe->state != PFS_NONE))
 		return;
 
@@ -477,7 +1052,24 @@ static void enqueue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & ENQUEUE_MIGRATED)
 		p->se.exec_start = 0;
 
-	pfs_queue_task(rq, p, flags);
+	/* kept its slots across a migration or an attribute change */
+	if (pe->granted && pe->grp == task_pfs_group(p)) {
+		pe->granted = 0;
+		pfs_queue_task(rq, p, flags);
+		return;
+	}
+	if (pe->slot_mask)
+		pfs_release_slots(rq, p);
+
+	pfs_admit_or_park(rq, p, flags);
+}
+
+/* A dequeue which is followed by an enqueue into the same group. */
+static inline bool pfs_dequeue_keeps(struct task_struct *p, int flags)
+{
+	if (flags & (DEQUEUE_MOVE | DEQUEUE_CLASS))
+		return false;
+	return (flags & DEQUEUE_SAVE) || task_on_rq_migrating(p);
 }
 
 static bool dequeue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
@@ -488,9 +1080,27 @@ static bool dequeue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 	case PFS_QUEUED:
 		update_curr_pfs(rq);
 		pfs_unqueue_task(rq, p, flags);
+		if (pe->slot_mask && pfs_dequeue_keeps(p, flags))
+			pe->granted = 1;
+		else
+			pfs_release_slots(rq, p);
 		break;
-	default:
-		WARN_ON_ONCE(1);
+	case PFS_WAITING:
+		/*
+		 * sched_change holds the run queue lock until the enqueue, so
+		 * nobody admits the task meanwhile: keep its place.
+		 */
+		if ((flags & DEQUEUE_SAVE) && !task_on_rq_migrating(p) &&
+		    !(flags & (DEQUEUE_MOVE | DEQUEUE_CLASS)))
+			break;
+		pfs_unpark(rq, p);
+		break;
+	case PFS_PARKING:
+		/* gave its slots back already */
+		pe->state = PFS_NONE;
+		break;
+	case PFS_NONE:
+		/* moved with its slots by a hand-off */
 		break;
 	}
 	return true;
@@ -591,14 +1201,34 @@ static void put_prev_task_pfs(struct rq *rq, struct task_struct *prev,
 	struct pfs_rq *prq = &rq->pfs;
 	struct sched_pfs_entity *pe = &prev->pfs;
 
-	if (pe->state == PFS_QUEUED) {
+	if (pe->state == PFS_QUEUED || pe->state == PFS_PARKING)
 		update_curr_pfs(rq);
-		if (!pe->on_tree)
-			__pfs_enqueue_entity(prq, pe);
-	}
 
 	WARN_ON_ONCE(prq->curr != prev);
 	prq->curr = NULL;
+
+	switch (pe->state) {
+	case PFS_QUEUED:
+		if (!pe->on_tree)
+			__pfs_enqueue_entity(prq, pe);
+		break;
+	case PFS_PARKING:
+		/*
+		 * Its slice ended while others wait: admit it again only if
+		 * it doesn't overtake anybody, else it waits at the tail. The
+		 * run queue lock is held until it is off the CPU, see
+		 * finish_task_switch(), so nobody sees it waiting before.
+		 */
+		pe->state = PFS_NONE;
+		pfs_admit_or_park(rq, prev, 0);
+		/* admitted after all, don't let this CPU idle with it queued */
+		if (pe->state == PFS_QUEUED && next &&
+		    sched_class_above(&pfs_sched_class, next->sched_class))
+			pfs_kick_cpu(cpu_of(rq));
+		break;
+	default:
+		break;
+	}
 }
 
 static void set_next_task_pfs(struct rq *rq, struct task_struct *p,
@@ -623,11 +1253,28 @@ static void set_next_task_pfs(struct rq *rq, struct task_struct *p,
 
 static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 {
+	struct sched_pfs_entity *pe = &curr->pfs;
+
 	update_curr_pfs(rq);
 
-	if (curr->pfs.state != PFS_QUEUED) {
+	if (pe->state != PFS_QUEUED) {
 		resched_curr(rq);
 		return;
+	}
+
+	/*
+	 * A task of a limited group gives its slots back at the end of its
+	 * run limit if somebody waits for them, see pfs_should_rotate().
+	 */
+	if (atomic_read(&pfs_nr_limited) && !pe->rotate &&
+	    curr->se.sum_exec_runtime - pe->run_start >= pe->run_limit) {
+		if (pfs_should_rotate(curr)) {
+			pe->rotate = 1;
+			resched_curr(rq);
+		} else {
+			pe->run_start = curr->se.sum_exec_runtime;
+			pe->run_limit = pfs_run_limit(curr);
+		}
 	}
 
 #ifdef CONFIG_SCHED_HRTICK
@@ -647,6 +1294,13 @@ static void prio_changed_pfs(struct rq *rq, struct task_struct *p, u64 oldprio)
 	} else {
 		wakeup_preempt(rq, p, 0);
 	}
+}
+
+static void switched_from_pfs(struct rq *rq, struct task_struct *p)
+{
+	if (p->pfs.slot_mask)
+		pfs_release_slots(rq, p);
+	p->pfs.granted = 0;
 }
 
 static void switched_to_pfs(struct rq *rq, struct task_struct *p)
@@ -835,6 +1489,11 @@ static int select_task_rq_pfs(struct task_struct *p, int prev_cpu, int wake_flag
 	if (!(wake_flags & (WF_TTWU | WF_FORK | WF_EXEC)))
 		return prev_cpu;
 
+	/* it would wait for a slot, don't wake an idle CPU for it */
+	if (atomic_read(&pfs_nr_limited) && pfs_path_full(task_pfs_group(p)) &&
+	    cpumask_test_cpu(prev_cpu, p->cpus_ptr))
+		return prev_cpu;
+
 	if (wake_flags & (WF_FORK | WF_EXEC))
 		target = this_cpu;
 
@@ -943,8 +1602,32 @@ static void pfs_queue_push(struct rq *rq)
 	queue_balance_callback(rq, &per_cpu(pfs_push_head, cpu_of(rq)), pfs_push);
 }
 
+/*
+ * The previous task's slice ended while others wait for its slots: it gives
+ * them back now, before the pick, and is admitted again or parked in
+ * put_prev_task_pfs().
+ */
+static void pfs_rotate_out(struct rq *rq, struct task_struct *prev)
+{
+	struct sched_pfs_entity *pe = &prev->pfs;
+
+	pe->rotate = 0;
+	if (pe->state != PFS_QUEUED || !task_on_rq_queued(prev))
+		return;
+
+	update_curr_pfs(rq);
+	pfs_unqueue_task(rq, prev, 0);
+	pfs_release_slots(rq, prev);
+	pe->state = PFS_PARKING;
+}
+
 static int balance_pfs(struct rq *rq, struct rq_flags *rf)
 {
+	struct task_struct *prev = rq->donor;
+
+	if (prev->sched_class == &pfs_sched_class && prev->pfs.rotate)
+		pfs_rotate_out(rq, prev);
+
 	return rq->pfs.nr_queued || sched_stop_runnable(rq) ||
 	       sched_dl_runnable(rq) || sched_rt_runnable(rq);
 }
@@ -961,15 +1644,51 @@ void pfs_init_group(struct task_group *tg, struct task_group *parent)
 	INIT_LIST_HEAD(&g->waiters);
 	g->depth = parent ? parent->pfs.depth + 1 : 0;
 	g->weight = NICE_0_LOAD;
+	hrtimer_setup(&g->window_timer, pfs_window_timer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_ABS_PINNED_HARD);
+	g->retry_work = IRQ_WORK_INIT_HARD(pfs_retry_workfn);
 }
 
 void pfs_free_group(struct task_group *tg)
 {
+	struct pfs_group *g = &tg->pfs;
+
+	if (g->limit)
+		atomic_dec(&pfs_nr_limited);
+	hrtimer_cancel(&g->window_timer);
+	irq_work_sync(&g->retry_work);
+	WARN_ON_ONCE(!list_empty(&g->waiters));
 }
 
+/*
+ * cpu.max "quota period" is a limit of quota / period CPUs, kept in
+ * milli-CPUs. A limit as large as the machine is no limit.
+ */
 void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 			     u64 quota_us, u64 burst_us)
 {
+	struct pfs_group *g = &tg->pfs;
+	u64 limit = 0;
+	unsigned int old;
+
+	if (!pfs_enabled())
+		return;
+
+	if (quota_us != RUNTIME_INF && period_us) {
+		limit = div64_u64(quota_us * 1000 + period_us - 1, period_us);
+		if (limit >= (u64)num_possible_cpus() * 1000)
+			limit = 0;
+	}
+
+	old = xchg(&g->limit, (unsigned int)limit);
+	if (!old && limit)
+		atomic_inc(&pfs_nr_limited);
+	else if (old && !limit)
+		atomic_dec(&pfs_nr_limited);
+
+	/* the limit may have grown */
+	if (READ_ONCE(g->nr_waiting))
+		pfs_group_retry(g);
 }
 
 void pfs_group_set_weight(struct task_group *tg)
@@ -1029,9 +1748,22 @@ bool __init pfs_init_rq(struct rq *rq)
 	return true;
 }
 
+/* A waiting task assigned to @rq, which went offline, with a reference. */
 struct task_struct *pfs_get_dying_waiter(struct rq *rq)
 {
-	return NULL;
+	struct task_struct *p = NULL;
+	struct sched_pfs_entity *pe;
+	struct rq_flags rf;
+
+	rq_lock_irqsave(rq, &rf);
+	pe = list_first_entry_or_null(&rq->pfs.waiters, struct sched_pfs_entity,
+				      rq_wait_node);
+	if (pe) {
+		p = pfs_task_of(pe);
+		get_task_struct(p);
+	}
+	rq_unlock_irqrestore(rq, &rf);
+	return p;
 }
 
 bool pfs_can_stop_tick(struct rq *rq)
@@ -1058,6 +1790,7 @@ DEFINE_SCHED_CLASS(pfs) = {
 
 	.reweight_task		= reweight_task_pfs,
 	.prio_changed		= prio_changed_pfs,
+	.switched_from		= switched_from_pfs,
 	.switched_to		= switched_to_pfs,
 
 	.get_rr_interval	= get_rr_interval_pfs,
