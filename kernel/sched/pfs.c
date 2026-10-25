@@ -25,10 +25,14 @@
 #include <linux/irq_work.h>
 #include <linux/topology.h>
 
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+
 #include <uapi/linux/sched/types.h>
 
 #include "sched.h"
 #include "stats.h"
+#include "autogroup.h"
 
 DEFINE_STATIC_KEY_FALSE(__pfs_enabled);
 
@@ -50,6 +54,34 @@ enum pfs_state {
 	PFS_WAITING,	/* waiting for a slot in pfs_group::waiters */
 	PFS_PARKING,	/* running task which gave its slots back */
 };
+
+enum pfs_stat {
+	PFS_STAT_ADMIT,		/* slots taken for a task */
+	PFS_STAT_PARK_FULL,	/* waits: no free slot */
+	PFS_STAT_PARK_BUDGET,	/* waits: no budget */
+	PFS_STAT_PARK_FIFO,	/* waits: others wait already */
+	PFS_STAT_ROTATE,	/* gave its slots back at the end of a slice */
+	PFS_STAT_HANDOFF,	/* waiting task pulled to the CPU that freed slots */
+	PFS_STAT_HANDOFF_LOCAL,	/* ... which was already on that CPU */
+	PFS_STAT_INPLACE,	/* waiting task admitted on its own CPU */
+	PFS_STAT_RETRY,		/* retry runs */
+	PFS_STAT_PULL,		/* newly idle pulls */
+	PFS_STAT_PUSH,		/* pushes */
+	PFS_STAT_KICK,		/* idle CPUs kicked */
+	PFS_NR_STATS,
+};
+
+static const char * const pfs_stat_names[PFS_NR_STATS] = {
+	"admit", "park_full", "park_budget", "park_fifo", "rotate", "handoff",
+	"handoff_local", "inplace", "retry", "pull", "push", "kick",
+};
+
+static DEFINE_PER_CPU(unsigned long [PFS_NR_STATS], pfs_stats);
+
+static inline void pfs_stat(enum pfs_stat idx)
+{
+	this_cpu_inc(pfs_stats[idx]);
+}
 
 /* groups with a limit; while there are none, admission is a no-op */
 static atomic_t pfs_nr_limited;
@@ -383,7 +415,7 @@ static int pfs_find_idle_cpu(struct task_struct *p, int target);
  * Groups and slots.
  */
 
-/* see sched-pfs.rst: window of the budget slot */
+/* see sched-pfs.rst: window of the budget slot, debugfs window_us */
 static u64 pfs_window_ns = 10 * NSEC_PER_MSEC;
 /* less budget than this left counts as none (unless the budget is smaller) */
 #define PFS_MIN_BUDGET_NS	(100 * NSEC_PER_USEC)
@@ -570,6 +602,8 @@ static enum pfs_reserve pfs_reserve(struct task_struct *p, struct pfs_group *g,
 		return ret;
 	}
 
+	if (mask)
+		pfs_stat(PFS_STAT_ADMIT);
 	pe->slot_mask = mask;
 	pe->grp = g;
 	pe->run_start = p->se.sum_exec_runtime;
@@ -716,6 +750,7 @@ static DEFINE_PER_CPU(struct irq_work, pfs_kick_work) =
  */
 static void pfs_kick_cpu(int cpu)
 {
+	pfs_stat(PFS_STAT_KICK);
 	cpumask_set_cpu(cpu, this_cpu_ptr(&pfs_kick_mask));
 	irq_work_queue(this_cpu_ptr(&pfs_kick_work));
 }
@@ -746,8 +781,18 @@ static void __pfs_unlink_waiter(struct sched_pfs_entity *pe)
  */
 static void pfs_waiter_linked(struct pfs_group *lg, enum pfs_reserve why)
 {
-	if (why == PFS_RES_BUDGET)
+	switch (why) {
+	case PFS_RES_BUDGET:
+		pfs_stat(PFS_STAT_PARK_BUDGET);
 		pfs_arm_window_timer(lg);
+		break;
+	case PFS_RES_FIFO:
+		pfs_stat(PFS_STAT_PARK_FIFO);
+		break;
+	default:
+		pfs_stat(PFS_STAT_PARK_FULL);
+		break;
+	}
 
 	/* order linking before the slot check, see pfs_put_slots() */
 	smp_mb();
@@ -838,6 +883,7 @@ static void pfs_admit_in_place(struct rq *rq, struct task_struct *p)
 {
 	int cpu;
 
+	pfs_stat(PFS_STAT_INPLACE);
 	pfs_unpark(rq, p);
 	pfs_queue_task(rq, p, 0);
 	wakeup_preempt(rq, p, 0);
@@ -861,6 +907,7 @@ static void pfs_group_retry(struct pfs_group *lg)
 {
 	int n;
 
+	pfs_stat(PFS_STAT_RETRY);
 	for (n = 0; n < PFS_RETRY_MAX; n++) {
 		struct task_struct *p;
 		struct rq_flags rf;
@@ -1655,6 +1702,7 @@ static int pfs_newidle(struct rq *this_rq, struct rq_flags *rf)
 	p = pfs_pick_migratable(src, this_cpu, ULONG_MAX);
 	if (p) {
 		move_queued_task_locked(src, this_rq, p);
+		pfs_stat(PFS_STAT_PULL);
 		pulled = 1;
 	}
 	double_unlock_balance(this_rq, src);
@@ -1797,8 +1845,10 @@ static void pfs_push(struct rq *rq)
 	get_task_struct(p);
 	double_lock_balance(rq, dst);
 	if (task_rq(p) == rq && task_on_rq_queued(p) && p->pfs.on_tree &&
-	    pfs_can_migrate(rq, p, cpu))
+	    pfs_can_migrate(rq, p, cpu)) {
 		move_queued_task_locked(rq, dst, p);
+		pfs_stat(PFS_STAT_PUSH);
+	}
 	double_unlock_balance(rq, dst);
 	put_task_struct(p);
 }
@@ -1831,6 +1881,7 @@ static void pfs_rotate_out(struct rq *rq, struct task_struct *prev)
 	pfs_unqueue_task(rq, prev, 0);
 	pfs_release_slots(rq, prev, true);
 	pe->state = PFS_PARKING;
+	pfs_stat(PFS_STAT_ROTATE);
 }
 
 /*
@@ -1875,6 +1926,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 				if (ret > 0) {
 					pfs_unpark(rq, p);
 					pfs_queue_task(rq, p, 0);
+					pfs_stat(PFS_STAT_HANDOFF_LOCAL);
 					got = 1;
 				}
 				continue;
@@ -1902,6 +1954,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 					deactivate_task(src, p, 0);
 					set_task_cpu(p, this_cpu);
 					activate_task(rq, p, 0);
+					pfs_stat(PFS_STAT_HANDOFF);
 					got = 1;
 				}
 			} else if (sched_task_cpu_allowed(p, cpu_of(src))) {
@@ -1968,7 +2021,13 @@ void pfs_free_group(struct task_group *tg)
 	if (g->limit)
 		atomic_dec(&pfs_nr_limited);
 	hrtimer_cancel(&g->window_timer);
-	irq_work_sync(&g->retry_work);
+	/*
+	 * Called from an RCU callback, irq_work_sync() may sleep. The group
+	 * has no tasks left, so no retry can be queued anymore; wait for one
+	 * that may still run, it is a hard irq_work.
+	 */
+	while (irq_work_is_busy(&g->retry_work))
+		cpu_relax();
 	WARN_ON_ONCE(!list_empty(&g->waiters));
 }
 
@@ -2093,6 +2152,89 @@ struct task_struct *pfs_get_dying_waiter(struct rq *rq)
 	}
 	rq_unlock_irqrestore(rq, &rf);
 	return p;
+}
+
+/**************************************************************
+ * Debugfs: /sys/kernel/debug/sched/pfs/
+ */
+
+static int pfs_stats_show(struct seq_file *m, void *v)
+{
+	unsigned long sum[PFS_NR_STATS] = { };
+	unsigned int nr_waiting = 0;
+	int cpu, i;
+
+	for_each_possible_cpu(cpu) {
+		for (i = 0; i < PFS_NR_STATS; i++)
+			sum[i] += per_cpu(pfs_stats, cpu)[i];
+		nr_waiting += READ_ONCE(cpu_rq(cpu)->pfs.nr_waiting);
+	}
+	seq_printf(m, "enabled %d\nlimited_groups %d\nwaiting %u\n",
+		   pfs_enabled() ? 1 : 0, atomic_read(&pfs_nr_limited), nr_waiting);
+	for (i = 0; i < PFS_NR_STATS; i++)
+		seq_printf(m, "%s %lu\n", pfs_stat_names[i], sum[i]);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(pfs_stats);
+
+static int pfs_groups_show(struct seq_file *m, void *v)
+{
+	struct task_group *tg;
+	char *path;
+
+	path = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!path)
+		return -ENOMEM;
+
+	seq_puts(m, "# limit_mcpu slots waiting window_used_us weight hweight active path\n");
+	rcu_read_lock();
+	list_for_each_entry_rcu(tg, &task_groups, list) {
+		struct pfs_group *g = &tg->pfs;
+
+		if (!READ_ONCE(g->limit) && !READ_ONCE(g->nr_waiting))
+			continue;
+		if (!autogroup_path(tg, path, PATH_MAX))
+			cgroup_path(tg->css.cgroup, path, PATH_MAX);
+		seq_printf(m, "%u %d %u %llu %lu %lu %d %s\n", READ_ONCE(g->limit),
+			   atomic_read(&g->nr_slots), READ_ONCE(g->nr_waiting),
+			   (u64)atomic64_read(&g->window_used) / NSEC_PER_USEC,
+			   scale_load_down(READ_ONCE(g->weight)),
+			   scale_load_down(READ_ONCE(g->hweight)),
+			   READ_ONCE(g->nr_active), path);
+	}
+	rcu_read_unlock();
+	kfree(path);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(pfs_groups);
+
+static int pfs_window_us_get(void *data, u64 *val)
+{
+	*val = div_u64(READ_ONCE(pfs_window_ns), NSEC_PER_USEC);
+	return 0;
+}
+
+static int pfs_window_us_set(void *data, u64 val)
+{
+	if (val < 1000 || val > USEC_PER_SEC)
+		return -EINVAL;
+	WRITE_ONCE(pfs_window_ns, val * NSEC_PER_USEC);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(pfs_window_us_fops, pfs_window_us_get,
+			 pfs_window_us_set, "%llu\n");
+
+void pfs_debugfs_init(struct dentry *parent)
+{
+	struct dentry *d;
+
+	if (!pfs_enabled())
+		return;
+
+	d = debugfs_create_dir("pfs", parent);
+	debugfs_create_file("stats", 0444, d, NULL, &pfs_stats_fops);
+	debugfs_create_file("groups", 0444, d, NULL, &pfs_groups_fops);
+	debugfs_create_file_unsafe("window_us", 0644, d, NULL, &pfs_window_us_fops);
 }
 
 bool pfs_can_stop_tick(struct rq *rq)

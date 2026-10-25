@@ -764,6 +764,9 @@ static __init int sched_init_debug(void)
 #ifdef CONFIG_SCHED_CLASS_EXT
 	debugfs_ext_server_init();
 #endif
+#ifdef CONFIG_SCHED_PFS
+	pfs_debugfs_init(debugfs_sched);
+#endif
 
 	return 0;
 }

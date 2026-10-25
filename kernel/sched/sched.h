@@ -2000,6 +2000,7 @@ extern void pfs_group_set_weight(struct task_group *tg);
 extern struct task_struct *pfs_get_dying_waiter(struct rq *rq);
 extern bool pfs_can_stop_tick(struct rq *rq);
 extern bool sched_task_cpu_allowed(struct task_struct *p, int cpu);
+extern void pfs_debugfs_init(struct dentry *parent);
 #else /* !CONFIG_SCHED_PFS */
 #define pfs_enabled()		false
 static inline bool pfs_init_rq(struct rq *rq) { return false; }
