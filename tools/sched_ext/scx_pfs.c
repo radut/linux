@@ -15,9 +15,15 @@ const char help_fmt[] =
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-s SLICE_US] [-w WINDOW_US] [-i INTERVAL] [-v]\n"
+"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i INTERVAL]\n"
+"       [-v]\n"
 "\n"
 "  -s SLICE_US   Slice duration (default: 2500)\n"
+"  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
+"                which woke up after this, also the least time a yielding\n"
+"                task keeps its slots (default: 500)\n"
+"  -r ROT_US     ... and to any waiting task after this, 0 for the end of the\n"
+"                slice (default: 1000)\n"
 "  -w WINDOW_US  Accounting window for fractional limits (default: 10000,\n"
 "                min: 1000)\n"
 "  -i INTERVAL   Report interval in seconds\n"
@@ -70,14 +76,19 @@ static void print_stats(struct scx_pfs *skel)
 	read_stats(skel, stats);
 	printf("direct=%llu shared=%llu park_full=%llu park_budget=%llu\n"
 	       "admit=%llu repark=%llu retry=%llu overflow=%llu race=%llu\n"
-	       "too_deep=%llu activate=%llu hweight=%llu keep=%llu\n",
+	       "too_deep=%llu activate=%llu hweight=%llu keep=%llu\n"
+	       "park_woken=%llu cut=%llu yield_keep=%llu yield_rotate=%llu "
+	       "kick=%llu rescue=%llu lost_path=%llu\n",
 	       stats[PFS_STAT_DIRECT], stats[PFS_STAT_SHARED],
 	       stats[PFS_STAT_PARK_FULL], stats[PFS_STAT_PARK_BUDGET],
 	       stats[PFS_STAT_ADMIT], stats[PFS_STAT_REPARK],
 	       stats[PFS_STAT_RETRY], stats[PFS_STAT_RETRY_OVERFLOW],
 	       stats[PFS_STAT_MOVE_RACE], stats[PFS_STAT_TOO_DEEP],
 	       stats[PFS_STAT_ACTIVATE], stats[PFS_STAT_HWEIGHT],
-	       stats[PFS_STAT_KEEP]);
+	       stats[PFS_STAT_KEEP], stats[PFS_STAT_PARK_WOKEN],
+	       stats[PFS_STAT_CUT], stats[PFS_STAT_YIELD_KEEP],
+	       stats[PFS_STAT_YIELD_ROTATE], stats[PFS_STAT_KICK],
+	       stats[PFS_STAT_RESCUE], stats[PFS_STAT_LOST_PATH]);
 	fflush(stdout);
 }
 
@@ -104,10 +115,16 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:w:i:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:w:i:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = strtoull(optarg, NULL, 0) * 1000;
+			break;
+		case 'c':
+			skel->rodata->cut_ns = strtoull(optarg, NULL, 0) * 1000;
+			break;
+		case 'r':
+			skel->rodata->rot_ns = strtoull(optarg, NULL, 0) * 1000;
 			break;
 		case 'w':
 			skel->rodata->window_ns = strtoull(optarg, NULL, 0) * 1000;
@@ -134,6 +151,9 @@ restart:
 		return 1;
 	}
 
+	if (skel->rodata->rot_ns && skel->rodata->cut_ns > skel->rodata->rot_ns)
+		fprintf(stderr, "WARNING: cut is longer than rot\n");
+
 	if (skel->rodata->slice_ns > skel->rodata->window_ns)
 		fprintf(stderr, "WARNING: slice is longer than the window\n");
 
@@ -144,8 +164,10 @@ restart:
 	skel->rodata->min_share = HWEIGHT_ONE * skel->rodata->slice_ns /
 				  (WAIT_MAX_NS * nr_cpus) ?: 1;
 
-	printf("slice=%lluus window=%lluus\n",
+	printf("slice=%lluus cut=%lluus rot=%lluus window=%lluus\n",
 	       (unsigned long long)skel->rodata->slice_ns / 1000,
+	       (unsigned long long)skel->rodata->cut_ns / 1000,
+	       (unsigned long long)skel->rodata->rot_ns / 1000,
 	       (unsigned long long)skel->rodata->window_ns / 1000);
 
 	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);

@@ -19,6 +19,32 @@
  * their slot back. A task whose slice expires gives its slots back in
  * ops.dispatch(), so that the next waiting task runs on the same CPU at once.
  *
+ * Waiting tasks are of two kinds, kept in two DSQs per cgroup: tasks which
+ * woke up and found no free slot, and tasks which gave their slots back at the
+ * end of a slice (rotated). Woken tasks are admitted first, but at most
+ * WOKEN_STREAK_MAX in a row while rotated tasks wait: they are typically
+ * request threads, lock holders, or the thread others spin or sleep for
+ * (Redis' main thread, a JVM's VM or GC threads), while rotated tasks are CPU
+ * bound and only take turns. While a woken task waits, a task holding its
+ * slots since a rotation gives them back after cut_ns (-c, 0.5ms), and while
+ * any task waits after rot_ns (-r, 1ms) instead of at the end of its slice; a
+ * task holding its slots since its own wakeup is not cut short. ops.tick()
+ * checks this, so the cuts are rounded up to a tick.
+ *
+ * sched_yield() doesn't give the slots away, unless the task has held them for
+ * cut_ns and others wait for them: a thread which yields with a lock held
+ * would otherwise wait a whole turn per yield, while the threads woken for the
+ * lock take its slots only to block again.
+ *
+ * Retries are processed by ops.dispatch() and by the window timer. A retry
+ * queued elsewhere, e.g. for slots given back in ops.stopping(), kicks an idle
+ * CPU so that the slots don't stay free until some CPU runs out of work. The
+ * timer also sweeps the cgroups which have waiting tasks and retries any that
+ * no retry walked for RESCUE_NS, which should never be needed and is counted.
+ * Slots are given back through the cgroup IDs of the task's path remembered
+ * when it joined its cgroup, so that the slots an exiting task holds on the
+ * ancestors of its already removed cgroup aren't leaked.
+ *
  * A fractional limit such as 1.5 is enforced as floor(1.5) == 1 slot without
  * any time budget plus one extra slot which is rate limited. The cgroup's total
  * usage is accounted in short windows (-w, 10ms by default) and the extra slot
@@ -112,12 +138,22 @@ enum {
 	RETRY_WALK_MAX		= 32,	/* tasks examined per retry_cgroup() */
 	TIMER_BATCH		= 64,
 	FRAC_ONE		= 1000,	/* limits are kept in milli-CPUs */
+	WOKEN_STREAK_MAX	= 4,	/* woken admissions in a row, see retry */
 };
+
+/*
+ * Each cgroup has two wait DSQs: rotated tasks wait in the DSQ with the
+ * cgroup's ID, tasks which woke up in the one with WOKEN_DSQ set as well.
+ * Cgroup IDs don't come close to bit 62.
+ */
+#define WOKEN_DSQ		(1LLU << 62)
 
 #define SLOT_LEVELS_MASK	0xffffffffLLU
 #define SLOT_SEQ_SHIFT		32
 #define MIN_BUDGET_NS		(100 * 1000LLU)
 #define HWEIGHT_REFRESH_NS	(1000 * 1000LLU)
+/* a waiting cgroup not walked by any retry for this long is retried */
+#define RESCUE_NS		(50 * 1000 * 1000LLU)
 
 _Static_assert(MAX_LEVELS <= SLOT_SEQ_SHIFT, "level bits overlap the sequence");
 
@@ -129,6 +165,10 @@ enum reserve_result {
 
 const volatile u64 slice_ns;
 const volatile u64 window_ns;
+/* a rotated holder gives its slots to a woken waiter after this, see tick */
+const volatile u64 cut_ns = 500 * 1000;
+/* and to any waiting task after this, 0 for the end of the slice */
+const volatile u64 rot_ns = 1000 * 1000;
 const volatile u64 min_share = 1;	/* see scale_by_cgrp_share() */
 
 static u64 vtime_now;
@@ -154,6 +194,9 @@ struct pfs_cgrp_ctx {
 	u32		retry_running;	/* a retry_cgroup() walks the DSQ */
 	u32		retry_walked;	/* tasks examined by the walker */
 	u32		budget_queued;
+	u32		woken_streak;	/* woken tasks admitted in a row */
+	u32		in_waitset;	/* listed in waitset */
+	u64		retry_at;	/* when a retry last walked the DSQs */
 	u64		window_id;
 	u64		window_used;	/* runtime charged in window_id */
 
@@ -182,6 +225,14 @@ struct pfs_task_ctx {
 	u64		started_at;
 	u64		run_cgid;	/* cgroup counting @p as runnable */
 	u64		run_weight;	/* weight @p is counted with */
+	u64		admitted_at;	/* when the slots were taken */
+	u32		rotated;	/* admitted after a rotation, not a wakeup */
+	/*
+	 * IDs of the cgroups on cgid's path by level, set with ->cgid. Slots
+	 * are given back through them: the cgroup of an exiting task can be
+	 * removed before the task's last switch, its ancestors are still there.
+	 */
+	u64		path_cgid[MAX_LEVELS];
 };
 
 struct {
@@ -197,6 +248,14 @@ struct {
 	__uint(max_entries, 16384);
 	__type(value, u64);
 } retry_q SEC(".maps");
+
+/* cgroups which had waiting tasks, swept by the timer, see rescue_cb() */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, u8);
+} waitset SEC(".maps");
 
 /* cgroups whose waiting tasks need the next window's budget */
 struct {
@@ -286,18 +345,76 @@ static struct pfs_cgrp_ctx *find_ancestor_ctx(struct cgroup *cgrp, int level,
 	return cgc;
 }
 
-static void queue_retry(struct pfs_cgrp_ctx *cgc, u64 cgid)
+/* tasks waiting for slots in @cgid's DSQs, rotated and woken */
+static u32 nr_waiting(u64 cgid)
+{
+	s32 rotated = scx_bpf_dsq_nr_queued(cgid);
+	s32 woken = scx_bpf_dsq_nr_queued(cgid | WOKEN_DSQ);
+
+	return (rotated > 0 ? rotated : 0) + (woken > 0 ? woken : 0);
+}
+
+static bool queue_retry(struct pfs_cgrp_ctx *cgc, u64 cgid)
 {
 	/* paired with the clearing in retry_cgroup() */
 	if (__sync_val_compare_and_swap(&cgc->retry_queued, 0, 1))
-		return;
+		return false;
 
 	/* a lost retry can stall the cgroup's waiting tasks forever */
 	if (bpf_map_push_elem(&retry_q, &cgid, 0)) {
 		cgc->retry_queued = 0;
 		stat_inc(PFS_STAT_RETRY_OVERFLOW);
 		scx_bpf_error("retry_q overflow for cgid %llu", cgid);
+		return false;
 	}
+	return true;
+}
+
+static void kick_idle_cpu(struct task_struct *p)
+{
+	s32 cpu;
+
+	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	if (cpu >= 0)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+}
+
+static bool kick_idle_cpu_any(void)
+{
+	const struct cpumask *idle;
+	s32 cpu;
+
+	idle = scx_bpf_get_idle_cpumask();
+	cpu = scx_bpf_pick_idle_cpu(idle, 0);
+	scx_bpf_put_idle_cpumask(idle);
+	if (cpu < 0)
+		return false;
+	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	return true;
+}
+
+/*
+ * Retries are processed by ops.dispatch() and by the window timer. A retry
+ * queued outside of dispatch, e.g. for slots given back in ops.stopping(),
+ * would wait for the next CPU to run out of work, up to a window on a
+ * mostly idle machine, while the slots stay free. Wake an idle CPU for it.
+ */
+static void queue_retry_kick(struct pfs_cgrp_ctx *cgc, u64 cgid)
+{
+	if (queue_retry(cgc, cgid) && kick_idle_cpu_any())
+		stat_inc(PFS_STAT_KICK);
+}
+
+/* list @cgid in waitset for the timer's sweep, see rescue_cb() */
+static void waitset_add(struct pfs_cgrp_ctx *cgc, u64 cgid)
+{
+	u8 one = 1;
+
+	if (cgc->in_waitset ||
+	    __sync_val_compare_and_swap(&cgc->in_waitset, 0, 1))
+		return;
+	if (bpf_map_update_elem(&waitset, &cgid, &one, BPF_ANY))
+		cgc->in_waitset = 0;
 }
 
 static void queue_budget(struct pfs_cgrp_ctx *cgc, u64 cgid)
@@ -406,7 +523,23 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
  * cover levels 1 to @cgrp->level, which is below MAX_LEVELS for a cgroup whose
  * tasks can hold slots.
  */
-static void put_slots(struct cgroup *cgrp, u64 mask, bool kick_waiters)
+enum put_flags {
+	PUT_RETRY	= 1 << 0,	/* queue a retry for levels with waiters */
+	PUT_KICK	= 1 << 1,	/* and kick an idle CPU to process it */
+};
+
+static void put_one_slot(struct pfs_cgrp_ctx *cgc, u64 cgid, u32 flags)
+{
+	__sync_fetch_and_sub(&cgc->nr_slots, 1);
+	if (!(flags & PUT_RETRY) || !nr_waiting(cgid))
+		return;
+	if (flags & PUT_KICK)
+		queue_retry_kick(cgc, cgid);
+	else
+		queue_retry(cgc, cgid);
+}
+
+static void put_slots(struct cgroup *cgrp, u64 mask, u32 flags)
 {
 	struct pfs_cgrp_ctx *cgc;
 	u64 cgid;
@@ -425,10 +558,69 @@ static void put_slots(struct cgroup *cgrp, u64 mask, bool kick_waiters)
 		if (!cgc)
 			return;
 
-		__sync_fetch_and_sub(&cgc->nr_slots, 1);
-		if (kick_waiters && scx_bpf_dsq_nr_queued(cgid) > 0)
-			queue_retry(cgc, cgid);
+		put_one_slot(cgc, cgid, flags);
 	}
+}
+
+/*
+ * Give back the slots in @mask through the cgroup IDs remembered in @taskc,
+ * which still works for the levels which exist when the task's own cgroup
+ * has already been removed.
+ */
+static void put_path_slots(struct pfs_task_ctx *taskc, u64 mask, u32 flags)
+{
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+	u64 cgid;
+	int level;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (!(mask >> level))
+			break;
+		if (!(mask & (1LLU << level)))
+			continue;
+
+		cgid = taskc->path_cgid[level];
+		cgrp = bpf_cgroup_from_id(cgid);
+		if (!cgrp) {
+			stat_inc(PFS_STAT_LOST_PATH);
+			continue;
+		}
+		cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+		if (cgc)
+			put_one_slot(cgc, cgid, flags);
+		bpf_cgroup_release(cgrp);
+	}
+}
+
+/*
+ * Make @cgrp the cgroup of @taskc. The path is only looked up when the
+ * cgroup changes. The caller makes sure that @taskc holds no slots.
+ */
+static void set_task_cgrp(struct pfs_task_ctx *taskc, struct cgroup *cgrp)
+{
+	u64 cgid = cgrp->kn->id;
+	int level;
+
+	if (taskc->cgid == cgid && taskc->path_cgid[0] == cgid)
+		return;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		struct cgroup *anc;
+
+		if (level > cgrp->level)
+			break;
+		anc = bpf_cgroup_ancestor(cgrp, level);
+		if (!anc) {
+			scx_bpf_error("ancestor cgroup lookup failed");
+			return;
+		}
+		taskc->path_cgid[level] = anc->kn->id;
+		bpf_cgroup_release(anc);
+	}
+	/* level 0 is the root, its slot is unused: mark the path valid */
+	taskc->path_cgid[0] = cgid;
+	taskc->cgid = cgid;
 }
 
 /*
@@ -475,7 +667,7 @@ static enum reserve_result reserve_slots(struct cgroup *cgrp, bool fifo,
 		if (!cgc->limit)
 			continue;
 
-		if (fifo && scx_bpf_dsq_nr_queued(cgid) > 0) {
+		if (fifo && nr_waiting(cgid)) {
 			ret = RESERVE_FULL;
 			*fail_cgidp = cgid;
 			break;
@@ -490,7 +682,7 @@ static enum reserve_result reserve_slots(struct cgroup *cgrp, bool fifo,
 	}
 
 	if (ret != RESERVE_OK) {
-		put_slots(cgrp, mask, false);
+		put_slots(cgrp, mask, 0);
 		return ret;
 	}
 
@@ -533,25 +725,32 @@ static bool unpublish_slots(struct pfs_task_ctx *taskc, u64 val)
  * Give back the slots @p holds. The xchg makes sure that the slots are put
  * once when several paths try to release them concurrently.
  */
-static void release_slots(struct pfs_task_ctx *taskc)
+static void release_slots(struct pfs_task_ctx *taskc, u32 flags)
 {
-	struct cgroup *cgrp;
 	u64 mask;
 
 	mask = __sync_lock_test_and_set(&taskc->slot_mask, 0);
 	if (!mask)
 		return;
 
-	cgrp = bpf_cgroup_from_id(taskc->cgid);
-	if (!cgrp)
-		return;
-
-	put_slots(cgrp, mask & SLOT_LEVELS_MASK, true);
-	bpf_cgroup_release(cgrp);
+	put_path_slots(taskc, mask & SLOT_LEVELS_MASK, PUT_RETRY | flags);
 }
 
+/* @taskc took its slots at @now, after a wakeup unless @rotated */
+static void set_admitted(struct pfs_task_ctx *taskc, u64 now, bool rotated)
+{
+	taskc->admitted_at = now;
+	taskc->rotated = rotated;
+}
+
+/*
+ * Wait in @cgid's DSQ for the woken (@woken) or the rotated tasks. Tasks
+ * which woke up and found no free slot are admitted first, see
+ * retry_cgroup(): they are typically request threads or the holders of what
+ * other threads spin or sleep for, while rotated tasks used up their slice.
+ */
 static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
-		 u64 vtime, u64 enq_flags)
+		 u64 vtime, u64 enq_flags, bool woken)
 {
 	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *wait_cgrp;
@@ -564,8 +763,10 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 	 * @vtime is kept for the shared DSQ. The preemption flags imply
 	 * SCX_ENQ_HEAD and are cleared with it.
 	 */
+	if (woken)
+		stat_inc(PFS_STAT_PARK_WOKEN);
 	scx_bpf_task_set_dsq_vtime(p, vtime);
-	scx_bpf_dsq_insert(p, cgid, slice_ns,
+	scx_bpf_dsq_insert(p, woken ? cgid | WOKEN_DSQ : cgid, slice_ns,
 			   enq_flags & ~(SCX_ENQ_HEAD | SCX_ENQ_PREEMPT |
 					 SCX_ENQ_PREEMPT_LAZY));
 
@@ -575,41 +776,26 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 
 	cgc = find_cgrp_ctx(wait_cgrp);
 	if (cgc) {
+		waitset_add(cgc, cgid);
 		/*
 		 * The slots may have been given back between the failed
 		 * reservation and the insertion above, in which case nobody
-		 * would queue a retry. Queue one unconditionally.
+		 * would queue a retry. Queue one unconditionally. If the level
+		 * has free slots, the task only parked behind other waiting
+		 * tasks, make sure that the retry runs soon.
 		 */
 		if (ret == RESERVE_BUDGET) {
 			stat_inc(PFS_STAT_PARK_BUDGET);
 			queue_budget(cgc, cgid);
 		} else {
 			stat_inc(PFS_STAT_PARK_FULL);
-			queue_retry(cgc, cgid);
+			if (cgc->nr_slots < div_round_up(cgc->limit, FRAC_ONE))
+				queue_retry_kick(cgc, cgid);
+			else
+				queue_retry(cgc, cgid);
 		}
 	}
 	bpf_cgroup_release(wait_cgrp);
-}
-
-static void kick_idle_cpu(struct task_struct *p)
-{
-	s32 cpu;
-
-	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-	if (cpu >= 0)
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-}
-
-static void kick_idle_cpu_any(void)
-{
-	const struct cpumask *idle;
-	s32 cpu;
-
-	idle = scx_bpf_get_idle_cpumask();
-	cpu = scx_bpf_pick_idle_cpu(idle, 0);
-	scx_bpf_put_idle_cpumask(idle);
-	if (cpu >= 0)
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 /*
@@ -636,55 +822,33 @@ static void kick_leftover(s32 pid)
 	bpf_task_release(p);
 }
 
+enum walk_result {
+	WK_EMPTY,		/* every task of the DSQ was examined */
+	WK_MORE,		/* stopped early, more tasks may be admittable */
+	WK_FULL,		/* @cgid itself has no free slot */
+	WK_BUDGET,		/* @cgid's rate limited slot is out of budget */
+};
+
 /*
- * Try to admit the tasks waiting in @cgid's DSQ. A task which can't be
- * admitted because another level of its path refuses is moved to that level's
- * DSQ. Stops at the first task refused by @cgid itself.
- *
- * The first *@nr_nokick admitted tasks which can run on this CPU don't kick an
- * idle CPU, the calling dispatch picks them up itself. *@nokick_pid is set to
- * the pid of the last such task so that dispatch can kick for it if it takes
- * another task instead.
- *
- * Only one walker scans a DSQ at a time so that two walkers can't reserve
- * slots for the same task. A retry which finds the DSQ busy, or which stops
- * after RETRY_WALK_MAX tasks with more left, is queued again so that it isn't
- * lost.
+ * Admit the tasks waiting in @dsq_id, one of the two wait DSQs of the cgroup
+ * whose context is @cgc, see retry_cgroup(). The number of tasks examined is
+ * counted in @cgc, which is owned by the walker, instead of on the stack. The
+ * verifier doesn't know its value, so it doesn't have to walk the loop once for
+ * each possible count.
  */
-static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
+static __noinline int walk_waiters(u64 dsq_id, struct pfs_cgrp_ctx *cgc,
+				   u32 *nr_nokick, s32 *nokick_pid)
 {
-	enum reserve_result ret = RESERVE_OK;
-	struct pfs_cgrp_ctx *cgc;
-	struct cgroup *cgrp;
+	bool woken_dsq = dsq_id & WOKEN_DSQ;
+	u64 cgid = dsq_id & ~WOKEN_DSQ;
 	struct task_struct *p;
-	bool requeue = false;
+	int res = WK_EMPTY;
 
-	cgrp = bpf_cgroup_from_id(cgid);
-	if (!cgrp)
-		return;
-
-	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
 	if (!cgc)
-		goto out_release;
+		return WK_EMPTY;
 
-	/* paired with the cmpxchg in queue_retry() */
-	cgc->retry_queued = 0;
-
-	if (__sync_val_compare_and_swap(&cgc->retry_running, 0, 1)) {
-		queue_retry(cgc, cgid);
-		goto out_release;
-	}
-
-	stat_inc(PFS_STAT_RETRY);
-
-	/*
-	 * The count is kept in @cgc, which is owned by the walker, instead of
-	 * on the stack. The verifier doesn't know its value, so it doesn't
-	 * have to walk the loop once for each possible count.
-	 */
-	cgc->retry_walked = 0;
-
-	bpf_for_each(scx_dsq, p, cgid, 0) {
+	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+		enum reserve_result ret;
 		struct pfs_task_ctx *taskc;
 		struct cgroup *task_cgrp;
 		u64 slice = slice_ns, mask, val, fail_cgid = 0;
@@ -692,29 +856,56 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 
 		walked = READ_ONCE(cgc->retry_walked);
 		if (walked >= RETRY_WALK_MAX) {
-			requeue = true;
+			res = WK_MORE;
 			break;
 		}
 		WRITE_ONCE(cgc->retry_walked, walked + 1);
 
 		taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-		if (!taskc)
+		if (!taskc) {
+			res = WK_MORE;
 			break;
+		}
 
 		/* the slots are put through @task_cgrp, keep it until done */
 		task_cgrp = bpf_cgroup_from_id(taskc->cgid);
-		if (!task_cgrp)
+		if (!task_cgrp) {
+			/*
+			 * The cgroup was removed under an exiting task. Its
+			 * slots can't be accounted anymore, let it run
+			 * without them rather than wait forever.
+			 */
+			set_admitted(taskc, window_now(), !woken_dsq);
+			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
+						   SHARED_DSQ, 0)) {
+				stat_inc(PFS_STAT_LOST_PATH);
+				kick_idle_cpu(p);
+			}
 			continue;
+		}
 
 		ret = reserve_slots(task_cgrp, false, &slice, &mask, &fail_cgid);
 		if (ret == RESERVE_OK) {
 			/* publish before @p can run and give the slots back */
 			if (!publish_slots(taskc, mask, &val)) {
 				stat_inc(PFS_STAT_MOVE_RACE);
-				put_slots(task_cgrp, mask, true);
+				put_slots(task_cgrp, mask, PUT_RETRY);
 				bpf_cgroup_release(task_cgrp);
 				continue;
 			}
+			/*
+			 * @p moved to another cgroup since ->cgid was read: the
+			 * slots are on the old path, which release_slots()
+			 * no longer knows. Take them back.
+			 */
+			if (taskc->cgid != task_cgrp->kn->id) {
+				stat_inc(PFS_STAT_MOVE_RACE);
+				if (unpublish_slots(taskc, val))
+					put_slots(task_cgrp, mask, PUT_RETRY);
+				bpf_cgroup_release(task_cgrp);
+				continue;
+			}
+			set_admitted(taskc, window_now(), !woken_dsq);
 
 			scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, slice);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
@@ -735,18 +926,40 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 				 */
 				stat_inc(PFS_STAT_MOVE_RACE);
 				if (unpublish_slots(taskc, val))
-					put_slots(task_cgrp, mask, true);
+					put_slots(task_cgrp, mask, PUT_RETRY);
 			}
 			bpf_cgroup_release(task_cgrp);
+
+			/*
+			 * At most WOKEN_STREAK_MAX woken tasks in a row while
+			 * rotated ones wait, and back to the woken tasks after
+			 * each rotated one.
+			 */
+			if (woken_dsq) {
+				if (scx_bpf_dsq_nr_queued(cgid) > 0 &&
+				    ++cgc->woken_streak >= WOKEN_STREAK_MAX) {
+					res = WK_MORE;
+					break;
+				}
+			} else {
+				cgc->woken_streak = 0;
+				if (scx_bpf_dsq_nr_queued(cgid | WOKEN_DSQ) > 0) {
+					res = WK_MORE;
+					break;
+				}
+			}
 			continue;
 		}
 		bpf_cgroup_release(task_cgrp);
 
-		if (fail_cgid == cgid)
+		if (fail_cgid == cgid) {
+			res = ret == RESERVE_BUDGET ? WK_BUDGET : WK_FULL;
 			break;
+		}
 
 		/* refused by another level, wait there instead */
-		if (scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, fail_cgid, 0)) {
+		if (scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, woken_dsq ?
+				     fail_cgid | WOKEN_DSQ : fail_cgid, 0)) {
 			struct pfs_cgrp_ctx *fail_cgc;
 			struct cgroup *fail_cgrp;
 
@@ -756,6 +969,7 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 				continue;
 			fail_cgc = bpf_cgrp_storage_get(&cgrp_ctx, fail_cgrp, 0, 0);
 			if (fail_cgc) {
+				waitset_add(fail_cgc, fail_cgid);
 				if (ret == RESERVE_BUDGET)
 					queue_budget(fail_cgc, fail_cgid);
 				else
@@ -763,15 +977,76 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 			}
 			bpf_cgroup_release(fail_cgrp);
 		}
-		ret = RESERVE_OK;
+	}
+
+	return res;
+}
+
+/*
+ * Try to admit the tasks waiting in @cgid's DSQs, the woken ones first, but at
+ * most WOKEN_STREAK_MAX in a row while rotated tasks wait. A task which can't
+ * be admitted because another level of its path refuses is moved to that
+ * level's DSQ of the same kind. Stops at the first task refused by @cgid
+ * itself.
+ *
+ * The first *@nr_nokick admitted tasks which can run on this CPU don't kick an
+ * idle CPU, the calling dispatch picks them up itself. *@nokick_pid is set to
+ * the pid of the last such task so that dispatch can kick for it if it takes
+ * another task instead.
+ *
+ * Only one walker scans a cgroup's DSQs at a time so that two walkers can't
+ * reserve slots for the same task. A retry which finds them busy, or which
+ * stops after RETRY_WALK_MAX tasks with more left, is queued again so that it
+ * isn't lost.
+ */
+static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
+{
+	int res = WK_EMPTY, i;
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp)
+		return;
+
+	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+	if (!cgc)
+		goto out_release;
+
+	/* paired with the cmpxchg in queue_retry() */
+	cgc->retry_queued = 0;
+
+	if (__sync_val_compare_and_swap(&cgc->retry_running, 0, 1)) {
+		queue_retry(cgc, cgid);
+		goto out_release;
+	}
+
+	stat_inc(PFS_STAT_RETRY);
+	cgc->retry_walked = 0;
+	cgc->retry_at = window_now();
+
+	bpf_for(i, 0, 2 * WOKEN_STREAK_MAX) {
+		if (cgc->woken_streak >= WOKEN_STREAK_MAX &&
+		    scx_bpf_dsq_nr_queued(cgid) > 0) {
+			res = walk_waiters(cgid, cgc, nr_nokick, nokick_pid);
+		} else {
+			res = walk_waiters(cgid | WOKEN_DSQ, cgc, nr_nokick,
+					   nokick_pid);
+			if (res == WK_EMPTY)
+				res = walk_waiters(cgid, cgc, nr_nokick,
+						   nokick_pid);
+		}
+		if (res != WK_MORE ||
+		    READ_ONCE(cgc->retry_walked) >= RETRY_WALK_MAX)
+			break;
 	}
 
 	/* paired with the cmpxchg above, fully ordered */
 	__sync_lock_test_and_set(&cgc->retry_running, 0);
 
-	if (requeue)
+	if (res == WK_MORE)
 		queue_retry(cgc, cgid);
-	if (ret == RESERVE_BUDGET)
+	else if (res == WK_BUDGET)
 		queue_budget(cgc, cgid);
 
 out_release:
@@ -971,19 +1246,20 @@ s32 BPF_STRUCT_OPS(pfs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return cpu;
 
 	taskc = find_task_ctx(p);
-	if (!taskc)
+	if (!taskc || taskc->slot_mask)	/* enqueue releases the slots */
 		return cpu;
 
 	/* a waking task holds no slot, the target is only taken if one is free */
 	cgrp = scx_bpf_task_cgroup(p);
-	taskc->cgid = cgrp->kn->id;
+	set_task_cgrp(taskc, cgrp);
 	if (reserve_slots(cgrp, true, &slice, &mask, &fail_cgid) == RESERVE_OK) {
 		if (publish_slots(taskc, mask, &val)) {
+			set_admitted(taskc, window_now(), false);
 			stat_inc(PFS_STAT_DIRECT);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 		} else {
 			/* @p still holds slots, enqueue releases them */
-			put_slots(cgrp, mask, true);
+			put_slots(cgrp, mask, PUT_RETRY);
 		}
 	}
 	bpf_cgroup_release(cgrp);
@@ -998,6 +1274,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	enum reserve_result ret;
 	u64 slice = slice_ns, mask, val, fail_cgid = 0;
 	u64 vtime;
+	bool woken;
 
 	/*
 	 * Per-cpu kthreads can't be queued behind anything else, run them
@@ -1016,12 +1293,13 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * @p may have been admitted and then dequeued without running, e.g.
 	 * for an attribute change. Start over.
 	 */
-	release_slots(taskc);
+	release_slots(taskc, PUT_KICK);
 
 	/* release_slots() and retries find the slots through ->cgid */
 	cgrp = scx_bpf_task_cgroup(p);
-	taskc->cgid = cgrp->kn->id;
+	set_task_cgrp(taskc, cgrp);
 	vtime = clamp_vtime(p, cgrp);
+	woken = enq_flags & SCX_ENQ_WAKEUP;
 
 	ret = reserve_slots(cgrp, true, &slice, &mask, &fail_cgid);
 	if (ret == RESERVE_OK && !publish_slots(taskc, mask, &val)) {
@@ -1031,24 +1309,31 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 		 * takes them back. Wait in @p's own cgroup for another retry.
 		 */
 		stat_inc(PFS_STAT_MOVE_RACE);
-		put_slots(cgrp, mask, true);
+		put_slots(cgrp, mask, PUT_RETRY);
 		ret = RESERVE_FULL;
 		fail_cgid = taskc->cgid;
 	}
 
 	if (ret == RESERVE_OK) {
 		stat_inc(PFS_STAT_SHARED);
+		set_admitted(taskc, window_now(), !woken);
 		/*
 		 * SCX_ENQ_LAST: @p's slice expired and nothing else is queued
 		 * for the CPU. Keep it running, the CPU would idle otherwise.
 		 */
-		if (enq_flags & SCX_ENQ_LAST)
+		if (enq_flags & SCX_ENQ_LAST) {
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, enq_flags);
-		else
+		} else {
 			scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime,
 						 enq_flags);
+			/*
+			 * @p holds its slots from now on: don't let it wait
+			 * for this CPU if another one is idle.
+			 */
+			kick_idle_cpu(p);
+		}
 	} else {
-		park(p, fail_cgid, ret, vtime, enq_flags);
+		park(p, fail_cgid, ret, vtime, enq_flags, woken);
 		/* run a dispatch cycle on the CPU to admit a waiting task */
 		if (enq_flags & SCX_ENQ_LAST)
 			scx_bpf_kick_cpu(scx_bpf_task_cpu(p), 0);
@@ -1175,9 +1460,10 @@ static bool keep_prev(struct task_struct *prev, struct pfs_task_ctx *taskc)
 	if (reserve_slots(cgrp, true, &slice, &mask, &fail_cgid) != RESERVE_OK)
 		goto out_release;
 	if (!publish_slots(taskc, mask, &val)) {
-		put_slots(cgrp, mask, true);
+		put_slots(cgrp, mask, PUT_RETRY);
 		goto out_release;
 	}
+	set_admitted(taskc, window_now(), true);
 
 	/*
 	 * A kept task doesn't go through ops.running(), advance the global
@@ -1223,7 +1509,7 @@ void BPF_STRUCT_OPS(pfs_dispatch, s32 cpu, struct task_struct *prev)
 		if (taskc) {
 			if (nr_limited && taskc->slot_mask)
 				charge_prev(prev, taskc);
-			release_slots(taskc);
+			release_slots(taskc, 0);
 		}
 	}
 
@@ -1278,7 +1564,109 @@ void BPF_STRUCT_OPS(pfs_stopping, struct task_struct *p, bool runnable)
 	charge_task(p, taskc, cgrp, now);
 	bpf_cgroup_release(cgrp);
 
-	release_slots(taskc);
+	release_slots(taskc, PUT_KICK);
+}
+
+/*
+ * Whether a level of @taskc's slots in @mask has waiting tasks, only woken ones
+ * if @woken_only.
+ */
+static bool slots_wanted(struct pfs_task_ctx *taskc, u64 mask, bool woken_only)
+{
+	int level;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		u64 cgid;
+
+		if (!(mask >> level))
+			break;
+		if (!(mask & (1LLU << level)))
+			continue;
+		cgid = taskc->path_cgid[level];
+		if (scx_bpf_dsq_nr_queued(cgid | WOKEN_DSQ) > 0 ||
+		    (!woken_only && scx_bpf_dsq_nr_queued(cgid) > 0))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Rotation on wakeup: a task which holds its slots since a rotation, i.e. it
+ * is CPU bound and took its turn, gives them back after cut_ns instead of at
+ * the end of its slice while a task which woke up waits for one of them. The
+ * woken task is typically what the others wait for: a lock holder, the main
+ * thread of a spin-wait hand-off, a GC or a VM thread. A task holding its
+ * slots since its own wakeup is not cut short.
+ *
+ * Rotated holders also give their slots to rotated waiting tasks after rot_ns
+ * instead of the whole slice. Threads which spin until another thread of
+ * their cgroup sets a flag make progress once per rotation, e.g. Redis I/O
+ * threads with more threads than slots; with a 2.5ms slice that was one step
+ * per two slices. EEVDF time-slices CPU bound tasks every 0.75ms by default
+ * on a real machine.
+ */
+void BPF_STRUCT_OPS(pfs_tick, struct task_struct *p)
+{
+	struct pfs_task_ctx *taskc;
+	u64 mask, held;
+
+	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+	if (!taskc || !taskc->rotated)
+		return;
+
+	mask = taskc->slot_mask & SLOT_LEVELS_MASK;
+	if (!mask)
+		return;
+
+	held = window_now() - taskc->admitted_at;
+	if (held < cut_ns)
+		return;
+
+	if (slots_wanted(taskc, mask, !rot_ns || held < rot_ns)) {
+		stat_inc(PFS_STAT_CUT);
+		p->scx.slice = 0;
+	}
+}
+
+/*
+ * A yielding task which holds slots keeps them, and keeps running, unless it
+ * has held them for cut_ns and other tasks wait for them; then it rotates to
+ * the end of the queue. Giving the slots away on every yield made a thread
+ * which yields with a lock held wait a whole turn for each yield, with the
+ * threads woken for the lock taking its slots only to block again, and the
+ * pod used a fraction of its limit. Spinners which yield in a loop, e.g. GC
+ * threads offering termination, still hand their slots over after cut_ns.
+ * Tasks without slots yield as without ops.yield().
+ */
+bool BPF_STRUCT_OPS(pfs_yield, struct task_struct *from, struct task_struct *to)
+{
+	struct pfs_task_ctx *taskc;
+	u64 mask;
+
+	if (to)
+		return false;
+
+	taskc = bpf_task_storage_get(&task_ctx, from, 0, 0);
+	mask = taskc ? taskc->slot_mask & SLOT_LEVELS_MASK : 0;
+	if (mask) {
+		bool wanted = slots_wanted(taskc, mask, false);
+
+		if (wanted && window_now() - taskc->admitted_at >= cut_ns) {
+			stat_inc(PFS_STAT_YIELD_ROTATE);
+		} else if (wanted ||
+			   (scx_bpf_dsq_nr_queued(SHARED_DSQ) <= 0 &&
+			    scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL) <= 0)) {
+			stat_inc(PFS_STAT_YIELD_KEEP);
+			return false;
+		}
+		/*
+		 * Nobody waits for the slots but admitted tasks wait for a
+		 * CPU: yield it, ops.enqueue() takes the free slots again.
+		 */
+	}
+
+	from->scx.slice = 0;
+	return false;
 }
 
 /*
@@ -1357,7 +1745,7 @@ void BPF_STRUCT_OPS(pfs_disable, struct task_struct *p)
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
 	if (taskc) {
-		release_slots(taskc);
+		release_slots(taskc, PUT_KICK);
 		put_runnable(taskc);
 	}
 }
@@ -1366,15 +1754,27 @@ s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
 	struct pfs_task_ctx *taskc;
+	struct cgroup *cgrp;
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0,
 				     BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!taskc)
 		return -ENOMEM;
 
-	taskc->cgid = args->cgroup->kn->id;
 	taskc->slot_mask = 0;
 	taskc->run_cgid = 0;
+	taskc->cgid = 0;
+
+	/*
+	 * @args->cgroup can't be passed to kfuncs, look it up. An exiting
+	 * task's cgroup may be gone already; ops.select_cpu() and
+	 * ops.enqueue() set the path before the task takes any slot.
+	 */
+	cgrp = bpf_cgroup_from_id(args->cgroup->kn->id);
+	if (!cgrp)
+		return 0;
+	set_task_cgrp(taskc, cgrp);
+	bpf_cgroup_release(cgrp);
 	return 0;
 }
 
@@ -1388,8 +1788,8 @@ void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 		return;
 
 	/* the slots are on @from's path */
-	release_slots(taskc);
-	taskc->cgid = to->kn->id;
+	release_slots(taskc, PUT_KICK);
+	set_task_cgrp(taskc, to);
 }
 
 static void set_limit(struct pfs_cgrp_ctx *cgc, u64 limit)
@@ -1419,11 +1819,18 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 		scx_bpf_error("scx_bpf_create_dsq failed (%d)", ret);
 		return ret;
 	}
+	ret = scx_bpf_create_dsq(cgid | WOKEN_DSQ, -1);
+	if (ret) {
+		scx_bpf_destroy_dsq(cgid);
+		scx_bpf_error("scx_bpf_create_dsq failed (%d)", ret);
+		return ret;
+	}
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0,
 				   BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!cgc) {
 		scx_bpf_destroy_dsq(cgid);
+		scx_bpf_destroy_dsq(cgid | WOKEN_DSQ);
 		return -ENOMEM;
 	}
 
@@ -1436,12 +1843,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 void BPF_STRUCT_OPS(pfs_cgroup_exit, struct cgroup *cgrp)
 {
 	struct pfs_cgrp_ctx *cgc;
+	u64 cgid = cgrp->kn->id;
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
 	if (cgc)
 		set_limit(cgc, 0);
 
-	scx_bpf_destroy_dsq(cgrp->kn->id);
+	scx_bpf_destroy_dsq(cgid);
+	scx_bpf_destroy_dsq(cgid | WOKEN_DSQ);
+	bpf_map_delete_elem(&waitset, &cgid);
 }
 
 void BPF_STRUCT_OPS(pfs_cgroup_set_bandwidth, struct cgroup *cgrp,
@@ -1456,8 +1866,8 @@ void BPF_STRUCT_OPS(pfs_cgroup_set_bandwidth, struct cgroup *cgrp,
 	set_limit(cgc, bw_to_limit(period_us, quota_us));
 
 	/* the limit may have grown, give the waiting tasks a chance */
-	if (scx_bpf_dsq_nr_queued(cgrp->kn->id) > 0)
-		queue_retry(cgc, cgrp->kn->id);
+	if (nr_waiting(cgrp->kn->id))
+		queue_retry_kick(cgc, cgrp->kn->id);
 }
 
 void BPF_STRUCT_OPS(pfs_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
@@ -1485,11 +1895,50 @@ void BPF_STRUCT_OPS(pfs_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 	__sync_fetch_and_add(&hweight_gen, 1);
 }
 
+/*
+ * Sweep of the cgroups which had waiting tasks: forget the ones without, and
+ * retry the ones whose DSQs no retry walked for RESCUE_NS. That should never
+ * be needed, retries are queued whenever slots are given back or a task
+ * parks, but a waiting task that is never retried stalls until the sched_ext
+ * watchdog ejects the scheduler, and the counter tells if it happens.
+ */
+static long rescue_cb(struct bpf_map *map, u64 *key, u8 *val, u64 *now)
+{
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+	u64 cgid = *key;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp) {
+		bpf_map_delete_elem(map, key);
+		return 0;
+	}
+
+	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+	if (!cgc) {
+		bpf_map_delete_elem(map, key);
+	} else if (!nr_waiting(cgid)) {
+		bpf_map_delete_elem(map, key);
+		cgc->in_waitset = 0;
+		/* a task may have parked after the test, list it again */
+		if (nr_waiting(cgid))
+			waitset_add(cgc, cgid);
+	} else if ((s64)(*now - cgc->retry_at) > (s64)RESCUE_NS &&
+		   !cgc->retry_running) {
+		stat_inc(PFS_STAT_RESCUE);
+		cgc->retry_queued = 0;
+		queue_retry(cgc, cgid);
+	}
+
+	bpf_cgroup_release(cgrp);
+	return 0;
+}
+
 static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *cgrp;
-	u64 cgid, nr = nr_budget_q;
+	u64 cgid, nr = nr_budget_q, now;
 	u32 nr_nokick = 0;
 	s32 nokick_pid = 0;
 	int i, ret;
@@ -1515,6 +1964,9 @@ static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 
 		retry_cgroup(cgid, &nr_nokick, &nokick_pid);
 	}
+
+	now = window_now();
+	bpf_for_each_map_elem(&waitset, rescue_cb, &now, 0);
 
 	/*
 	 * Retries are normally processed by dispatch. Drain some here too so
@@ -1574,6 +2026,8 @@ SCX_OPS_DEFINE(pfs_ops,
 	       .runnable		= (void *)pfs_runnable,
 	       .running			= (void *)pfs_running,
 	       .stopping		= (void *)pfs_stopping,
+	       .tick			= (void *)pfs_tick,
+	       .yield			= (void *)pfs_yield,
 	       .quiescent		= (void *)pfs_quiescent,
 	       .enable			= (void *)pfs_enable,
 	       .disable			= (void *)pfs_disable,
