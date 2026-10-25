@@ -488,6 +488,71 @@ struct cfs_bandwidth {
 };
 
 /* Task group related information */
+#ifdef CONFIG_SCHED_PFS
+/*
+ * Parallel Fair Scheduler, see Documentation/scheduler/sched-pfs.rst.
+ */
+
+/* Per task group state. */
+struct pfs_group {
+	/* protects ->waiters and ->nr_waiting */
+	raw_spinlock_t		lock;
+	/* FIFO of tasks waiting for a slot at this level */
+	struct list_head	waiters;
+	unsigned int		nr_waiting;
+	/* slots taken by tasks of the subtree */
+	atomic_t		nr_slots;
+	/* limit in milli-CPUs, 0 if none */
+	unsigned int		limit;
+	/* task_group depth, the root is 0 */
+	int			depth;
+
+	/* budget of the fractional slot */
+	atomic64_t		window_id;
+	atomic64_t		window_used;
+	struct hrtimer		window_timer;
+	atomic_t		timer_armed;
+	/* admits waiting tasks when slots were freed without a hand-off */
+	struct irq_work		retry_work;
+
+	/* cpu.weight, protected by pfs_weight_lock */
+	unsigned long		weight;
+	/* active children plus one for own admitted tasks */
+	int			nr_active;
+	/* sum of the active children's weights */
+	unsigned long		child_weight_sum;
+	/* own admitted tasks and their nice weights */
+	atomic_t		nr_own;
+	atomic_long_t		own_weight;
+	/* cached hierarchical weight, see pfs_hweight() */
+	unsigned long		hweight;
+	unsigned long		hweight_gen;
+	u64			hweight_at;
+};
+
+/* Per CPU state. */
+struct pfs_rq {
+	struct rb_root_cached	tasks_timeline;
+	u64			zero_vruntime;
+	s64			sum_w_vruntime;
+	long			sum_weight;
+	/* admitted tasks of this CPU, including the running one */
+	unsigned int		nr_queued;
+	/* sum of their effective weights */
+	unsigned long		load;
+	/* the PFS task between set_next_task() and put_prev_task() */
+	struct task_struct	*curr;
+	/* waiting tasks whose task_cpu() is this CPU */
+	struct list_head	waiters;
+	unsigned int		nr_waiting;
+	/* a task blocked here and gave back slots of this group's path */
+	struct pfs_group	*handoff;
+	/* earliest jiffies for the next push */
+	unsigned long		next_push;
+	unsigned int		push_preempted;
+};
+#endif /* CONFIG_SCHED_PFS */
+
 struct task_group {
 	struct cgroup_subsys_state css;
 
@@ -518,6 +583,10 @@ struct task_group {
 #endif
 
 	struct scx_task_group	scx;
+
+#ifdef CONFIG_SCHED_PFS
+	struct pfs_group	pfs;
+#endif
 
 	struct rcu_head		rcu;
 	struct list_head	list;
@@ -1249,6 +1318,10 @@ struct rq {
 
 	struct sched_dl_entity	fair_server;
 
+#ifdef CONFIG_SCHED_PFS
+	struct pfs_rq		pfs;
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this CPU: */
 	struct list_head	leaf_cfs_rq_list;
@@ -1910,6 +1983,34 @@ struct rq_flags {
 };
 
 extern struct balance_callback balance_push_callback;
+
+#ifdef CONFIG_SCHED_PFS
+extern const struct sched_class pfs_sched_class;
+
+DECLARE_STATIC_KEY_FALSE(__pfs_enabled);	/* booted with sched_pfs=1 */
+#define pfs_enabled()		static_branch_unlikely(&__pfs_enabled)
+
+extern bool pfs_init_rq(struct rq *rq);
+extern void pfs_init_entity(struct task_struct *p);
+extern void pfs_init_group(struct task_group *tg, struct task_group *parent);
+extern void pfs_free_group(struct task_group *tg);
+extern void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
+				    u64 quota_us, u64 burst_us);
+extern void pfs_group_set_weight(struct task_group *tg);
+extern struct task_struct *pfs_get_dying_waiter(struct rq *rq);
+extern bool pfs_can_stop_tick(struct rq *rq);
+extern bool sched_task_cpu_allowed(struct task_struct *p, int cpu);
+#else /* !CONFIG_SCHED_PFS */
+#define pfs_enabled()		false
+static inline bool pfs_init_rq(struct rq *rq) { return false; }
+static inline void pfs_init_entity(struct task_struct *p) { }
+static inline void pfs_init_group(struct task_group *tg, struct task_group *parent) { }
+static inline void pfs_free_group(struct task_group *tg) { }
+static inline void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
+					   u64 quota_us, u64 burst_us) { }
+static inline void pfs_group_set_weight(struct task_group *tg) { }
+static inline bool pfs_can_stop_tick(struct rq *rq) { return true; }
+#endif /* !CONFIG_SCHED_PFS */
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 extern const struct sched_class ext_sched_class;
@@ -2897,6 +2998,13 @@ extern const struct sched_class idle_sched_class;
 static inline const struct sched_class *next_active_class(const struct sched_class *class)
 {
 	class++;
+#ifdef CONFIG_SCHED_PFS
+	/* PFS replaces the fair class when enabled, otherwise it is unused */
+	if (class == &fair_sched_class && pfs_enabled())
+		class++;
+	if (class == &pfs_sched_class && !pfs_enabled())
+		class++;
+#endif
 #ifdef CONFIG_SCHED_CLASS_EXT
 	if (scx_switched_all() && class == &fair_sched_class)
 		class++;
@@ -2904,6 +3012,16 @@ static inline const struct sched_class *next_active_class(const struct sched_cla
 		class++;
 #endif
 	return class;
+}
+
+/* The class of SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks. */
+static inline const struct sched_class *normal_sched_class(void)
+{
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		return &pfs_sched_class;
+#endif
+	return &fair_sched_class;
 }
 
 #define for_class_range(class, _from, _to) \

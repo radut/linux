@@ -637,6 +637,47 @@ struct sched_rt_entity {
 #endif
 } __randomize_layout;
 
+#ifdef CONFIG_SCHED_PFS
+struct pfs_group;
+
+/*
+ * State of a task in the Parallel Fair Scheduler, see
+ * Documentation/scheduler/sched-pfs.rst. Protected by task_rq(p)->lock.
+ */
+struct sched_pfs_entity {
+	struct rb_node			run_node;
+	/* pfs_group::waiters while PFS_WAITING */
+	struct list_head		wait_node;
+	/* pfs_rq::waiters of task_cpu() while PFS_WAITING */
+	struct list_head		rq_wait_node;
+	/* effective (flattened hierarchical) weight */
+	struct load_weight		weight;
+	u64				deadline;
+	u64				min_vruntime;
+	u64				vruntime;
+	s64				vlag;
+	u64				slice;
+	/* se.sum_exec_runtime at admission and the runtime until rotation */
+	u64				run_start;
+	u64				run_limit;
+	/* hierarchy levels (task_group depth) where a slot is held */
+	u64				slot_mask;
+	/* group whose slots are in slot_mask and which counts the task */
+	struct pfs_group		*grp;
+	/* group whose queue the task waits in */
+	struct pfs_group		*wait_grp;
+	/* nice weight counted in grp while queued */
+	unsigned long			run_weight;
+	unsigned char			state;
+	unsigned char			on_tree;
+	/* slots in slot_mask survive a dequeue (save/restore, migration) */
+	unsigned char			granted;
+	/* the slice ended and the slots must be given back, see balance */
+	unsigned char			rotate;
+	unsigned char			rel_deadline;
+};
+#endif
+
 struct rq_flags;
 typedef struct task_struct *(*dl_server_pick_f)(struct sched_dl_entity *, struct rq_flags *rf);
 
@@ -889,6 +930,9 @@ struct task_struct {
 
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
+#ifdef CONFIG_SCHED_PFS
+	struct sched_pfs_entity		pfs;
+#endif
 	struct sched_dl_entity		dl;
 	struct sched_dl_entity		*dl_server;
 #ifdef CONFIG_SCHED_CLASS_EXT

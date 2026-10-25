@@ -195,6 +195,27 @@ config SCHED_CLASS_EXT
 	    Documentation/scheduler/sched-ext.rst
 	    https://github.com/sched-ext/scx
 
+config SCHED_PFS
+	bool "Parallel Fair Scheduler"
+	depends on SMP && CFS_BANDWIDTH && FAIR_GROUP_SCHED
+	depends on !SCHED_PROXY_EXEC
+	help
+	  This option adds the Parallel Fair Scheduler (PFS), a scheduling
+	  class which can replace the fair class for SCHED_NORMAL,
+	  SCHED_BATCH and SCHED_IDLE tasks. Under PFS a cgroup CPU limit
+	  (cpu.max) caps the number of threads of the group which run at the
+	  same time instead of granting a CPU time budget per period, so a
+	  group that stays within its limit is never throttled. Threads
+	  beyond the limit wait in a queue of the group and take over a CPU
+	  as soon as another thread of the group gives it up.
+
+	  PFS is only used when the kernel is booted with sched_pfs=1.
+	  Otherwise the fair class is used and PFS adds no overhead.
+
+	  See Documentation/scheduler/sched-pfs.rst.
+
+	  If unsure, say N.
+
 config PREFERRED_CPU
 	bool
 	depends on SMP && PARAVIRT

@@ -38,5 +38,6 @@ endif
 #
 obj-y += core.o
 obj-y += fair.o
+obj-$(CONFIG_SCHED_PFS) += pfs.o
 obj-y += build_policy.o
 obj-y += build_utility.o
