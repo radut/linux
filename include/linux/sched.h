@@ -687,9 +687,11 @@ struct sched_pfs_entity {
 	unsigned char			fresh;
 	/* rotations since the wakeup which kept its wakeup priority */
 	unsigned char			fresh_rounds;
-	/* when it went to sleep with negative lag, and the CPU's load then */
+	/* when it went to sleep, and the CPU's load then if its lag was negative */
 	u64				sleep_stamp;
 	unsigned long			sleep_load;
+	/* how long it slept before its last wakeup */
+	u64				slept;
 	/* parks or rotates on its way back to user space */
 	struct callback_head		user_work;
 };

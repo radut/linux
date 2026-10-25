@@ -61,10 +61,12 @@ enum {
 	PFS_F_SLEEP_LAG		= 1 << 2,	/* negative lag served while asleep */
 	PFS_F_PROTECT		= 1 << 3,	/* fair's slice protection updates */
 	PFS_F_BALANCE_WEIGHT	= 1 << 4,	/* balance unequal weights */
+	PFS_F_BALANCE_COUNT	= 1 << 5,	/* balance task counts */
 };
 
 static unsigned int pfs_features __read_mostly =
-	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT;
+	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT |
+	PFS_F_BALANCE_COUNT;
 
 static inline bool pfs_feat(unsigned int f)
 {
@@ -1360,11 +1362,14 @@ static void pfs_serve_sleep_lag(struct rq *rq, struct sched_pfs_entity *pe)
 {
 	s64 elapsed, served;
 
-	if (!pe->sleep_stamp || pe->vlag >= 0)
+	if (!pe->sleep_stamp) {
+		pe->slept = U64_MAX;
 		return;
+	}
 	elapsed = rq_clock(rq) - pe->sleep_stamp;
 	pe->sleep_stamp = 0;
-	if (elapsed <= 0)
+	pe->slept = max_t(s64, elapsed, 0);
+	if (elapsed <= 0 || !pe->sleep_load || pe->vlag >= 0)
 		return;
 	served = div64_u64((u64)elapsed * scale_load_down(NICE_0_LOAD),
 			   max(pe->sleep_load, 1UL));
@@ -1383,6 +1388,8 @@ static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 	pfs_set_weight(pe, w);
 	if (flags & ENQUEUE_WAKEUP)
 		pfs_serve_sleep_lag(rq, pe);
+	else
+		pe->slept = U64_MAX;
 
 	pfs_place_entity(prq, pe, flags);
 	pe->state = PFS_QUEUED;
@@ -1420,9 +1427,11 @@ static void pfs_unqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	 * the CPU's virtual time advanced, see pfs_serve_sleep_lag().
 	 */
 	pe->sleep_stamp = 0;
-	if ((flags & DEQUEUE_SLEEP) && pe->vlag < 0 && pfs_feat(PFS_F_SLEEP_LAG)) {
+	pe->sleep_load = 0;
+	if (flags & DEQUEUE_SLEEP) {
 		pe->sleep_stamp = rq_clock(rq);
-		pe->sleep_load = prq->sum_weight + pfs_avg_weight(pe);
+		if (pe->vlag < 0 && pfs_feat(PFS_F_SLEEP_LAG))
+			pe->sleep_load = prq->sum_weight + pfs_avg_weight(pe);
 	}
 
 	pe->state = PFS_NONE;
@@ -1766,6 +1775,29 @@ static void yield_task_pfs(struct rq *rq)
 	pe->vprot = pe->vruntime;
 }
 
+/* debugfs wakeup_gran_us, see pfs_wakeup_far_ahead() */
+static unsigned int pfs_wakeup_gran_us __read_mostly = 1000;
+
+/*
+ * Wakeup granularity for short sleepers, as the fair class had before EEVDF:
+ * a task which slept for less than this preempts only if the running task is
+ * ahead of it by more than this much (scaled to the waking task's weight).
+ * Without it, tasks which sleep for microseconds, e.g. readers of a pipe,
+ * preempt the writer on every wakeup and run in lockstep with it; with it
+ * they batch up. A task which slept longer, e.g. a request handler, preempts
+ * as EEVDF decides.
+ */
+static bool pfs_wakeup_far_ahead(struct task_struct *curr,
+				 struct task_struct *p)
+{
+	u64 gran = (u64)READ_ONCE(pfs_wakeup_gran_us) * NSEC_PER_USEC;
+	s64 ahead = (s64)(curr->pfs.vruntime - p->pfs.vruntime);
+
+	if (!gran || p->pfs.slept >= gran)
+		return true;
+	return ahead > (s64)pfs_calc_delta(gran, &p->pfs);
+}
+
 static void wakeup_preempt_pfs(struct rq *rq, struct task_struct *p, int wake_flags)
 {
 	struct task_struct *donor = rq->donor;
@@ -1805,7 +1837,8 @@ static void wakeup_preempt_pfs(struct rq *rq, struct task_struct *p, int wake_fl
 	if (wake_flags & WF_FORK)
 		return;
 
-	if (pfs_pick_eevdf(prq, true) == &p->pfs)
+	if (pfs_wakeup_far_ahead(donor, p) &&
+	    pfs_pick_eevdf(prq, true) == &p->pfs)
 		goto preempt;
 
 	/* see update_protect_slice() in fair.c */
@@ -2509,7 +2542,7 @@ static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 	 */
 	this_nr = READ_ONCE(this_rq->pfs.nr_queued);
 	busiest_nr = READ_ONCE(busiest->pfs.nr_queued);
-	if (busiest_nr < this_nr + 2 &&
+	if (!(pfs_feat(PFS_F_BALANCE_COUNT) && busiest_nr >= this_nr + 2) &&
 	    !(pfs_feat(PFS_F_BALANCE_WEIGHT) && busiest_nr >= 2 &&
 	      busiest_load > 2 * this_load))
 		return;
@@ -2870,6 +2903,7 @@ void pfs_init_entity(struct task_struct *p)
 	pe->fresh = 0;
 	pe->fresh_rounds = 0;
 	pe->sleep_stamp = 0;
+	pe->slept = U64_MAX;
 	init_task_work(&pe->user_work, pfs_user_workfn);
 	/* not queued, see pfs_has_user_work() */
 	pe->user_work.next = &pe->user_work;
@@ -3040,6 +3074,7 @@ void pfs_debugfs_init(struct dentry *parent)
 	debugfs_create_file("waiters", 0400, d, NULL, &pfs_waiters_fops);
 	debugfs_create_file_unsafe("window_us", 0644, d, NULL, &pfs_window_us_fops);
 	debugfs_create_u32("features", 0644, d, &pfs_features);
+	debugfs_create_u32("wakeup_gran_us", 0644, d, &pfs_wakeup_gran_us);
 }
 
 bool pfs_can_stop_tick(struct rq *rq)

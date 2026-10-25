@@ -256,6 +256,17 @@ the waking task has a shorter slice; a waking task which doesn't preempt
 shortens the protection (``update_protect_slice()``), and once it ends the
 running task is picked again at the next update of its runtime.
 
+A task which slept for less than the wakeup granularity (1 ms by default)
+preempts only if the running task is also ahead of it by more than that much
+virtual time, as with the fair class' wakeup granularity before EEVDF.
+Without it, tasks which sleep for microseconds, such as the readers and
+writers of a pipe, preempt each other on every wakeup and run in lockstep on
+different CPUs: twice the context switches of the fair class, contention on
+the run queue locks of their wakeups and on the pipe's mutex, and hackbench
+with processes 25-40% slower. The fair class avoids most of these
+preemptions through the state delayed dequeue leaves in its run queues.
+Tasks which slept longer, such as request handlers, preempt as EEVDF decides.
+
 Instead of delayed dequeue (``DELAY_DEQUEUE``, ``DELAY_ZERO``), a task which
 goes to sleep with negative lag remembers when and at which rate its CPU's
 virtual time advanced, and when it wakes up its negative lag is reduced by
@@ -494,7 +505,11 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    behaviour switches for comparisons within one boot: 1 the ported fair
    wakeup placement (off), 2 periodic balance, 4 negative lag served while
    asleep, 8 slice protection updates, 16 periodic balance of unequal
-   weights by load alone (default 30).
+   weights by load alone, 32 periodic balance of task counts (default 62).
+
+``wakeup_gran_us``
+   wakeup granularity for short sleepers, see above; 0 turns it off
+   (default 1000).
 
 
 Measurements
@@ -522,13 +537,12 @@ CPU:
   and 5.0/10.0 ms at limit 0.5 (42.3/83.2, 11.8/50.5, 16.9/38.1).
 - Tasks without limits (median of nine runs in three alternating boots of
   the same kernel with and without ``sched_pfs=1``, on an otherwise quiet
-  host): busy loops as with the fair class; hackbench with threads 2-9%
-  slower, with processes 26-39% slower (remote wakeups contend on run queue
-  locks where the fair class more often wakes an idle CPU through its wake
-  list); a pipe ping-pong 3% faster; wakeup latency of a periodic task next
-  to 8 busy threads p99 0.41 of the fair class, next to 16 busy threads
-  1.16; request latency next to 8 busy threads 25% higher at the median and
-  29% lower at p99 (1.89 vs 1.51 ms, 7.2 vs 10.1 ms).
+  host): busy loops as with the fair class; hackbench with processes 0.68,
+  0.99 and 1.09 of the fair class' time with 4, 8 and 16 groups, with
+  threads 0.85, 0.85 and 1.07; a pipe ping-pong 10% slower; wakeup latency
+  of a periodic task next to 8 busy threads p99 0.77 of the fair class, next
+  to 16 busy threads 1.26; request latency next to 8 busy threads the same
+  at the median and 30% lower at p99 (1.63 vs 1.62 ms, 7.1 vs 10.2 ms).
 - Lock probes in a group limited to 2 and 4 CPUs: threads handing a lock
   over with ``sched_yield()``, threads spinning on a flag set by a thread
   that waits for a slot, and a spin-then-futex barrier all keep the group
