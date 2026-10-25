@@ -831,19 +831,29 @@ enum walk_result {
 
 /*
  * Admit the tasks waiting in @dsq_id, one of the two wait DSQs of the cgroup
- * whose context is @cgc, see retry_cgroup(). The number of tasks examined is
- * counted in @cgc, which is owned by the walker, instead of on the stack. The
+ * whose context is cgc, see retry_cgroup(). The number of tasks examined is
+ * counted in cgc, which is owned by the walker, instead of on the stack. The
  * verifier doesn't know its value, so it doesn't have to walk the loop once for
- * each possible count.
+ * each possible count. A global function, verified once rather than for each
+ * of its call sites, which made loading slow and memory hungry.
  */
-static __noinline int walk_waiters(u64 dsq_id, struct pfs_cgrp_ctx *cgc,
-				   u32 *nr_nokick, s32 *nokick_pid)
+__noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 {
 	bool woken_dsq = dsq_id & WOKEN_DSQ;
 	u64 cgid = dsq_id & ~WOKEN_DSQ;
+	struct pfs_cgrp_ctx *cgc;
 	struct task_struct *p;
+	struct cgroup *cgrp;
 	int res = WK_EMPTY;
 
+	if (!nr_nokick || !nokick_pid)
+		return WK_EMPTY;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp)
+		return WK_EMPTY;
+	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+	bpf_cgroup_release(cgrp);
 	if (!cgc)
 		return WK_EMPTY;
 
@@ -1028,13 +1038,12 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 	bpf_for(i, 0, 2 * WOKEN_STREAK_MAX) {
 		if (cgc->woken_streak >= WOKEN_STREAK_MAX &&
 		    scx_bpf_dsq_nr_queued(cgid) > 0) {
-			res = walk_waiters(cgid, cgc, nr_nokick, nokick_pid);
+			res = walk_waiters(cgid, nr_nokick, nokick_pid);
 		} else {
-			res = walk_waiters(cgid | WOKEN_DSQ, cgc, nr_nokick,
+			res = walk_waiters(cgid | WOKEN_DSQ, nr_nokick,
 					   nokick_pid);
 			if (res == WK_EMPTY)
-				res = walk_waiters(cgid, cgc, nr_nokick,
-						   nokick_pid);
+				res = walk_waiters(cgid, nr_nokick, nokick_pid);
 		}
 		if (res != WK_MORE ||
 		    READ_ONCE(cgc->retry_walked) >= RETRY_WALK_MAX)
