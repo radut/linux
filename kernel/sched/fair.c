@@ -15406,6 +15406,12 @@ static __latent_entropy void sched_balance_softirq(void)
 {
 	struct rq *this_rq = this_rq();
 	enum cpu_idle_type idle = this_rq->idle_balance;
+
+	/* PFS replaces the fair class and runs its own balancer */
+	if (pfs_enabled()) {
+		pfs_balance_softirq();
+		return;
+	}
 	/*
 	 * If this CPU has a pending NOHZ_BALANCE_KICK, then do the
 	 * balancing on behalf of the other idle CPUs whose ticks are

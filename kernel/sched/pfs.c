@@ -51,6 +51,25 @@ static int __init setup_sched_pfs(char *str)
 }
 early_param("sched_pfs", setup_sched_pfs);
 
+/*
+ * Behaviour switches, /sys/kernel/debug/sched/pfs/features, for comparing
+ * variants within one boot.
+ */
+enum {
+	PFS_F_WAKE_AFFINE	= 1 << 0,	/* fair's wakeup placement */
+	PFS_F_BALANCE		= 1 << 1,	/* periodic balance */
+	PFS_F_SLEEP_LAG		= 1 << 2,	/* negative lag served while asleep */
+	PFS_F_PROTECT		= 1 << 3,	/* fair's slice protection updates */
+};
+
+static unsigned int pfs_features __read_mostly =
+	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT;
+
+static inline bool pfs_feat(unsigned int f)
+{
+	return READ_ONCE(pfs_features) & f;
+}
+
 enum pfs_state {
 	PFS_NONE,	/* not runnable, or not on a PFS run queue */
 	PFS_QUEUED,	/* admitted: on the CPU tree, or running */
@@ -73,13 +92,15 @@ enum pfs_stat {
 	PFS_STAT_KICK,		/* idle CPUs kicked */
 	PFS_STAT_CREDIT,	/* admitted without slots, in the kernel */
 	PFS_STAT_USER_PARK,	/* parked or rotated on the way to user space */
+	PFS_STAT_YIELD,		/* gave its slots back in sched_yield() */
+	PFS_STAT_BALANCE,	/* tasks moved by the periodic balancer */
 	PFS_NR_STATS,
 };
 
 static const char * const pfs_stat_names[PFS_NR_STATS] = {
 	"admit", "park_full", "park_budget", "park_fifo", "rotate", "handoff",
 	"handoff_local", "inplace", "retry", "pull", "push", "kick", "credit",
-	"user_park",
+	"user_park", "yield", "balance",
 };
 
 static DEFINE_PER_CPU(unsigned long [PFS_NR_STATS], pfs_stats);
@@ -429,6 +450,23 @@ found:
 }
 
 static int pfs_find_idle_cpu(struct task_struct *p, int target);
+
+/*
+ * CPUs which found nothing to run in their last PFS pick, a hint that lets
+ * wakeups and pushes skip the idle CPU scan on an overloaded machine.
+ */
+static atomic_t pfs_idle_cpus;
+
+static inline void pfs_set_idle_hint(struct pfs_rq *prq, unsigned int idle)
+{
+	if (prq->idle_hint == idle)
+		return;
+	prq->idle_hint = idle;
+	if (idle)
+		atomic_inc(&pfs_idle_cpus);
+	else
+		atomic_dec(&pfs_idle_cpus);
+}
 
 /**************************************************************
  * Groups and slots.
@@ -1312,6 +1350,26 @@ static void pfs_reweight_curr(struct rq *rq, struct task_struct *curr)
  * Admitted tasks on a CPU.
  */
 
+/*
+ * Pay back negative lag for the time asleep, at the rate the virtual time of
+ * the CPU it slept on advanced, and at most up to zero lag: what the fair
+ * class gets from keeping such a task queued until it is eligible.
+ */
+static void pfs_serve_sleep_lag(struct rq *rq, struct sched_pfs_entity *pe)
+{
+	s64 elapsed, served;
+
+	if (!pe->sleep_stamp || pe->vlag >= 0)
+		return;
+	elapsed = rq_clock(rq) - pe->sleep_stamp;
+	pe->sleep_stamp = 0;
+	if (elapsed <= 0)
+		return;
+	served = div64_u64((u64)elapsed * scale_load_down(NICE_0_LOAD),
+			   max(pe->sleep_load, 1UL));
+	pe->vlag = min_t(s64, pe->vlag + served, 0);
+}
+
 /* Put an admitted task on @rq: the tree, or as the running task. */
 static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -1322,6 +1380,8 @@ static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 	pfs_account(p);
 	w = pfs_effective_weight(p, prq->load);
 	pfs_set_weight(pe, w);
+	if (flags & ENQUEUE_WAKEUP)
+		pfs_serve_sleep_lag(rq, pe);
 
 	pfs_place_entity(prq, pe, flags);
 	pe->state = PFS_QUEUED;
@@ -1333,6 +1393,8 @@ static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 	if (!prq->nr_queued++)
 		dl_server_start(&rq->fair_server);
 	prq->load += w;
+	prq->nr_idle_policy += task_has_idle_policy(p);
+	pfs_set_idle_hint(prq, 0);
 	add_nr_running(rq, 1);
 }
 
@@ -1350,9 +1412,22 @@ static void pfs_unqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	if (pe->on_tree)
 		__pfs_dequeue_entity(prq, pe);
 
+	/*
+	 * The fair class keeps a task which sleeps with negative lag queued
+	 * until the lag is paid back (DELAY_DEQUEUE, DELAY_ZERO): the lag is
+	 * served while it sleeps. Remember when it went to sleep and how fast
+	 * the CPU's virtual time advanced, see pfs_serve_sleep_lag().
+	 */
+	pe->sleep_stamp = 0;
+	if ((flags & DEQUEUE_SLEEP) && pe->vlag < 0 && pfs_feat(PFS_F_SLEEP_LAG)) {
+		pe->sleep_stamp = rq_clock(rq);
+		pe->sleep_load = prq->sum_weight + pfs_avg_weight(pe);
+	}
+
 	pe->state = PFS_NONE;
 	prq->nr_queued--;
 	prq->load -= pe->weight.weight;
+	prq->nr_idle_policy -= task_has_idle_policy(p);
 	sub_nr_running(rq, 1);
 	pfs_unaccount(p);
 }
@@ -1551,6 +1626,7 @@ static void update_curr_pfs(struct rq *rq)
 	struct pfs_rq *prq = &rq->pfs;
 	struct task_struct *curr = prq->curr;
 	struct sched_pfs_entity *pe;
+	bool resched;
 	s64 delta;
 
 	if (!curr)
@@ -1569,7 +1645,11 @@ static void update_curr_pfs(struct rq *rq)
 		return;
 
 	pe->vruntime += pfs_calc_delta(delta, pe);
-	if (pfs_update_deadline(prq, pe) && prq->nr_queued > 1)
+	resched = pfs_update_deadline(prq, pe);
+	if (prq->nr_queued == 1)
+		return;
+	/* as update_curr() in fair.c: pick again once the protection ends */
+	if (resched || (!pfs_protected(pe) && pfs_feat(PFS_F_PROTECT)))
 		resched_curr_lazy(rq);
 }
 
@@ -1654,7 +1734,23 @@ static void yield_task_pfs(struct rq *rq)
 	struct sched_pfs_entity *pe = &curr->pfs;
 	struct pfs_rq *prq = &rq->pfs;
 
-	if (unlikely(rq->nr_running == 1) || pe->state != PFS_QUEUED)
+	if (pe->state != PFS_QUEUED)
+		return;
+
+	/*
+	 * A task holding a slot which yields, e.g. spinning on a lock with
+	 * sched_yield(), may wait for a task which waits for that slot: give
+	 * the slot to the next waiting task. It holds no kernel locks here,
+	 * so it may wait, see pfs_admit_or_park().
+	 */
+	if (pe->slot_mask && atomic_read(&pfs_nr_limited) &&
+	    pfs_should_rotate(curr)) {
+		pe->rotate = 1;
+		pfs_stat(PFS_STAT_YIELD);
+		return;
+	}
+
+	if (unlikely(rq->nr_running == 1))
 		return;
 
 	update_rq_clock(rq);
@@ -1710,6 +1806,15 @@ static void wakeup_preempt_pfs(struct rq *rq, struct task_struct *p, int wake_fl
 
 	if (pfs_pick_eevdf(prq, true) == &p->pfs)
 		goto preempt;
+
+	/* see update_protect_slice() in fair.c */
+	if (pfs_feat(PFS_F_PROTECT)) {
+		struct sched_pfs_entity *se = &donor->pfs;
+		u64 v = pfs_min_vruntime(se->vruntime, pfs_avg_vruntime(prq));
+		u64 slice = min(se->slice, p->pfs.slice);
+
+		se->vprot = pfs_min_vruntime(se->vprot, v + pfs_calc_delta(slice, se));
+	}
 	return;
 
 preempt:
@@ -1740,14 +1845,17 @@ again:
 			return pfs_task_of(pe);
 	}
 
-	if (sched_core_enabled(rq) || !rf)
+	if (sched_core_enabled(rq) || !rf) {
+		pfs_set_idle_hint(prq, 1);
 		return NULL;
+	}
 
 	pulled = pfs_newidle(rq, rf);
 	if (pulled < 0)
 		return RETRY_TASK;
 	if (pulled > 0)
 		goto again;
+	pfs_set_idle_hint(prq, 1);
 	return NULL;
 }
 
@@ -2078,27 +2186,184 @@ static inline bool pfs_cpu_idle(int cpu)
 /* An idle CPU in @p's affinity, close to @target first. */
 static int pfs_find_idle_cpu(struct task_struct *p, int target)
 {
-	int cpu, pass;
+	const struct cpumask *llc = pfs_llc_span(target);
+	int cpu;
 
-	for (pass = 0; pass < 2; pass++) {
-		const struct cpumask *span = pass ? cpu_active_mask :
-						    pfs_llc_span(target);
+	/* overloaded: don't scan, as SIS_UTIL in the fair class */
+	if (!atomic_read(&pfs_idle_cpus))
+		return -1;
 
-		for_each_cpu_wrap(cpu, span, target) {
-			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
-				continue;
-			if (pfs_cpu_idle(cpu))
-				return cpu;
-		}
+	for_each_cpu_wrap(cpu, llc, target) {
+		if (cpumask_test_cpu(cpu, p->cpus_ptr) && pfs_cpu_idle(cpu))
+			return cpu;
+	}
+	if (llc == cpu_active_mask)
+		return -1;
+	for_each_cpu_wrap(cpu, cpu_active_mask, target) {
+		if (cpumask_test_cpu(cpu, llc))
+			continue;
+		if (cpumask_test_cpu(cpu, p->cpus_ptr) && pfs_cpu_idle(cpu))
+			return cpu;
 	}
 	return -1;
+}
+
+/*
+ * Wakeup placement, ported from select_task_rq_fair(): wake_wide() and
+ * wake_affine() decide between the waking and the previous CPU,
+ * select_idle_sibling() then looks for an idle CPU close to the choice.
+ */
+
+/* see record_wakee() in fair.c */
+static void pfs_record_wakee(struct task_struct *p)
+{
+	if (time_after(jiffies, current->wakee_flip_decay_ts + HZ)) {
+		current->wakee_flips >>= 1;
+		current->wakee_flip_decay_ts = jiffies;
+	}
+
+	if (current->last_wakee != p) {
+		current->last_wakee = p;
+		current->wakee_flips++;
+	}
+}
+
+/* M:N waker/wakee relations should spread, see wake_wide() in fair.c */
+static int pfs_wake_wide(struct task_struct *p)
+{
+	unsigned int master = current->wakee_flips;
+	unsigned int slave = p->wakee_flips;
+	int factor = __this_cpu_read(sd_llc_size);
+
+	if (master < slave)
+		swap(master, slave);
+	if (slave < factor || master < slave * factor)
+		return 0;
+	return 1;
+}
+
+static inline unsigned long pfs_task_load(struct task_struct *p)
+{
+	return p->pfs.weight.weight ?: p->se.load.weight;
+}
+
+/* wake_affine_idle() and wake_affine_weight() of fair.c on PFS loads */
+static int pfs_wake_affine(struct task_struct *p, int this_cpu, int prev_cpu,
+			   int sync)
+{
+	s64 this_load, prev_load, task_load;
+
+	if (available_idle_cpu(this_cpu) && cpus_share_cache(this_cpu, prev_cpu))
+		return available_idle_cpu(prev_cpu) ? prev_cpu : this_cpu;
+
+	if (sync && cpu_rq(this_cpu)->nr_running == 1)
+		return this_cpu;
+
+	if (available_idle_cpu(prev_cpu))
+		return prev_cpu;
+
+	this_load = READ_ONCE(cpu_rq(this_cpu)->pfs.load);
+	if (sync && current->sched_class == &pfs_sched_class) {
+		s64 current_load = pfs_task_load(current);
+
+		if (current_load > this_load)
+			return this_cpu;
+		this_load -= current_load;
+	}
+
+	task_load = pfs_task_load(p);
+	this_load = (this_load + task_load) * 100;
+	prev_load = max_t(s64, READ_ONCE(cpu_rq(prev_cpu)->pfs.load) - task_load, 0);
+	/* imbalance_pct 117, half of it as in wake_affine_weight() */
+	prev_load *= 100 + (117 - 100) / 2;
+	if (sync)
+		prev_load += 1;
+
+	return this_load < prev_load ? this_cpu : prev_cpu;
+}
+
+/* Runqueue only has SCHED_IDLE tasks enqueued */
+static inline bool pfs_sched_idle_rq(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	unsigned int nr = READ_ONCE(rq->nr_running);
+
+	return nr && nr == READ_ONCE(rq->pfs.nr_idle_policy);
+}
+
+static inline bool pfs_choose_idle_cpu(int cpu, struct task_struct *p)
+{
+	return pfs_cpu_idle(cpu) ||
+	       (pfs_sched_idle_rq(cpu) && !task_has_idle_policy(p));
+}
+
+/* see select_idle_sibling() in fair.c */
+static int pfs_select_idle_sibling(struct task_struct *p, int prev, int target)
+{
+	int cpu, recent_used_cpu;
+	struct sched_domain *sd;
+
+	if (pfs_choose_idle_cpu(target, p))
+		return target;
+
+	/* if the previous CPU is cache affine and idle, don't be stupid */
+	if (prev != target && cpus_share_cache(prev, target) &&
+	    pfs_choose_idle_cpu(prev, p))
+		return prev;
+
+	/* a per-CPU kthread (e.g. I/O completion) stacks with its wakee */
+	if (is_per_cpu_kthread(current) && in_task() &&
+	    prev == smp_processor_id() && this_rq()->nr_running <= 1)
+		return prev;
+
+	recent_used_cpu = p->recent_used_cpu;
+	p->recent_used_cpu = prev;
+	if (recent_used_cpu != prev && recent_used_cpu != target &&
+	    cpus_share_cache(recent_used_cpu, target) &&
+	    pfs_choose_idle_cpu(recent_used_cpu, p) &&
+	    cpumask_test_cpu(recent_used_cpu, p->cpus_ptr))
+		return recent_used_cpu;
+
+	sd = rcu_dereference_all(per_cpu(sd_llc, target));
+	if (!sd || !atomic_read(&pfs_idle_cpus))
+		return target;
+
+	for_each_cpu_wrap(cpu, sched_domain_span(sd), target + 1) {
+		if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		if (pfs_choose_idle_cpu(cpu, p))
+			return cpu;
+	}
+	return target;
+}
+
+/* For fork and exec: an idle CPU, else the one with the fewest tasks. */
+static int pfs_find_idlest_cpu(struct task_struct *p, int this_cpu)
+{
+	unsigned int nr, min_nr = UINT_MAX;
+	int cpu, best = this_cpu;
+
+	cpu = pfs_find_idle_cpu(p, this_cpu);
+	if (cpu >= 0)
+		return cpu;
+
+	for_each_cpu_wrap(cpu, cpu_active_mask, this_cpu) {
+		if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+			continue;
+		nr = READ_ONCE(cpu_rq(cpu)->nr_running);
+		if (nr < min_nr) {
+			min_nr = nr;
+			best = cpu;
+		}
+	}
+	return best;
 }
 
 static int select_task_rq_pfs(struct task_struct *p, int prev_cpu, int wake_flags)
 {
 	int this_cpu = smp_processor_id();
+	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
 	int target = prev_cpu;
-	int cpu;
 
 	if (!(wake_flags & (WF_TTWU | WF_FORK | WF_EXEC)))
 		return prev_cpu;
@@ -2108,69 +2373,186 @@ static int select_task_rq_pfs(struct task_struct *p, int prev_cpu, int wake_flag
 	    cpumask_test_cpu(prev_cpu, p->cpus_ptr))
 		return prev_cpu;
 
+	guard(rcu)();
+
 	if (wake_flags & (WF_FORK | WF_EXEC))
-		target = this_cpu;
+		return pfs_find_idlest_cpu(p, this_cpu);
 
-	if (cpumask_test_cpu(target, p->cpus_ptr) && pfs_cpu_idle(target))
-		return target;
+	pfs_record_wakee(p);
 
-	/* a synchronous waker is about to sleep, its CPU frees up */
-	if ((wake_flags & WF_SYNC) && cpu_rq(this_cpu)->nr_running == 1 &&
+	if ((wake_flags & WF_CURRENT_CPU) &&
+	    cpumask_test_cpu(this_cpu, p->cpus_ptr))
+		return this_cpu;
+
+	if (!pfs_feat(PFS_F_WAKE_AFFINE)) {
+		int cpu;
+
+		if (cpumask_test_cpu(prev_cpu, p->cpus_ptr) && pfs_cpu_idle(prev_cpu))
+			return prev_cpu;
+		if (sync && cpu_rq(this_cpu)->nr_running == 1 &&
+		    cpumask_test_cpu(this_cpu, p->cpus_ptr) &&
+		    cpus_share_cache(this_cpu, prev_cpu))
+			target = this_cpu;
+		cpu = pfs_find_idle_cpu(p, target);
+		return cpu >= 0 ? cpu : target;
+	}
+
+	if (this_cpu != prev_cpu && !pfs_wake_wide(p) &&
 	    cpumask_test_cpu(this_cpu, p->cpus_ptr) &&
 	    cpus_share_cache(this_cpu, prev_cpu))
-		target = this_cpu;
+		target = pfs_wake_affine(p, this_cpu, prev_cpu, sync);
+
+	return pfs_select_idle_sibling(p, prev_cpu, target);
+}
+
+/*
+ * Periodic balancing, a simplified sched_balance_rq() of fair.c: every
+ * balance interval a CPU compares its PFS load (the effective weights of its
+ * admitted tasks) with the busiest CPU of its LLC, then of the machine, and
+ * pulls queued tasks which aren't cache hot while that reduces the
+ * imbalance by more than imbalance_pct. Runs from SCHED_SOFTIRQ, raised by
+ * the tick; idle CPUs pull in their newly idle pick and are pushed to.
+ */
+#define PFS_BALANCE_BUSY_MS	32
+#define PFS_BALANCE_IDLE_MS	4
+#define PFS_IMBALANCE_PCT	117
+#define PFS_BALANCE_MAX_MOVE	8
+
+void pfs_balance_trigger(struct rq *rq)
+{
+	if (pfs_feat(PFS_F_BALANCE) &&
+	    time_after_eq(jiffies, READ_ONCE(rq->pfs.next_balance)) &&
+	    cpu_active(cpu_of(rq)))
+		raise_softirq(SCHED_SOFTIRQ);
+}
+
+/* @p ran on @rq less than sched_migration_cost ago */
+static bool pfs_cache_hot(struct rq *rq, struct task_struct *p)
+{
+	s64 delta = rq_clock_task(rq) - p->se.exec_start;
+
+	return p->se.exec_start && delta < (s64)sysctl_sched_migration_cost;
+}
+
+static struct rq *pfs_find_busiest_load(struct rq *this_rq,
+					const struct cpumask *span,
+					unsigned long *busiest_load)
+{
+	int this_cpu = cpu_of(this_rq), cpu;
+	struct rq *busiest = NULL;
+	unsigned long max = 0;
+
+	for_each_cpu(cpu, span) {
+		struct rq *rq = cpu_rq(cpu);
+		unsigned long load;
+
+		if (cpu == this_cpu || !pfs_nr_waiting_on_tree(rq))
+			continue;
+		load = READ_ONCE(rq->pfs.load);
+		if (load > max) {
+			max = load;
+			busiest = rq;
+		}
+	}
+	*busiest_load = max;
+	return busiest;
+}
+
+/* Pull up to @imbalance of load from @src, with both run queues locked. */
+static int pfs_detach_attach(struct rq *this_rq, struct rq *src, long imbalance)
+{
+	struct rb_node *node = rb_last(&src->pfs.tasks_timeline.rb_root);
+	int this_cpu = cpu_of(this_rq), moved = 0, scanned = 0;
+
+	while (node && imbalance > 0 && moved < PFS_BALANCE_MAX_MOVE &&
+	       scanned++ < 2 * PFS_MIGRATE_SCAN) {
+		struct sched_pfs_entity *pe = __node_2_pe(node);
+		struct task_struct *p = pfs_task_of(pe);
+
+		node = rb_prev(node);
+		if (!pfs_can_migrate(src, p, this_cpu) || pfs_cache_hot(src, p))
+			continue;
+		/* moving it must not just swap the imbalance */
+		if ((long)pe->weight.weight > imbalance * 2)
+			continue;
+		imbalance -= pe->weight.weight;
+		move_queued_task_locked(src, this_rq, p);
+		pfs_stat(PFS_STAT_BALANCE);
+		moved++;
+	}
+	return moved;
+}
+
+static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
+{
+	unsigned long this_load, busiest_load;
+	struct rq *busiest;
+	unsigned long flags;
+	long imbalance;
+
+	busiest = pfs_find_busiest_load(this_rq, span, &busiest_load);
+	if (!busiest)
+		return;
+	this_load = READ_ONCE(this_rq->pfs.load);
+	if (busiest_load * 100 <= this_load * PFS_IMBALANCE_PCT)
+		return;
+	/*
+	 * The load is instantaneous, not averaged as in the fair class: only
+	 * act on an imbalance in the number of tasks too, so that the
+	 * moment-to-moment noise of wakeup-heavy loads doesn't migrate tasks.
+	 */
+	if (READ_ONCE(busiest->pfs.nr_queued) < READ_ONCE(this_rq->pfs.nr_queued) + 2)
+		return;
+	imbalance = (busiest_load - this_load) / 2;
+
+	local_irq_save(flags);
+	double_rq_lock(this_rq, busiest);
+	update_rq_clock(this_rq);
+	update_rq_clock(busiest);
+	pfs_detach_attach(this_rq, busiest, imbalance);
+	double_rq_unlock(this_rq, busiest);
+	local_irq_restore(flags);
+}
+
+void pfs_balance_softirq(void)
+{
+	struct rq *this_rq = this_rq();
+	int this_cpu = cpu_of(this_rq);
+	bool idle = !READ_ONCE(this_rq->pfs.nr_queued);
+	unsigned long interval;
+
+	interval = msecs_to_jiffies(idle ? PFS_BALANCE_IDLE_MS : PFS_BALANCE_BUSY_MS);
+	WRITE_ONCE(this_rq->pfs.next_balance, jiffies + max(interval, 1UL));
+	if (!cpu_active(this_cpu))
+		return;
 
 	rcu_read_lock();
-	cpu = pfs_find_idle_cpu(p, target);
+	pfs_balance_one(this_rq, pfs_llc_span(this_cpu));
+	/* across LLCs at a quarter of the rate */
+	if (!(jiffies & 3) && pfs_llc_span(this_cpu) != cpu_active_mask)
+		pfs_balance_one(this_rq, cpu_active_mask);
 	rcu_read_unlock();
-	if (cpu >= 0)
-		return cpu;
-
-	return target;
 }
 
 static DEFINE_PER_CPU(struct balance_callback, pfs_push_head);
 
 /*
- * The least loaded CPU @p may move to from @rq, an idle one if possible. Only
- * returned if moving @p makes the load of the two CPUs more even.
+ * An idle CPU @p may move to from @rq. Idle CPUs don't run the periodic
+ * balancer (NOHZ), so the busy ones push to them.
  */
 static int pfs_find_push_target(struct rq *rq, struct task_struct *p)
 {
-	int this_cpu = cpu_of(rq), cpu, best = -1, pass;
-	unsigned long w = p->pfs.weight.weight;
-	unsigned long min_load = ULONG_MAX;
+	int this_cpu = cpu_of(rq), cpu;
 
 	cpu = pfs_find_idle_cpu(p, this_cpu);
 	if (cpu >= 0 && cpu != this_cpu)
 		return cpu;
-
-	for (pass = 0; pass < 2 && best < 0; pass++) {
-		const struct cpumask *span = pass ? cpu_active_mask :
-						    pfs_llc_span(this_cpu);
-
-		for_each_cpu_wrap(cpu, span, this_cpu) {
-			unsigned long load;
-
-			if (cpu == this_cpu || !cpumask_test_cpu(cpu, p->cpus_ptr))
-				continue;
-			load = READ_ONCE(cpu_rq(cpu)->pfs.load);
-			if (load < min_load) {
-				min_load = load;
-				best = cpu;
-			}
-		}
-	}
-
-	/* moving p must lower the larger of the two loads */
-	if (best >= 0 && min_load + w + (w >> 3) < READ_ONCE(rq->pfs.load))
-		return best;
 	return -1;
 }
 
 /*
  * Balance callback after a context switch: move one queued task to an idle
- * CPU, or to a CPU with less load.
+ * CPU.
  */
 static void pfs_push(struct rq *rq)
 {
@@ -2477,6 +2859,7 @@ void pfs_init_entity(struct task_struct *p)
 	pe->wake_list = 0;
 	pe->fresh = 0;
 	pe->fresh_rounds = 0;
+	pe->sleep_stamp = 0;
 	init_task_work(&pe->user_work, pfs_user_workfn);
 	/* not queued, see pfs_has_user_work() */
 	pe->user_work.next = &pe->user_work;
@@ -2646,6 +3029,7 @@ void pfs_debugfs_init(struct dentry *parent)
 	debugfs_create_file("groups", 0444, d, NULL, &pfs_groups_fops);
 	debugfs_create_file("waiters", 0400, d, NULL, &pfs_waiters_fops);
 	debugfs_create_file_unsafe("window_us", 0644, d, NULL, &pfs_window_us_fops);
+	debugfs_create_u32("features", 0644, d, &pfs_features);
 }
 
 bool pfs_can_stop_tick(struct rq *rq)

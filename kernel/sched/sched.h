@@ -561,6 +561,12 @@ struct pfs_rq {
 	/* earliest jiffies for the next push */
 	unsigned long		next_push;
 	unsigned int		push_preempted;
+	/* admitted SCHED_IDLE tasks, see pfs_sched_idle_rq() */
+	unsigned int		nr_idle_policy;
+	/* jiffies of the next periodic balance */
+	unsigned long		next_balance;
+	/* counted in pfs_idle_cpus, see pfs_set_idle_hint() */
+	unsigned int		idle_hint;
 };
 #endif /* CONFIG_SCHED_PFS */
 
@@ -2015,6 +2021,8 @@ extern struct task_struct *pfs_get_dying_waiter(struct rq *rq);
 extern bool pfs_can_stop_tick(struct rq *rq);
 extern bool sched_task_cpu_allowed(struct task_struct *p, int cpu);
 extern void pfs_debugfs_init(struct dentry *parent);
+extern void pfs_balance_trigger(struct rq *rq);
+extern void pfs_balance_softirq(void);
 #else /* !CONFIG_SCHED_PFS */
 #define pfs_enabled()		false
 static inline bool pfs_init_rq(struct rq *rq) { return false; }
@@ -2025,6 +2033,8 @@ static inline void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 					   u64 quota_us, u64 burst_us) { }
 static inline void pfs_group_set_weight(struct task_group *tg) { }
 static inline bool pfs_can_stop_tick(struct rq *rq) { return true; }
+static inline void pfs_balance_trigger(struct rq *rq) { }
+static inline void pfs_balance_softirq(void) { }
 #endif /* !CONFIG_SCHED_PFS */
 
 #ifdef CONFIG_SCHED_CLASS_EXT

@@ -134,6 +134,9 @@ keep running on credit until they block.
 A task gives its slots back when it
 
 - blocks, exits, or moves to another cgroup;
+- calls ``sched_yield()`` while tasks wait for its slots: a thread spinning
+  on a lock with ``sched_yield()`` may wait for the lock holder, which waits
+  for a slot;
 - reaches the end of its slice (``sched_base_slice``) while one of its levels
   has waiting tasks, has no budget left, or holds more slots than its limit
   allows (after the limit was lowered). If the slice ends while the task runs
@@ -249,9 +252,18 @@ an earlier deadline, no wakeup preemption by ``SCHED_BATCH`` and
 
 As with ``RUN_TO_PARITY`` and ``PREEMPT_SHORT`` in the fair class, a running
 task is not preempted by a waking task before its request is used up, unless
-the waking task has a shorter slice.
+the waking task has a shorter slice; a waking task which doesn't preempt
+shortens the protection (``update_protect_slice()``), and once it ends the
+running task is picked again at the next update of its runtime.
 
-Not carried over: delayed dequeue, next/short buddies, PELT per task and per
+Instead of delayed dequeue (``DELAY_DEQUEUE``, ``DELAY_ZERO``), a task which
+goes to sleep with negative lag remembers when and at which rate its CPU's
+virtual time advanced, and when it wakes up its negative lag is reduced by
+the virtual time that passed, up to zero lag. The fair class gets the same
+by keeping such a task queued until it is eligible; without either, a short
+sleeper next to busy tasks wakes up with its old debt and waits behind them.
+
+Not carried over: next/short buddies, PELT per task and per
 group, util_est, energy aware placement, misfit migration, NUMA balancing and
 ``cpu.idle`` (treated as a plain weight). For schedutil, PFS keeps one PELT
 utilisation signal per CPU, like the RT class does, and ``cpu_util_cfs()``
@@ -381,13 +393,26 @@ balancer softirq is not raised.
 Load balancing
 ==============
 
-PFS has its own, deliberately simple balancer; the fair class' sched domain
-balancer is not used.
+PFS has its own balancer, with parts ported from the fair class; the fair
+class' sched domain balancer is not used.
 
-- Wake-up placement (``select_task_rq``): the previous CPU if idle, else an
-  idle CPU in the previous CPU's LLC, else an idle CPU anywhere in the task's
-  affinity mask, else the previous CPU. A task of a limited group whose
-  levels have no free slot stays on its previous CPU (it would only park).
+- Wake-up placement (``select_task_rq``): the previous CPU if idle; for a
+  synchronous wakeup from a CPU running only the waker, the waking CPU; else
+  an idle CPU close to that choice, LLC first; else the choice itself. The
+  idle CPU scan is skipped while no CPU went idle in its last pick (a global
+  count of such CPUs), which is what keeps an overloaded machine from paying
+  for scans that find nothing (``SIS_UTIL`` in the fair class). Fork and exec
+  take an idle CPU or the one with the fewest tasks. A port of
+  ``wake_wide()``/``wake_affine()``/``select_idle_sibling()`` is available
+  (feature bit 0) but measured slower here and is off. A task of a limited
+  group whose levels have no free slot stays on its previous CPU (it would
+  only park).
+- Periodic balance (``SCHED_SOFTIRQ``, raised by the tick every 32 ms on a
+  busy CPU, 4 ms on an idle one): compare the PFS load with the busiest CPU
+  of the LLC (and, at a quarter of the rate, of the machine) and pull queued
+  tasks which aren't cache hot while the imbalance exceeds 17%. As the loads
+  are instantaneous rather than averaged, the busiest CPU must also have at
+  least two more admitted tasks.
 - Newly idle pull (``pick_task`` with an empty tree): pull a queued, not
   running, allowed task from the busiest CPU (by queued count), searching the
   LLC first. As in the fair class, a CPU whose idle periods are usually
@@ -396,8 +421,8 @@ balancer is not used.
   time.
 - Push (a balance callback after a context switch, at most once per tick per
   CPU, and right away for a preempted task of a limited group): move a
-  queued task to an idle CPU, or to a CPU whose load is lower by more than the
-  task's weight.
+  queued task to an idle CPU; idle CPUs don't tick (NOHZ) and don't run the
+  periodic balance.
 - Idle CPUs that need to pull are kicked with ``resched_cpu()`` from an
   ``irq_work`` (the kicking side holds a run queue lock); they pull in their
   newly idle pick.
@@ -462,6 +487,11 @@ Under ``/sys/kernel/debug/sched/pfs/``:
 ``window_us``
    length of the budget window, 1000 to 1000000 (default 10000).
 
+``features``
+   behaviour switches for comparisons within one boot: 1 the ported fair
+   wakeup placement (off), 2 periodic balance, 4 negative lag served while
+   asleep, 8 slice protection updates (default 14).
+
 
 Measurements
 ============
@@ -486,10 +516,17 @@ CPU:
   busy threads of the same group), median/p99: 3.9/6.0 ms at limit 1
   (CFS bandwidth control 13.9/61.4, width mode 5.9/24.1, sched_ext 7.0/9.3)
   and 5.0/10.0 ms at limit 0.5 (42.3/83.2, 11.8/50.5, 16.9/38.1).
-- Tasks without limits: busy loops as with the fair class; request latency
-  the same on an otherwise idle machine, but a higher median next to 8 busy
-  threads (2.9 vs 1.3 ms, p99 6.8 vs 4.1 ms); hackbench 13-60% slower, a
-  pipe ping-pong up to 13% slower.
+- Tasks without limits (median of six runs, alternating boots of the same
+  kernel with and without ``sched_pfs=1``): busy loops as with the fair
+  class; hackbench 5-30% faster, a pipe ping-pong 6% faster; wakeup
+  latency of a periodic task next to busy threads lower (p99 0.54-0.83 of
+  the fair class); request latency next to 8 busy threads 10% higher at the
+  median and 16% at p99 (1.82 vs 1.65 ms, 16.0 vs 13.9 ms).
+- Lock probes in a group limited to 2 and 4 CPUs: threads handing a lock
+  over with ``sched_yield()``, threads spinning on a flag set by a thread
+  that waits for a slot, and a spin-then-futex barrier all keep the group
+  at its limit. A barrier with more threads than slots runs at 0.35-0.56
+  of the fair class' rate, as its threads take turns on the slots.
 
 
 Limits of this implementation
