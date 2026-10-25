@@ -60,10 +60,11 @@ enum {
 	PFS_F_BALANCE		= 1 << 1,	/* periodic balance */
 	PFS_F_SLEEP_LAG		= 1 << 2,	/* negative lag served while asleep */
 	PFS_F_PROTECT		= 1 << 3,	/* fair's slice protection updates */
+	PFS_F_BALANCE_WEIGHT	= 1 << 4,	/* balance unequal weights */
 };
 
 static unsigned int pfs_features __read_mostly =
-	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT;
+	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT;
 
 static inline bool pfs_feat(unsigned int f)
 {
@@ -2472,8 +2473,8 @@ static int pfs_detach_attach(struct rq *this_rq, struct rq *src, long imbalance)
 		node = rb_prev(node);
 		if (!pfs_can_migrate(src, p, this_cpu) || pfs_cache_hot(src, p))
 			continue;
-		/* moving it must not just swap the imbalance */
-		if ((long)pe->weight.weight > imbalance * 2)
+		/* moving it must not just mirror the imbalance */
+		if ((long)pe->weight.weight >= imbalance * 2)
 			continue;
 		imbalance -= pe->weight.weight;
 		move_queued_task_locked(src, this_rq, p);
@@ -2485,7 +2486,7 @@ static int pfs_detach_attach(struct rq *this_rq, struct rq *src, long imbalance)
 
 static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 {
-	unsigned long this_load, busiest_load;
+	unsigned long this_load, busiest_load, this_nr, busiest_nr;
 	struct rq *busiest;
 	unsigned long flags;
 	long imbalance;
@@ -2500,8 +2501,16 @@ static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 	 * The load is instantaneous, not averaged as in the fair class: only
 	 * act on an imbalance in the number of tasks too, so that the
 	 * moment-to-moment noise of wakeup-heavy loads doesn't migrate tasks.
+	 * One task more is enough when the loads differ by more than twice,
+	 * which equal weights can't do: a heavy task (the slot holder of a
+	 * limited group carries its group's weight) then gets a CPU of its
+	 * own instead of sharing one with a light task.
 	 */
-	if (READ_ONCE(busiest->pfs.nr_queued) < READ_ONCE(this_rq->pfs.nr_queued) + 2)
+	this_nr = READ_ONCE(this_rq->pfs.nr_queued);
+	busiest_nr = READ_ONCE(busiest->pfs.nr_queued);
+	if (busiest_nr < this_nr + 2 &&
+	    !(pfs_feat(PFS_F_BALANCE_WEIGHT) && busiest_nr > this_nr &&
+	      busiest_load > 2 * this_load))
 		return;
 	imbalance = (busiest_load - this_load) / 2;
 

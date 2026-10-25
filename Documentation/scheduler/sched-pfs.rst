@@ -412,7 +412,10 @@ class' sched domain balancer is not used.
   of the LLC (and, at a quarter of the rate, of the machine) and pull queued
   tasks which aren't cache hot while the imbalance exceeds 17%. As the loads
   are instantaneous rather than averaged, the busiest CPU must also have at
-  least two more admitted tasks.
+  least two more admitted tasks, or one more if its load is more than twice
+  as high (which equal weights can't reach): a slot holder of a limited
+  group, which carries the group's weight, then gets a CPU of its own next
+  to the light tasks of an unlimited neighbour.
 - Newly idle pull (``pick_task`` with an empty tree): pull a queued, not
   running, allowed task from the busiest CPU (by queued count), searching the
   LLC first. As in the fair class, a CPU whose idle periods are usually
@@ -490,7 +493,8 @@ Under ``/sys/kernel/debug/sched/pfs/``:
 ``features``
    behaviour switches for comparisons within one boot: 1 the ported fair
    wakeup placement (off), 2 periodic balance, 4 negative lag served while
-   asleep, 8 slice protection updates (default 14).
+   asleep, 8 slice protection updates, 16 periodic balance of unequal
+   weights with one task more (default 30).
 
 
 Measurements
