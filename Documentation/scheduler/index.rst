@@ -22,6 +22,7 @@ Scheduler
     sched-rt-group
     sched-stats
     sched-ext
+    sched-pfs
     sched-debug
     sched-paravirt
     sched-preemption
