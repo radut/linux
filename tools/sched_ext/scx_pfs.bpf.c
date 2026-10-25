@@ -26,9 +26,9 @@
  * request threads, lock holders, or the thread others spin or sleep for
  * (Redis' main thread, a JVM's VM or GC threads), while rotated tasks are CPU
  * bound and only take turns. While a woken task waits, a task holding its
- * slots since a rotation gives them back after cut_ns (-c, 0.5ms), and while
- * any task waits after rot_ns (-r, 1ms) instead of at the end of its slice; a
- * task holding its slots since its own wakeup is not cut short. ops.tick()
+ * slots since a rotation gives them back after cut_ns (-c, 0.5ms) instead of at
+ * the end of its slice, and with -r while any task waits after rot_ns; a task
+ * holding its slots since its own wakeup is not cut short. ops.tick()
  * checks this, so the cuts are rounded up to a tick.
  *
  * sched_yield() doesn't give the slots away, unless the task has held them for
@@ -167,8 +167,8 @@ const volatile u64 slice_ns;
 const volatile u64 window_ns;
 /* a rotated holder gives its slots to a woken waiter after this, see tick */
 const volatile u64 cut_ns = 500 * 1000;
-/* and to any waiting task after this, 0 for the end of the slice */
-const volatile u64 rot_ns = 1000 * 1000;
+/* and to any waiting task after this, 0 (default) for the end of the slice */
+const volatile u64 rot_ns;
 const volatile u64 min_share = 1;	/* see scale_by_cgrp_share() */
 
 static u64 vtime_now;
@@ -1610,12 +1610,12 @@ static bool slots_wanted(struct pfs_task_ctx *taskc, u64 mask, bool woken_only)
  * thread of a spin-wait hand-off, a GC or a VM thread. A task holding its
  * slots since its own wakeup is not cut short.
  *
- * Rotated holders also give their slots to rotated waiting tasks after rot_ns
- * instead of the whole slice. Threads which spin until another thread of
- * their cgroup sets a flag make progress once per rotation, e.g. Redis I/O
- * threads with more threads than slots; with a 2.5ms slice that was one step
- * per two slices. EEVDF time-slices CPU bound tasks every 0.75ms by default
- * on a real machine.
+ * With -r, rotated holders also give their slots to rotated waiting tasks after
+ * rot_ns instead of the whole slice. Threads which spin until another thread
+ * of their cgroup sets a flag make progress once per rotation, e.g. Redis I/O
+ * threads with more threads than slots: -r 1000 made such a hand-off about
+ * 1.5x faster, but also split a contended machine less precisely by
+ * cpu.weight between limited cgroups, so it is off by default.
  */
 void BPF_STRUCT_OPS(pfs_tick, struct task_struct *p)
 {

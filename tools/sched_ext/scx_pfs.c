@@ -23,7 +23,7 @@ const char help_fmt[] =
 "                which woke up after this, also the least time a yielding\n"
 "                task keeps its slots (default: 500)\n"
 "  -r ROT_US     ... and to any waiting task after this, 0 for the end of the\n"
-"                slice (default: 1000)\n"
+"                slice (default: 0)\n"
 "  -w WINDOW_US  Accounting window for fractional limits (default: 10000,\n"
 "                min: 1000)\n"
 "  -i INTERVAL   Report interval in seconds\n"
