@@ -673,18 +673,34 @@ static bool pfs_should_rotate(struct task_struct *p)
 }
 
 /* charge @delta of runtime to the budget windows of @g's limited levels */
+/*
+ * Charge @delta of runtime of a task of @g, which holds slots, to the limited
+ * levels of its path: to the budget window of a fractional limit, and to the
+ * slot service of the child of the level the task belongs to, which shares
+ * the level's slots between its children by weight, see pfs_next_waiter().
+ */
 static void pfs_charge(struct pfs_group *g, u64 delta)
 {
-	struct pfs_group *lg;
+	struct pfs_group *lg, *child = NULL;
 	u64 now = 0;
 
-	for_each_pfs_level(lg, g) {
+	for (lg = g; lg && lg->depth > 0; child = lg, lg = pfs_parent(lg)) {
 		if (!pfs_level_limited(lg))
 			continue;
-		if (!now)
-			now = pfs_now();
-		pfs_window_left(lg, now);
-		atomic64_add(delta, &lg->window_used);
+
+		if (READ_ONCE(lg->limit) % 1000) {
+			if (!now)
+				now = pfs_now();
+			pfs_window_left(lg, now);
+			atomic64_add(delta, &lg->window_used);
+		}
+
+		if (child)
+			atomic64_add(div64_ul(delta * scale_load_down(NICE_0_LOAD),
+					      max(scale_load_down(READ_ONCE(child->weight)), 1UL)),
+				     &child->slot_vtime);
+		else
+			atomic64_add(delta, &lg->own_slot_vtime);
 	}
 }
 
@@ -861,16 +877,67 @@ static bool pfs_waiting_at(struct rq *rq, struct task_struct *p,
 	       p->pfs.state == PFS_WAITING && p->pfs.wait_grp == lg;
 }
 
-static struct task_struct *pfs_first_waiter(struct pfs_group *lg)
+/* waiting tasks of a level compared by pfs_next_waiter() */
+#define PFS_WAITER_SCAN		16
+
+/*
+ * The slot service of the child of @lg on @p's path, or of @lg's own tasks,
+ * floored to a bit less than the service of the last child admitted at @lg:
+ * a child coming back after a pause gets a bounded head start.
+ */
+static u64 pfs_waiter_vtime(struct pfs_group *lg, struct task_struct *p)
 {
+	struct pfs_group *g = task_pfs_group(p), *child = NULL;
+	u64 vtime, floor;
+
+	for (; g && g != lg; g = pfs_parent(g))
+		child = g;
+
+	if (!g)
+		return 0;
+	vtime = child ? atomic64_read(&child->slot_vtime) :
+			atomic64_read(&lg->own_slot_vtime);
+	floor = READ_ONCE(lg->slot_vmin) - 2 * sysctl_sched_base_slice;
+	return (s64)(vtime - floor) < 0 ? floor : vtime;
+}
+
+/*
+ * The next task to admit at @lg: among the first PFS_WAITER_SCAN waiting
+ * tasks, the first one of the child (or own tasks) of @lg which received the
+ * least slot service for its weight. Within a child the order is FIFO.
+ * Waiting tasks are freed after a grace period, the caller is in an RCU
+ * read-side section.
+ */
+static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
+{
+	struct task_struct *best = NULL;
 	struct sched_pfs_entity *pe;
 	unsigned long flags;
+	u64 best_vt = 0;
+	int n = 0;
 
 	raw_spin_lock_irqsave(&lg->lock, flags);
-	pe = list_first_entry_or_null(&lg->waiters, struct sched_pfs_entity,
-				      wait_node);
+	list_for_each_entry(pe, &lg->waiters, wait_node) {
+		struct task_struct *p = pfs_task_of(pe);
+		u64 vt;
+
+		if (n++ >= PFS_WAITER_SCAN)
+			break;
+		/* one waiting group is the common case */
+		if (n == 1 && list_is_singular(&lg->waiters)) {
+			best = p;
+			break;
+		}
+		vt = pfs_waiter_vtime(lg, p);
+		if (!best || (s64)(vt - best_vt) < 0) {
+			best = p;
+			best_vt = vt;
+		}
+	}
+	if (best && (s64)(best_vt - READ_ONCE(lg->slot_vmin)) > 0)
+		WRITE_ONCE(lg->slot_vmin, best_vt);
 	raw_spin_unlock_irqrestore(&lg->lock, flags);
-	return pe ? pfs_task_of(pe) : NULL;
+	return best;
 }
 
 static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags);
@@ -915,7 +982,7 @@ static void pfs_group_retry(struct pfs_group *lg)
 		int ret = -1;
 
 		rcu_read_lock();
-		p = pfs_first_waiter(lg);
+		p = pfs_next_waiter(lg);
 		if (!p) {
 			rcu_read_unlock();
 			return;
@@ -1910,7 +1977,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 			int ret;
 
 			/* waiting tasks are freed after a grace period */
-			p = pfs_first_waiter(lg);
+			p = pfs_next_waiter(lg);
 			if (!p)
 				break;
 			src = task_rq(p);

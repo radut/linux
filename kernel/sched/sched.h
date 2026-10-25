@@ -528,6 +528,13 @@ struct pfs_group {
 	unsigned long		hweight;
 	unsigned long		hweight_gen;
 	u64			hweight_at;
+
+	/* runtime under the parent's slots, scaled by weight */
+	atomic64_t		slot_vtime;
+	/* the same for own tasks, as a child of this level */
+	atomic64_t		own_slot_vtime;
+	/* slot service of the last task admitted from the queue */
+	u64			slot_vmin;
 };
 
 /* Per CPU state. */
