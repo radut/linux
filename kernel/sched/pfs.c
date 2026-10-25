@@ -1483,9 +1483,11 @@ static void pfs_user_workfn(struct callback_head *work)
 	update_rq_clock(rq);
 	update_curr_pfs(rq);
 	if (pe->unslotted && !pe->slot_mask) {
+		bool woken = pe->woken;
+
 		if (pfs_reserve(p, task_pfs_group(p), true, &fail) == PFS_RES_OK) {
-			/* it ran on credit since it woke up */
-			pe->fresh = 1;
+			/* ran on credit since it woke up (not since fork) */
+			pe->fresh = woken;
 			goto unlock;
 		}
 	} else if (!pfs_should_rotate(p)) {
