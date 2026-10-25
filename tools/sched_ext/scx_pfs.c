@@ -7,11 +7,11 @@
 #include <libgen.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
-#include "scx_width.h"
-#include "scx_width.bpf.skel.h"
+#include "scx_pfs.h"
+#include "scx_pfs.bpf.skel.h"
 
 const char help_fmt[] =
-"A sched_ext scheduler enforcing cgroup CPU limits as a cap on concurrency.\n"
+"Parallel Fair Scheduler: enforces cgroup CPU limits as a concurrency cap.\n"
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
@@ -42,16 +42,16 @@ static void sigint_handler(int dummy)
 	exit_req = 1;
 }
 
-static void read_stats(struct scx_width *skel, __u64 *stats)
+static void read_stats(struct scx_pfs *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
 	assert(nr_cpus > 0);
-	__u64 cnts[WIDTH_NR_STATS][nr_cpus];
+	__u64 cnts[PFS_NR_STATS][nr_cpus];
 	__u32 idx;
 
-	memset(stats, 0, sizeof(stats[0]) * WIDTH_NR_STATS);
+	memset(stats, 0, sizeof(stats[0]) * PFS_NR_STATS);
 
-	for (idx = 0; idx < WIDTH_NR_STATS; idx++) {
+	for (idx = 0; idx < PFS_NR_STATS; idx++) {
 		int ret, cpu;
 
 		ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.stats),
@@ -63,27 +63,27 @@ static void read_stats(struct scx_width *skel, __u64 *stats)
 	}
 }
 
-static void print_stats(struct scx_width *skel)
+static void print_stats(struct scx_pfs *skel)
 {
-	__u64 stats[WIDTH_NR_STATS];
+	__u64 stats[PFS_NR_STATS];
 
 	read_stats(skel, stats);
 	printf("direct=%llu shared=%llu park_full=%llu park_budget=%llu\n"
 	       "admit=%llu repark=%llu retry=%llu overflow=%llu race=%llu\n"
 	       "too_deep=%llu activate=%llu hweight=%llu keep=%llu\n",
-	       stats[WIDTH_STAT_DIRECT], stats[WIDTH_STAT_SHARED],
-	       stats[WIDTH_STAT_PARK_FULL], stats[WIDTH_STAT_PARK_BUDGET],
-	       stats[WIDTH_STAT_ADMIT], stats[WIDTH_STAT_REPARK],
-	       stats[WIDTH_STAT_RETRY], stats[WIDTH_STAT_RETRY_OVERFLOW],
-	       stats[WIDTH_STAT_MOVE_RACE], stats[WIDTH_STAT_TOO_DEEP],
-	       stats[WIDTH_STAT_ACTIVATE], stats[WIDTH_STAT_HWEIGHT],
-	       stats[WIDTH_STAT_KEEP]);
+	       stats[PFS_STAT_DIRECT], stats[PFS_STAT_SHARED],
+	       stats[PFS_STAT_PARK_FULL], stats[PFS_STAT_PARK_BUDGET],
+	       stats[PFS_STAT_ADMIT], stats[PFS_STAT_REPARK],
+	       stats[PFS_STAT_RETRY], stats[PFS_STAT_RETRY_OVERFLOW],
+	       stats[PFS_STAT_MOVE_RACE], stats[PFS_STAT_TOO_DEEP],
+	       stats[PFS_STAT_ACTIVATE], stats[PFS_STAT_HWEIGHT],
+	       stats[PFS_STAT_KEEP]);
 	fflush(stdout);
 }
 
 int main(int argc, char **argv)
 {
-	struct scx_width *skel;
+	struct scx_pfs *skel;
 	struct bpf_link *link;
 	__u64 intv = 1;
 	long nr_cpus;
@@ -95,7 +95,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sigint_handler);
 restart:
 	optind = 1;
-	skel = SCX_OPS_OPEN(width_ops, scx_width);
+	skel = SCX_OPS_OPEN(pfs_ops, scx_pfs);
 
 	/*
 	 * Slices end on a tick, 2.5ms run for about 3ms with HZ=1000, close to
@@ -148,8 +148,8 @@ restart:
 	       (unsigned long long)skel->rodata->slice_ns / 1000,
 	       (unsigned long long)skel->rodata->window_ns / 1000);
 
-	SCX_OPS_LOAD(skel, width_ops, scx_width, uei);
-	link = SCX_OPS_ATTACH(skel, width_ops, scx_width);
+	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);
+	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		print_stats(skel);
@@ -159,7 +159,7 @@ restart:
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
-	scx_width__destroy(skel);
+	scx_pfs__destroy(skel);
 
 	if (!exit_req && UEI_ECODE_RESTART(ecode))
 		goto restart;

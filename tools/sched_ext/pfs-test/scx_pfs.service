@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: GPL-2.0
-# Example unit for running scx_width on a host. Install:
-#   install -m 755 scx_width /usr/local/sbin/scx_width
-#   install -m 644 scx_width.service /etc/systemd/system/
-#   systemctl daemon-reload && systemctl start scx_width   # enable: at boot
+# Example unit for running scx_pfs on a host. Install:
+#   install -m 755 scx_pfs /usr/local/sbin/scx_pfs
+#   install -m 644 scx_pfs.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl start scx_pfs   # enable: at boot
 # While it runs, every task on the host is scheduled by it, not only limited
 # cgroups. Stopping the unit returns all tasks to the kernel's scheduler.
 [Unit]
-Description=scx_width sched_ext scheduler (cgroup CPU limits as concurrency caps)
+Description=scx_pfs sched_ext scheduler (cgroup CPU limits as concurrency caps)
 ConditionPathExists=/sys/kernel/sched_ext/state
 After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/scx_width -i 60
-# scx_width detaches on SIGINT/SIGTERM within one report interval
+ExecStart=/usr/local/sbin/scx_pfs -i 60
+# scx_pfs detaches on SIGINT/SIGTERM within one report interval
 KillSignal=SIGINT
 TimeoutStopSec=90
 # if the kernel ejects the scheduler (watchdog) the loader exits; try again

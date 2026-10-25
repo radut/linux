@@ -33,7 +33,7 @@ environment:
   IMAGE=...       image with /spin /noisy /reqlat (default $IMAGE, see docker-image.sh)
   DOCKER="sudo -u USER XDG_RUNTIME_DIR=/run/user/UID podman"   rootless Podman
   DOCKER="podman --cgroup-manager=cgroupfs"   Podman with the cgroupfs manager
-  SCX_MODE=container|service   run scx_width as a privileged container or a
+  SCX_MODE=container|service   run scx_pfs as a privileged container or a
                   systemd unit instead of from this script (default host)
 
 Prints one CSV line ($CSV_HEADER).

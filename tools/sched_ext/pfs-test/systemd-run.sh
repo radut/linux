@@ -9,7 +9,7 @@ KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=cg-run.sh
 . "$KIT/cg-run.sh"
 
-WT_SLICE=${WT_SLICE:-widthtest.slice}
+WT_SLICE=${WT_SLICE:-pfstest.slice}
 WT_UNITS=()
 
 usage() {

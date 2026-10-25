@@ -1,0 +1,26 @@
+#ifndef __SCX_EXAMPLE_PFS_H
+#define __SCX_EXAMPLE_PFS_H
+
+#define HWEIGHT_ONE		(1LLU << 28)	/* the whole machine */
+/* bound on how long a task of a small cgroup waits for its next slice */
+#define WAIT_MAX_NS		(1000 * 1000 * 1000LLU)
+
+enum pfs_stat_idx {
+	PFS_STAT_DIRECT,		/* dispatched straight to an idle CPU */
+	PFS_STAT_SHARED,		/* admitted to the shared DSQ on enqueue */
+	PFS_STAT_PARK_FULL,		/* parked, all slots of a cgroup taken */
+	PFS_STAT_PARK_BUDGET,		/* parked, fractional budget exhausted */
+	PFS_STAT_ADMIT,		/* parked task admitted by a retry */
+	PFS_STAT_REPARK,		/* parked task moved to another level */
+	PFS_STAT_RETRY,		/* cgroup retries processed */
+	PFS_STAT_RETRY_OVERFLOW,	/* retry queue full, scheduler ejected */
+	PFS_STAT_MOVE_RACE,		/* admission raced, slots given back */
+	PFS_STAT_TOO_DEEP,		/* task of a too deep cgroup not limited */
+	PFS_STAT_ACTIVATE,		/* cgroup (de)activations changing weights */
+	PFS_STAT_HWEIGHT,		/* hweight recomputations */
+	PFS_STAT_KEEP,		/* expired task kept running by dispatch */
+
+	PFS_NR_STATS,
+};
+
+#endif /* __SCX_EXAMPLE_PFS_H */

@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# Run scx_width as a privileged container (--privileged --pid=host), the
+# Run scx_pfs as a privileged container (--privileged --pid=host), the
 # Docker equivalent of a Kubernetes DaemonSet. The scheduler then applies to
 # every task on the host, not only to containers.
 set -euo pipefail

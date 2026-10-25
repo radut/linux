@@ -26,7 +26,7 @@ usage: $0 [options]
   -o DIR        output directory (default ./results/<timestamp>-<path>)
   -h            this text
 
-Writes DIR/results.csv and DIR/summary.txt; scx_width's log goes to DIR/scx-<variant>.log.
+Writes DIR/results.csv and DIR/summary.txt; scx_pfs's log goes to DIR/scx-<variant>.log.
 Limits not below the CPU count are skipped. Takes about
   (#cells * #neigh + 2 * #latency limits) * #variants * REPS * (SECS + 2) seconds.
 EOF

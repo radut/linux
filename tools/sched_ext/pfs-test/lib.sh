@@ -1,21 +1,21 @@
 # shellcheck shell=bash disable=SC2034
 # SPDX-License-Identifier: GPL-2.0
-# Shared helpers for the width test kit. Sourced, not executed.
+# Shared helpers for the PFS test kit. Sourced, not executed.
 #
 # Variants:
 #   cfs     stock CFS bandwidth control (quota per period)
-#   scx     the scx_width sched_ext scheduler loaded for the duration of a run
+#   scx     the scx_pfs sched_ext scheduler loaded for the duration of a run
 #   kwidth  the in-kernel width mode, sysctl kernel.sched_cfs_bandwidth_width=1
 #
 # Environment:
-#   SCX        path to the scx_width binary (default: search, see find_scx)
-#   SCX_ARGS   extra scx_width options, e.g. "-s 2500 -w 10000"
-#   WT_CG      cgroup directory name under /sys/fs/cgroup (default width-test)
+#   SCX        path to the scx_pfs binary (default: search, see find_scx)
+#   SCX_ARGS   extra scx_pfs options, e.g. "-s 2500 -w 10000"
+#   WT_CG      cgroup directory name under /sys/fs/cgroup (default pfs-test)
 #   WT_TRACE   0 disables the sched_switch trace (no concurrency columns)
 
 KIT=${KIT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 CG_FS=/sys/fs/cgroup
-CG_ROOT=$CG_FS/${WT_CG:-width-test}
+CG_ROOT=$CG_FS/${WT_CG:-pfs-test}
 TRACEFS=/sys/kernel/tracing
 SCX_STATE=/sys/kernel/sched_ext/state
 KW_SYSCTL=/proc/sys/kernel/sched_cfs_bandwidth_width
@@ -57,8 +57,8 @@ have_kwidth() { [ -e $KW_SYSCTL ]; }
 
 find_scx() {
 	local c
-	for c in "${SCX:-}" "$KIT/bin/scx_width" "$KIT/../build/bin/scx_width" \
-		 "$(command -v scx_width 2>/dev/null || true)"; do
+	for c in "${SCX:-}" "$KIT/bin/scx_pfs" "$KIT/../build/bin/scx_pfs" \
+		 "$(command -v scx_pfs 2>/dev/null || true)"; do
 		if [ -n "$c" ] && [ -x "$c" ]; then
 			echo "$c"
 			return 0
@@ -89,9 +89,9 @@ wait_scx_enabled() {
 	[ "$(cat $SCX_STATE)" = enabled ]
 }
 
-# scx_start: load scx_width. SCX_MODE picks how:
+# scx_start: load scx_pfs. SCX_MODE picks how:
 #   host       run the binary from this script (default)
-#   service    systemctl start $SCX_UNIT (default scx_width.service)
+#   service    systemctl start $SCX_UNIT (default scx_pfs.service)
 #   container  privileged container, see scx_container_start
 scx_start() {
 	local bin
@@ -100,16 +100,16 @@ scx_start() {
 		die "another sched_ext scheduler is loaded ($(cat /sys/kernel/sched_ext/root/ops 2>/dev/null))"
 	case ${SCX_MODE:-host} in
 	host)
-		bin=$(find_scx) || die "scx_width binary not found (set SCX=/path/to/scx_width)"
+		bin=$(find_scx) || die "scx_pfs binary not found (set SCX=/path/to/scx_pfs)"
 		# shellcheck disable=SC2086
-		"$bin" ${SCX_ARGS:-} -i 3600 > "${SCX_LOG:-/tmp/scx_width.log}" 2>&1 &
+		"$bin" ${SCX_ARGS:-} -i 3600 > "${SCX_LOG:-/tmp/scx_pfs.log}" 2>&1 &
 		SCX_PID=$!
-		wait_scx_enabled || { cat "${SCX_LOG:-/tmp/scx_width.log}" >&2; die "scx_width did not enable"; }
+		wait_scx_enabled || { cat "${SCX_LOG:-/tmp/scx_pfs.log}" >&2; die "scx_pfs did not enable"; }
 		;;
 	service)
-		systemctl start "${SCX_UNIT:-scx_width.service}"
+		systemctl start "${SCX_UNIT:-scx_pfs.service}"
 		SCX_STARTED=service
-		wait_scx_enabled || { journalctl -u "${SCX_UNIT:-scx_width.service}" -n 20 >&2; die "scx_width service did not enable"; }
+		wait_scx_enabled || { journalctl -u "${SCX_UNIT:-scx_pfs.service}" -n 20 >&2; die "scx_pfs service did not enable"; }
 		;;
 	container)
 		scx_container_start
@@ -119,13 +119,13 @@ scx_start() {
 		die "SCX_MODE must be host, service or container"
 		;;
 	esac
-	log "scx_width enabled via ${SCX_MODE:-host} (ops=$(cat /sys/kernel/sched_ext/root/ops))"
+	log "scx_pfs enabled via ${SCX_MODE:-host} (ops=$(cat /sys/kernel/sched_ext/root/ops))"
 }
 
 scx_stop() {
 	case ${SCX_STARTED:-} in
 	service)
-		systemctl stop "${SCX_UNIT:-scx_width.service}" || true
+		systemctl stop "${SCX_UNIT:-scx_pfs.service}" || true
 		;;
 	container)
 		scx_container_stop
@@ -137,8 +137,8 @@ scx_stop() {
 	wait "$SCX_PID" 2>/dev/null || true
 	SCX_PID=
 	# the kernel ejects a scheduler that stalls tasks (watchdog); report it
-	if grep -q 'SCX_EXIT_ERROR\|runnable task stall\|watchdog' "${SCX_LOG:-/tmp/scx_width.log}" 2>/dev/null; then
-		log "scx_width log reports an error exit, see ${SCX_LOG:-/tmp/scx_width.log}"
+	if grep -q 'SCX_EXIT_ERROR\|runnable task stall\|watchdog' "${SCX_LOG:-/tmp/scx_pfs.log}" 2>/dev/null; then
+		log "scx_pfs log reports an error exit, see ${SCX_LOG:-/tmp/scx_pfs.log}"
 	fi
 }
 
@@ -284,8 +284,8 @@ kill_pids() {
 # --- docker / podman -------------------------------------------------------
 
 DOCKER=${DOCKER:-docker}
-IMAGE=${IMAGE:-width-test:local}
-SCX_CTR=${SCX_CTR:-scx-width}
+IMAGE=${IMAGE:-pfs-test:local}
+SCX_CTR=${SCX_CTR:-scx-pfs}
 WT_CTRS=()
 
 # docker_check: runtime answers and the image exists
@@ -340,20 +340,20 @@ limited_cgroup() {
 	echo "$cg"
 }
 
-# scx_container_start: scx_width as a privileged container sharing the host
+# scx_container_start: scx_pfs as a privileged container sharing the host
 # PID namespace, the same shape as a Kubernetes DaemonSet
 scx_container_start() {
 	local i
 	[ "$(cat $SCX_STATE 2>/dev/null)" = disabled ] || die "sched_ext missing or a scheduler is already loaded"
 	# shellcheck disable=SC2086
 	$DOCKER run -d --name "$SCX_CTR" --privileged --pid=host --network none \
-		"$IMAGE" /scx_width ${SCX_ARGS:-} -i 3600 > /dev/null
+		"$IMAGE" /scx_pfs ${SCX_ARGS:-} -i 3600 > /dev/null
 	for i in $(seq 50); do
 		[ "$(cat $SCX_STATE)" = enabled ] && break
 		sleep 0.1
 	done
-	[ "$(cat $SCX_STATE)" = enabled ] || { $DOCKER logs "$SCX_CTR" >&2; die "scx_width container did not enable"; }
-	log "scx_width enabled from container $SCX_CTR"
+	[ "$(cat $SCX_STATE)" = enabled ] || { $DOCKER logs "$SCX_CTR" >&2; die "scx_pfs container did not enable"; }
+	log "scx_pfs enabled from container $SCX_CTR"
 }
 
 scx_container_stop() {

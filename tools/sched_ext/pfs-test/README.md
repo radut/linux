@@ -7,7 +7,7 @@ Docker/Podman:
 | Variant  | What enforces `cpu.max = Q P`                                                     |
 |----------|-----------------------------------------------------------------------------------|
 | `cfs`    | Stock CFS bandwidth control: Q µs of CPU time per P µs, shared by all threads.     |
-| `scx`    | `scx_width` (sched_ext): at most floor(Q/P) threads on CPUs at once, no time budget; a fractional remainder is one extra slot with a budget per 10 ms window. `cpu.weight` sets the share under contention. |
+| `scx`    | `scx_pfs` (sched_ext): at most floor(Q/P) threads on CPUs at once, no time budget; a fractional remainder is one extra slot with a budget per 10 ms window. `cpu.weight` sets the share under contention. |
 | `kwidth` | The same policy inside CFS, enabled with `sysctl kernel.sched_cfs_bandwidth_width=1` on a kernel carrying that patch. |
 
 Kubernetes, Docker, Podman and systemd all express a CPU limit as `cpu.max`,
@@ -30,17 +30,17 @@ with `CPUQuota=150%`, gets `150000 100000`.
 
 ## Build
 
-    make -C tools/sched_ext                     # builds build/bin/scx_width
-    make -C tools/sched_ext/width-test          # static spin, noisy, reqlat
+    make -C tools/sched_ext                     # builds build/bin/scx_pfs
+    make -C tools/sched_ext/pfs-test          # static spin, noisy, reqlat
 
-For a container image, link `scx_width` statically (libbpf, libelf, zlib and
+For a container image, link `scx_pfs` statically (libbpf, libelf, zlib and
 libzstd static archives installed):
 
     cd tools/sched_ext
-    gcc -static -o build/bin/scx_width.static build/obj/sched_ext/scx_width.o \
+    gcc -static -o build/bin/scx_pfs.static build/obj/sched_ext/scx_pfs.o \
         build/obj/libbpf/libbpf.a -lelf -lz -lzstd -lpthread
 
-The scripts look for scx_width in `$SCX`, `width-test/bin/`, `../build/bin/`
+The scripts look for scx_pfs in `$SCX`, `pfs-test/bin/`, `../build/bin/`
 and `$PATH`.
 
 ## Tools
@@ -55,12 +55,12 @@ and `$PATH`.
 | `docker-run.sh`    | One case in a container (Docker or Podman). |
 | `compare.sh`       | The whole matrix or chosen cells, repeated if asked; CSV and a summary table. |
 | `summary.py`       | Summary of a results.csv: median (min-max) per case and variant. |
-| `scx_width.service` | Example systemd unit for running scx_width on a host. |
+| `scx_pfs.service`  | Example systemd unit for running scx_pfs on a host. |
 | `docker-image.sh`  | Builds a local FROM-scratch image with the static binaries (`docker import`, no registry). |
-| `scx-container.sh` | Runs scx_width as a privileged container (`--privileged --pid=host`), the Docker shape of a DaemonSet. |
+| `scx-container.sh` | Runs scx_pfs as a privileged container (`--privileged --pid=host`), the Docker shape of a DaemonSet. |
 
 Every script prints its usage with `-h`, runs under `set -euo pipefail`, and on
-exit or Ctrl-C removes its cgroups and containers, stops scx_width and restores
+exit or Ctrl-C removes its cgroups and containers, stops scx_pfs and restores
 the sysctl.
 
 ## Path A: plain cgroup v2
@@ -68,24 +68,24 @@ the sysctl.
 What the scripts do by hand:
 
     echo +cpu > /sys/fs/cgroup/cgroup.subtree_control
-    mkdir /sys/fs/cgroup/width-test
-    echo +cpu > /sys/fs/cgroup/width-test/cgroup.subtree_control
-    mkdir /sys/fs/cgroup/width-test/lim
-    echo "150000 100000" > /sys/fs/cgroup/width-test/lim/cpu.max    # 1.5 CPUs
-    echo 100 > /sys/fs/cgroup/width-test/lim/cpu.weight
-    sh -c 'echo $$ > /sys/fs/cgroup/width-test/lim/cgroup.procs; exec ./bin/spin 8 10'
-    cat /sys/fs/cgroup/width-test/lim/cpu.stat
+    mkdir /sys/fs/cgroup/pfs-test
+    echo +cpu > /sys/fs/cgroup/pfs-test/cgroup.subtree_control
+    mkdir /sys/fs/cgroup/pfs-test/lim
+    echo "150000 100000" > /sys/fs/cgroup/pfs-test/lim/cpu.max    # 1.5 CPUs
+    echo 100 > /sys/fs/cgroup/pfs-test/lim/cpu.weight
+    sh -c 'echo $$ > /sys/fs/cgroup/pfs-test/lim/cgroup.procs; exec ./bin/spin 8 10'
+    cat /sys/fs/cgroup/pfs-test/lim/cpu.stat
 
 One case per variant:
 
     sudo ./cg-run.sh -H cfs 1 8              # stock CFS, 1 CPU, 8 threads
-    sudo ./cg-run.sh scx 1 8                 # loads scx_width for the run
+    sudo ./cg-run.sh scx 1 8                 # loads scx_pfs for the run
     sudo ./cg-run.sh kwidth 1 8              # sysctl on for the run
     sudo ./cg-run.sh -n noisy scx 2 64       # with an unlimited busy neighbour
     sudo ./cg-run.sh -w reqlat -n noisy cfs 0.5 2   # request latency, 2 burners
 
-To try scx_width on your own workload instead, start it in one terminal
-(`sudo ./bin/scx_width -i 5`, Ctrl-C to stop) and set `cpu.max` as usual.
+To try scx_pfs on your own workload instead, start it in one terminal
+(`sudo ./bin/scx_pfs -i 5`, Ctrl-C to stop) and set `cpu.max` as usual.
 kwidth applies at the moment `cpu.max` is written: flip the sysctl, then
 rewrite existing limits (`cat cpu.max > cpu.max`).
 
@@ -102,15 +102,15 @@ it), `CPUWeight=` writes `cpu.weight`:
     sudo ./systemd-run.sh -m service -n noisy scx 1.5 8
     sudo ./compare.sh -p systemd -m scope
 
-The units go into `widthtest.slice` (a `-` in a slice name means nesting to
+The units go into `pfstest.slice` (a `-` in a slice name means nesting to
 systemd, `a-b.slice` is a child of `a.slice`).
 
 ## Path C: Docker (or Podman)
 
-    sudo ./docker-image.sh                   # image width-test:local
-    sudo docker run --rm --cpus=1.5 width-test:local /spin 8 10
+    sudo ./docker-image.sh                   # image pfs-test:local
+    sudo docker run --rm --cpus=1.5 pfs-test:local /spin 8 10
     sudo docker run --rm --cpu-period=100000 --cpu-quota=50000 --cpu-shares=512 \
-         width-test:local /reqlat 4 1000 20000 10 2
+         pfs-test:local /reqlat 4 1000 20000 10 2
 
 Find the container's cgroup and read its counters while it runs:
 
@@ -126,29 +126,29 @@ conversion (512 shares gave weight 59 with Docker 29). The cgroup disappears
 with the container, so read it while the container runs; `docker-run.sh`
 polls `cpu.stat` every 0.2 s and reports the last reading.
 
-Start the scheduler on the host (`sudo ./bin/scx_width`), as a systemd
+Start the scheduler on the host (`sudo ./bin/scx_pfs`), as a systemd
 unit, or as a container, which mirrors the Kubernetes DaemonSet:
 
-    sudo install -m 755 bin/scx_width /usr/local/sbin/scx_width
-    sudo install -m 644 scx_width.service /etc/systemd/system/
+    sudo install -m 755 bin/scx_pfs /usr/local/sbin/scx_pfs
+    sudo install -m 644 scx_pfs.service /etc/systemd/system/
     sudo systemctl daemon-reload
-    sudo systemctl start scx_width          # stop: back to the kernel scheduler
+    sudo systemctl start scx_pfs          # stop: back to the kernel scheduler
 
 
-    sudo ./scx-container.sh start            # needs a static scx_width in the image
+    sudo ./scx-container.sh start            # needs a static scx_pfs in the image
     sudo ./scx-container.sh status
     sudo ./scx-container.sh stop
 
     # by hand:
-    docker run -d --name scx-width --privileged --pid=host --network none \
-        width-test:local /scx_width -i 10
+    docker run -d --name scx-pfs --privileged --pid=host --network none \
+        pfs-test:local /scx_pfs -i 10
 
 Cases and the matrix:
 
     sudo ./docker-run.sh -H cfs 1.5 8
     sudo ./docker-run.sh -P 100000 -S 512 kwidth 0.5 8
     sudo SCX_MODE=container ./docker-run.sh scx 1 64
-    sudo SCX_MODE=service ./docker-run.sh scx 1 64   # uses scx_width.service
+    sudo SCX_MODE=service ./docker-run.sh scx 1 64   # uses scx_pfs.service
     sudo ./compare.sh -p docker
 
 `SCX_MODE` (host, service, container) works with every script. The `path`
@@ -173,7 +173,7 @@ and drive the user's Podman through `DOCKER`:
 must list `cpu` (default on recent systemd; otherwise add a drop-in for
 `user@.service` with `[Service]` `Delegate=cpu cpuset io memory pids`).
 `loginctl enable-linger USER` keeps the user's systemd running between logins.
-Loading scx_width always needs root.
+Loading scx_pfs always needs root.
 
 ## The matrix
 
@@ -200,17 +200,17 @@ one, then the latency test at 0.5 and 1 CPU. `summary.txt` gives median
   every CPU), `nr_throttled` close to one per period, worst stalls near
   `period - quota` (90 ms at 1 CPU with 8 threads).
 - `scx`: `avg_conc` at the limit, `pct_over_cap` near 0, `nr_throttled` 0:
-  scx_width parks waiting threads in its own queues and never uses CFS
+  scx_pfs parks waiting threads in its own queues and never uses CFS
   throttling. Stalls are bounded by the slice (2.5 ms) times the number of
   waiting threads per slot. Throughput is usually higher at the same limit
   because no quota is lost at period boundaries.
 - `kwidth`: `avg_conc` at the limit as well, but `nr_throttled` and
   `throttled_usec` grow: a run queue waiting for a slot is parked with CFS's
   own throttling, so here they count slot waits, not exhausted quota.
-- scx_width counters: `sudo ./bin/scx_width -i 5` prints them every 5 s
+- scx_pfs counters: `sudo ./bin/scx_pfs -i 5` prints them every 5 s
   (`park_full` = a thread waited for a whole-CPU slot, `park_budget` = the
   fractional slot ran out of budget, `admit` = parked threads let in).
-- `/sys/kernel/sched_ext/state` is `enabled` while scx_width runs;
+- `/sys/kernel/sched_ext/state` is `enabled` while scx_pfs runs;
   `/sys/kernel/sched_ext/root/ops` names it.
 
 ## Troubleshooting
@@ -235,7 +235,7 @@ one, then the latency test at 0.5 and 1 CPU. `summary.txt` gives median
   (rootless). Always find it through the container's PID as above.
 - Rootless Podman fails with a cpu controller error: the controller is not
   delegated to the user, see above.
-- scx_width exits with a stall error: the kernel watchdog ejects a sched_ext
+- scx_pfs exits with a stall error: the kernel watchdog ejects a sched_ext
   scheduler that leaves a runnable task waiting too long
   (`runnable task stall` in `dmesg`), and all tasks fall back to the normal
   scheduler at once. The workload keeps running, now under CFS. Report the

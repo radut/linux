@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * A demo sched_ext scheduler which enforces cgroup CPU limits as a cap on
- * concurrency instead of a time quota.
+ * scx_pfs, the Parallel Fair Scheduler: a demo sched_ext scheduler which
+ * enforces cgroup CPU limits as a cap on concurrency instead of a time quota.
  *
  * With CFS bandwidth control, cpu.max "quota period" gives a cgroup a pool of
  * CPU time which is refilled every period. All threads of the cgroup draw from
@@ -10,7 +10,7 @@
  * CPUs for 1/8 of the period and then stall for the remaining 7/8, which shows
  * up as tail latency even though the average usage is well below the limit.
  *
- * scx_width reads the same cpu.max values through ops.cgroup_init() and
+ * scx_pfs reads the same cpu.max values through ops.cgroup_init() and
  * ops.cgroup_set_bandwidth() and interprets quota / period as a width: a cgroup
  * limited to N CPUs may have at most N of its tasks admitted to run at any
  * time. There is no time budget for whole CPUs, so a cgroup which keeps its
@@ -86,10 +86,10 @@
  * holding a slot.
  *
  * Only cgroups up to MAX_LEVELS - 1 deep are tracked. Tasks of deeper cgroups
- * are not limited at all, which is counted in WIDTH_STAT_TOO_DEEP.
+ * are not limited at all, which is counted in PFS_STAT_TOO_DEEP.
  */
 #include <scx/common.bpf.h>
-#include "scx_width.h"
+#include "scx_pfs.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -143,11 +143,11 @@ static u64 nr_budget_q;
 static u64 hweight_gen = 1;
 
 /* protects ->nr_active and ->child_weight_sum of all cgroups */
-private(WIDTH_WEIGHT) struct bpf_spin_lock weight_lock;
+private(PFS_WEIGHT) struct bpf_spin_lock weight_lock;
 
 UEI_DEFINE(uei);
 
-struct width_cgrp_ctx {
+struct pfs_cgrp_ctx {
 	u64		limit;		/* milli-CPUs from cpu.max, 0 if none */
 	u32		nr_slots;	/* slots taken by tasks of the subtree */
 	u32		retry_queued;
@@ -172,10 +172,10 @@ struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, struct width_cgrp_ctx);
+	__type(value, struct pfs_cgrp_ctx);
 } cgrp_ctx SEC(".maps");
 
-struct width_task_ctx {
+struct pfs_task_ctx {
 	u64		cgid;		/* cgroup the task belongs to */
 	u64		slot_mask;	/* levels of cgid's path holding a slot */
 	u64		slot_seq;
@@ -188,7 +188,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, struct width_task_ctx);
+	__type(value, struct pfs_task_ctx);
 } task_ctx SEC(".maps");
 
 /* cgroups whose waiting tasks may be admittable now */
@@ -205,7 +205,7 @@ struct {
 	__type(value, u64);
 } budget_q SEC(".maps");
 
-struct width_timer {
+struct pfs_timer {
 	struct bpf_timer	timer;
 };
 
@@ -213,17 +213,17 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct width_timer);
+	__type(value, struct pfs_timer);
 } window_timer SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, u64);
-	__uint(max_entries, WIDTH_NR_STATS);
+	__uint(max_entries, PFS_NR_STATS);
 } stats SEC(".maps");
 
-static void stat_inc(enum width_stat_idx idx)
+static void stat_inc(enum pfs_stat_idx idx)
 {
 	u32 idx_v = idx;
 
@@ -244,9 +244,9 @@ static u64 bw_to_limit(u64 period_us, u64 quota_us)
 	return div_round_up(quota_us * FRAC_ONE, period_us);
 }
 
-static struct width_task_ctx *find_task_ctx(struct task_struct *p)
+static struct pfs_task_ctx *find_task_ctx(struct task_struct *p)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
 	if (!taskc)
@@ -254,9 +254,9 @@ static struct width_task_ctx *find_task_ctx(struct task_struct *p)
 	return taskc;
 }
 
-static struct width_cgrp_ctx *find_cgrp_ctx(struct cgroup *cgrp)
+static struct pfs_cgrp_ctx *find_cgrp_ctx(struct cgroup *cgrp)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
 	if (!cgc)
@@ -268,10 +268,10 @@ static struct width_cgrp_ctx *find_cgrp_ctx(struct cgroup *cgrp)
  * Look up the context of @cgrp's ancestor at @level. The ancestors are pinned
  * by @cgrp, so the context stays valid after the ancestor is released.
  */
-static struct width_cgrp_ctx *find_ancestor_ctx(struct cgroup *cgrp, int level,
+static struct pfs_cgrp_ctx *find_ancestor_ctx(struct cgroup *cgrp, int level,
 						u64 *cgidp)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *anc;
 
 	anc = bpf_cgroup_ancestor(cgrp, level);
@@ -286,7 +286,7 @@ static struct width_cgrp_ctx *find_ancestor_ctx(struct cgroup *cgrp, int level,
 	return cgc;
 }
 
-static void queue_retry(struct width_cgrp_ctx *cgc, u64 cgid)
+static void queue_retry(struct pfs_cgrp_ctx *cgc, u64 cgid)
 {
 	/* paired with the clearing in retry_cgroup() */
 	if (__sync_val_compare_and_swap(&cgc->retry_queued, 0, 1))
@@ -295,12 +295,12 @@ static void queue_retry(struct width_cgrp_ctx *cgc, u64 cgid)
 	/* a lost retry can stall the cgroup's waiting tasks forever */
 	if (bpf_map_push_elem(&retry_q, &cgid, 0)) {
 		cgc->retry_queued = 0;
-		stat_inc(WIDTH_STAT_RETRY_OVERFLOW);
+		stat_inc(PFS_STAT_RETRY_OVERFLOW);
 		scx_bpf_error("retry_q overflow for cgid %llu", cgid);
 	}
 }
 
-static void queue_budget(struct width_cgrp_ctx *cgc, u64 cgid)
+static void queue_budget(struct pfs_cgrp_ctx *cgc, u64 cgid)
 {
 	if (__sync_val_compare_and_swap(&cgc->budget_queued, 0, 1))
 		return;
@@ -309,7 +309,7 @@ static void queue_budget(struct width_cgrp_ctx *cgc, u64 cgid)
 		__sync_fetch_and_add(&nr_budget_q, 1);
 	} else {
 		cgc->budget_queued = 0;
-		stat_inc(WIDTH_STAT_RETRY_OVERFLOW);
+		stat_inc(PFS_STAT_RETRY_OVERFLOW);
 		scx_bpf_error("budget_q overflow for cgid %llu", cgid);
 	}
 }
@@ -344,7 +344,7 @@ static u64 window_now(void)
  * window is carried into the next one, up to a full budget, so that the
  * average stays at the limit.
  */
-static u64 window_left(struct width_cgrp_ctx *cgc, u64 now)
+static u64 window_left(struct pfs_cgrp_ctx *cgc, u64 now)
 {
 	u64 id = now / window_ns;
 	u64 old_id = cgc->window_id;
@@ -372,7 +372,7 @@ static u64 window_left(struct width_cgrp_ctx *cgc, u64 now)
  * clips *@slicep to it. Less than MIN_BUDGET_NS left counts as none to avoid
  * tiny slices, unless the whole budget of a window is smaller than that.
  */
-static enum reserve_result take_slot(struct width_cgrp_ctx *cgc, u64 now,
+static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 				     u64 *slicep)
 {
 	u64 width = div_round_up(cgc->limit, FRAC_ONE);
@@ -408,7 +408,7 @@ static enum reserve_result take_slot(struct width_cgrp_ctx *cgc, u64 now,
  */
 static void put_slots(struct cgroup *cgrp, u64 mask, bool kick_waiters)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	u64 cgid;
 	int level;
 
@@ -445,7 +445,7 @@ static enum reserve_result reserve_slots(struct cgroup *cgrp, bool fifo,
 					 u64 *fail_cgidp)
 {
 	enum reserve_result ret = RESERVE_OK;
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	u64 now = window_now();
 	u64 mask = 0, cgid;
 	int i;
@@ -456,7 +456,7 @@ static enum reserve_result reserve_slots(struct cgroup *cgrp, bool fifo,
 
 	/* rather not limit at all than enforce only part of the path */
 	if (too_deep(cgrp)) {
-		stat_inc(WIDTH_STAT_TOO_DEEP);
+		stat_inc(PFS_STAT_TOO_DEEP);
 		return RESERVE_OK;
 	}
 
@@ -506,7 +506,7 @@ static enum reserve_result reserve_slots(struct cgroup *cgrp, bool fifo,
  * that unpublish_slots() can't take back slots which were released and then
  * published again by another path in the meantime.
  */
-static bool publish_slots(struct width_task_ctx *taskc, u64 mask, u64 *valp)
+static bool publish_slots(struct pfs_task_ctx *taskc, u64 mask, u64 *valp)
 {
 	u64 seq = __sync_fetch_and_add(&taskc->slot_seq, 1);
 
@@ -523,7 +523,7 @@ static bool publish_slots(struct width_task_ctx *taskc, u64 mask, u64 *valp)
  * published, in which case the caller owns them again and has to put them.
  * Otherwise another path has already released them.
  */
-static bool unpublish_slots(struct width_task_ctx *taskc, u64 val)
+static bool unpublish_slots(struct pfs_task_ctx *taskc, u64 val)
 {
 	return val &&
 		__sync_val_compare_and_swap(&taskc->slot_mask, val, 0) == val;
@@ -533,7 +533,7 @@ static bool unpublish_slots(struct width_task_ctx *taskc, u64 val)
  * Give back the slots @p holds. The xchg makes sure that the slots are put
  * once when several paths try to release them concurrently.
  */
-static void release_slots(struct width_task_ctx *taskc)
+static void release_slots(struct pfs_task_ctx *taskc)
 {
 	struct cgroup *cgrp;
 	u64 mask;
@@ -553,7 +553,7 @@ static void release_slots(struct width_task_ctx *taskc)
 static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 		 u64 vtime, u64 enq_flags)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *wait_cgrp;
 
 	/*
@@ -581,10 +581,10 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 		 * would queue a retry. Queue one unconditionally.
 		 */
 		if (ret == RESERVE_BUDGET) {
-			stat_inc(WIDTH_STAT_PARK_BUDGET);
+			stat_inc(PFS_STAT_PARK_BUDGET);
 			queue_budget(cgc, cgid);
 		} else {
-			stat_inc(WIDTH_STAT_PARK_FULL);
+			stat_inc(PFS_STAT_PARK_FULL);
 			queue_retry(cgc, cgid);
 		}
 	}
@@ -654,7 +654,7 @@ static void kick_leftover(s32 pid)
 static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 {
 	enum reserve_result ret = RESERVE_OK;
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *cgrp;
 	struct task_struct *p;
 	bool requeue = false;
@@ -675,7 +675,7 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 		goto out_release;
 	}
 
-	stat_inc(WIDTH_STAT_RETRY);
+	stat_inc(PFS_STAT_RETRY);
 
 	/*
 	 * The count is kept in @cgc, which is owned by the walker, instead of
@@ -685,7 +685,7 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 	cgc->retry_walked = 0;
 
 	bpf_for_each(scx_dsq, p, cgid, 0) {
-		struct width_task_ctx *taskc;
+		struct pfs_task_ctx *taskc;
 		struct cgroup *task_cgrp;
 		u64 slice = slice_ns, mask, val, fail_cgid = 0;
 		u32 walked;
@@ -710,7 +710,7 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 		if (ret == RESERVE_OK) {
 			/* publish before @p can run and give the slots back */
 			if (!publish_slots(taskc, mask, &val)) {
-				stat_inc(WIDTH_STAT_MOVE_RACE);
+				stat_inc(PFS_STAT_MOVE_RACE);
 				put_slots(task_cgrp, mask, true);
 				bpf_cgroup_release(task_cgrp);
 				continue;
@@ -719,7 +719,7 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 			scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, slice);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
-				stat_inc(WIDTH_STAT_ADMIT);
+				stat_inc(PFS_STAT_ADMIT);
 				if (*nr_nokick &&
 				    bpf_cpumask_test_cpu(bpf_get_smp_processor_id(),
 							 p->cpus_ptr)) {
@@ -733,7 +733,7 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 				 * @p left the DSQ. Whoever dequeued it may
 				 * have released the slots already.
 				 */
-				stat_inc(WIDTH_STAT_MOVE_RACE);
+				stat_inc(PFS_STAT_MOVE_RACE);
 				if (unpublish_slots(taskc, val))
 					put_slots(task_cgrp, mask, true);
 			}
@@ -747,10 +747,10 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 
 		/* refused by another level, wait there instead */
 		if (scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, fail_cgid, 0)) {
-			struct width_cgrp_ctx *fail_cgc;
+			struct pfs_cgrp_ctx *fail_cgc;
 			struct cgroup *fail_cgrp;
 
-			stat_inc(WIDTH_STAT_REPARK);
+			stat_inc(PFS_STAT_REPARK);
 			fail_cgrp = bpf_cgroup_from_id(fail_cgid);
 			if (!fail_cgrp)
 				continue;
@@ -792,7 +792,7 @@ static bool weighted(struct cgroup *cgrp)
  * changes all the time. A cgroup's hweight is recomputed at most once every
  * HWEIGHT_REFRESH_NS, about a tick, and is that much out of date at worst.
  */
-static void refresh_hweight(struct cgroup *cgrp, struct width_cgrp_ctx *cgc)
+static void refresh_hweight(struct cgroup *cgrp, struct pfs_cgrp_ctx *cgc)
 {
 	u64 cgid, now;
 	int level;
@@ -805,10 +805,10 @@ static void refresh_hweight(struct cgroup *cgrp, struct width_cgrp_ctx *cgc)
 		return;
 	cgc->hweight_at = now;
 
-	stat_inc(WIDTH_STAT_HWEIGHT);
+	stat_inc(PFS_STAT_HWEIGHT);
 
 	bpf_for(level, 0, MAX_LEVELS) {
-		struct width_cgrp_ctx *acgc, *pcgc;
+		struct pfs_cgrp_ctx *acgc, *pcgc;
 		bool is_active;
 
 		if (level > cgrp->level)
@@ -851,7 +851,7 @@ static void refresh_hweight(struct cgroup *cgrp, struct width_cgrp_ctx *cgc)
  * it pairs with, ->nr_active goes negative for a moment without propagating
  * and the increment brings it back to 0, again without propagating. A cgroup's
  * weight is in its parent's sum exactly while its ->nr_active is positive,
- * which is what width_cgroup_set_weight() tests.
+ * which is what pfs_cgroup_set_weight() tests.
  */
 static void update_active(struct cgroup *cgrp, bool runnable)
 {
@@ -860,7 +860,7 @@ static void update_active(struct cgroup *cgrp, bool runnable)
 	int i;
 
 	bpf_for(i, 0, MAX_LEVELS) {
-		struct width_cgrp_ctx *cgc, *pcgc;
+		struct pfs_cgrp_ctx *cgc, *pcgc;
 		int level = cgrp->level - i;
 		bool propagate = false;
 
@@ -895,7 +895,7 @@ static void update_active(struct cgroup *cgrp, bool runnable)
 	}
 
 	if (updated) {
-		stat_inc(WIDTH_STAT_ACTIVATE);
+		stat_inc(PFS_STAT_ACTIVATE);
 		__sync_fetch_and_add(&hweight_gen, 1);
 	}
 }
@@ -922,7 +922,7 @@ static void update_active(struct cgroup *cgrp, bool runnable)
  */
 static u64 scale_by_cgrp_share(struct cgroup *cgrp, u64 vdelta)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	u64 share;
 
 	if (!weighted(cgrp))
@@ -957,10 +957,10 @@ static u64 clamp_vtime(struct task_struct *p, struct cgroup *cgrp)
 	return vtime;
 }
 
-s32 BPF_STRUCT_OPS(width_select_cpu, struct task_struct *p, s32 prev_cpu,
+s32 BPF_STRUCT_OPS(pfs_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 	struct cgroup *cgrp;
 	u64 slice = slice_ns, mask, val, fail_cgid;
 	bool is_idle = false;
@@ -979,7 +979,7 @@ s32 BPF_STRUCT_OPS(width_select_cpu, struct task_struct *p, s32 prev_cpu,
 	taskc->cgid = cgrp->kn->id;
 	if (reserve_slots(cgrp, true, &slice, &mask, &fail_cgid) == RESERVE_OK) {
 		if (publish_slots(taskc, mask, &val)) {
-			stat_inc(WIDTH_STAT_DIRECT);
+			stat_inc(PFS_STAT_DIRECT);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 		} else {
 			/* @p still holds slots, enqueue releases them */
@@ -991,9 +991,9 @@ s32 BPF_STRUCT_OPS(width_select_cpu, struct task_struct *p, s32 prev_cpu,
 	return cpu;
 }
 
-void BPF_STRUCT_OPS(width_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 	struct cgroup *cgrp;
 	enum reserve_result ret;
 	u64 slice = slice_ns, mask, val, fail_cgid = 0;
@@ -1030,14 +1030,14 @@ void BPF_STRUCT_OPS(width_enqueue, struct task_struct *p, u64 enq_flags)
 		 * for it after the release above. The retry's move fails and
 		 * takes them back. Wait in @p's own cgroup for another retry.
 		 */
-		stat_inc(WIDTH_STAT_MOVE_RACE);
+		stat_inc(PFS_STAT_MOVE_RACE);
 		put_slots(cgrp, mask, true);
 		ret = RESERVE_FULL;
 		fail_cgid = taskc->cgid;
 	}
 
 	if (ret == RESERVE_OK) {
-		stat_inc(WIDTH_STAT_SHARED);
+		stat_inc(PFS_STAT_SHARED);
 		/*
 		 * SCX_ENQ_LAST: @p's slice expired and nothing else is queued
 		 * for the CPU. Keep it running, the CPU would idle otherwise.
@@ -1059,7 +1059,7 @@ void BPF_STRUCT_OPS(width_enqueue, struct task_struct *p, u64 enq_flags)
 /* charge @delta of runtime to the windows of the limited cgroups on the path */
 static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	u64 cgid;
 	int level;
 
@@ -1086,7 +1086,7 @@ static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
  * to its vtime, scaled by its weight and @cgrp's share, and to the windows on
  * @cgrp's path.
  */
-static void charge_task(struct task_struct *p, struct width_task_ctx *taskc,
+static void charge_task(struct task_struct *p, struct pfs_task_ctx *taskc,
 			struct cgroup *cgrp, u64 now)
 {
 	u64 delta, vdelta;
@@ -1110,7 +1110,7 @@ static void charge_task(struct task_struct *p, struct width_task_ctx *taskc,
  * doesn't include @prev, so the cgroup is looked up through ->cgid, which
  * follows @prev's moves.
  */
-static void charge_prev(struct task_struct *prev, struct width_task_ctx *taskc)
+static void charge_prev(struct task_struct *prev, struct pfs_task_ctx *taskc)
 {
 	struct cgroup *cgrp;
 
@@ -1143,7 +1143,7 @@ static bool shared_head_vtime(u64 *vtimep)
  * again after dispatch, and the tasks of a cgroup with fewer tasks than its
  * share of CPUs wait out a turn after every slice they run.
  */
-static bool keep_prev(struct task_struct *prev, struct width_task_ctx *taskc)
+static bool keep_prev(struct task_struct *prev, struct pfs_task_ctx *taskc)
 {
 	u64 slice = slice_ns, mask, val, fail_cgid, head;
 	struct cgroup *cgrp;
@@ -1188,7 +1188,7 @@ static bool keep_prev(struct task_struct *prev, struct width_task_ctx *taskc)
 	if (time_before(vtime_now, prev->scx.dsq_vtime))
 		vtime_now = prev->scx.dsq_vtime;
 
-	stat_inc(WIDTH_STAT_KEEP);
+	stat_inc(PFS_STAT_KEEP);
 	prev->scx.slice = slice;
 	keep = true;
 out_release:
@@ -1196,9 +1196,9 @@ out_release:
 	return keep;
 }
 
-void BPF_STRUCT_OPS(width_dispatch, s32 cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(pfs_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct width_task_ctx *taskc = NULL;
+	struct pfs_task_ctx *taskc = NULL;
 	u32 nr_nokick = 1;
 	s32 nokick_pid = 0;
 	u64 cgid;
@@ -1246,9 +1246,9 @@ void BPF_STRUCT_OPS(width_dispatch, s32 cpu, struct task_struct *prev)
 		kick_leftover(nokick_pid);
 }
 
-void BPF_STRUCT_OPS(width_running, struct task_struct *p)
+void BPF_STRUCT_OPS(pfs_running, struct task_struct *p)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
 	if (taskc)
@@ -1264,9 +1264,9 @@ void BPF_STRUCT_OPS(width_running, struct task_struct *p)
 		vtime_now = p->scx.dsq_vtime;
 }
 
-void BPF_STRUCT_OPS(width_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(pfs_stopping, struct task_struct *p, bool runnable)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 	struct cgroup *cgrp;
 	u64 now = window_now();
 
@@ -1287,10 +1287,10 @@ void BPF_STRUCT_OPS(width_stopping, struct task_struct *p, bool runnable)
  * across a cgroup move, which is bracketed by ops.quiescent() and
  * ops.runnable() for a runnable task.
  */
-void BPF_STRUCT_OPS(width_runnable, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(pfs_runnable, struct task_struct *p, u64 enq_flags)
 {
-	struct width_task_ctx *taskc;
-	struct width_cgrp_ctx *cgc;
+	struct pfs_task_ctx *taskc;
+	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *cgrp;
 
 	taskc = find_task_ctx(p);
@@ -1314,9 +1314,9 @@ out_release:
 	bpf_cgroup_release(cgrp);
 }
 
-static void put_runnable(struct width_task_ctx *taskc)
+static void put_runnable(struct pfs_task_ctx *taskc)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *cgrp;
 	u64 cgid = taskc->run_cgid;
 
@@ -1337,23 +1337,23 @@ static void put_runnable(struct width_task_ctx *taskc)
 	bpf_cgroup_release(cgrp);
 }
 
-void BPF_STRUCT_OPS(width_quiescent, struct task_struct *p, u64 deq_flags)
+void BPF_STRUCT_OPS(pfs_quiescent, struct task_struct *p, u64 deq_flags)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
 	if (taskc)
 		put_runnable(taskc);
 }
 
-void BPF_STRUCT_OPS(width_enable, struct task_struct *p)
+void BPF_STRUCT_OPS(pfs_enable, struct task_struct *p)
 {
 	scx_bpf_task_set_dsq_vtime(p, vtime_now);
 }
 
-void BPF_STRUCT_OPS(width_disable, struct task_struct *p)
+void BPF_STRUCT_OPS(pfs_disable, struct task_struct *p)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
 	if (taskc) {
@@ -1362,10 +1362,10 @@ void BPF_STRUCT_OPS(width_disable, struct task_struct *p)
 	}
 }
 
-s32 BPF_STRUCT_OPS(width_init_task, struct task_struct *p,
+s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0,
 				     BPF_LOCAL_STORAGE_GET_F_CREATE);
@@ -1378,10 +1378,10 @@ s32 BPF_STRUCT_OPS(width_init_task, struct task_struct *p,
 	return 0;
 }
 
-void BPF_STRUCT_OPS(width_cgroup_move, struct task_struct *p,
+void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 		    struct cgroup *from, struct cgroup *to)
 {
-	struct width_task_ctx *taskc;
+	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
 	if (!taskc)
@@ -1392,7 +1392,7 @@ void BPF_STRUCT_OPS(width_cgroup_move, struct task_struct *p,
 	taskc->cgid = to->kn->id;
 }
 
-static void set_limit(struct width_cgrp_ctx *cgc, u64 limit)
+static void set_limit(struct pfs_cgrp_ctx *cgc, u64 limit)
 {
 	if (!cgc->limit && limit)
 		__sync_fetch_and_add(&nr_limited, 1);
@@ -1402,10 +1402,10 @@ static void set_limit(struct width_cgrp_ctx *cgc, u64 limit)
 	cgc->limit = limit;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(width_cgroup_init, struct cgroup *cgrp,
+s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 			     struct scx_cgroup_init_args *args)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	u64 cgid = cgrp->kn->id;
 	s32 ret;
 
@@ -1433,9 +1433,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(width_cgroup_init, struct cgroup *cgrp,
 	return 0;
 }
 
-void BPF_STRUCT_OPS(width_cgroup_exit, struct cgroup *cgrp)
+void BPF_STRUCT_OPS(pfs_cgroup_exit, struct cgroup *cgrp)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
 	if (cgc)
@@ -1444,10 +1444,10 @@ void BPF_STRUCT_OPS(width_cgroup_exit, struct cgroup *cgrp)
 	scx_bpf_destroy_dsq(cgrp->kn->id);
 }
 
-void BPF_STRUCT_OPS(width_cgroup_set_bandwidth, struct cgroup *cgrp,
+void BPF_STRUCT_OPS(pfs_cgroup_set_bandwidth, struct cgroup *cgrp,
 		    u64 period_us, u64 quota_us, u64 burst_us)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 
 	cgc = find_cgrp_ctx(cgrp);
 	if (!cgc)
@@ -1460,9 +1460,9 @@ void BPF_STRUCT_OPS(width_cgroup_set_bandwidth, struct cgroup *cgrp,
 		queue_retry(cgc, cgrp->kn->id);
 }
 
-void BPF_STRUCT_OPS(width_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
+void BPF_STRUCT_OPS(pfs_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
-	struct width_cgrp_ctx *cgc, *pcgc = NULL;
+	struct pfs_cgrp_ctx *cgc, *pcgc = NULL;
 	u64 cgid;
 
 	cgc = find_cgrp_ctx(cgrp);
@@ -1487,7 +1487,7 @@ void BPF_STRUCT_OPS(width_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 
 static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
-	struct width_cgrp_ctx *cgc;
+	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *cgrp;
 	u64 cgid, nr = nr_budget_q;
 	u32 nr_nokick = 0;
@@ -1533,7 +1533,7 @@ static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 	return 0;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(width_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_init)
 {
 	struct bpf_timer *timer;
 	u32 key = 0;
@@ -1557,7 +1557,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(width_init)
 	return ret;
 }
 
-void BPF_STRUCT_OPS(width_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(pfs_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
 }
@@ -1567,23 +1567,23 @@ void BPF_STRUCT_OPS(width_exit, struct scx_exit_info *ei)
  * queued for its CPU keeps running and never gives its slots back to the tasks
  * waiting for them.
  */
-SCX_OPS_DEFINE(width_ops,
-	       .select_cpu		= (void *)width_select_cpu,
-	       .enqueue			= (void *)width_enqueue,
-	       .dispatch		= (void *)width_dispatch,
-	       .runnable		= (void *)width_runnable,
-	       .running			= (void *)width_running,
-	       .stopping		= (void *)width_stopping,
-	       .quiescent		= (void *)width_quiescent,
-	       .enable			= (void *)width_enable,
-	       .disable			= (void *)width_disable,
-	       .init_task		= (void *)width_init_task,
-	       .cgroup_init		= (void *)width_cgroup_init,
-	       .cgroup_exit		= (void *)width_cgroup_exit,
-	       .cgroup_move		= (void *)width_cgroup_move,
-	       .cgroup_set_weight	= (void *)width_cgroup_set_weight,
-	       .cgroup_set_bandwidth	= (void *)width_cgroup_set_bandwidth,
-	       .init			= (void *)width_init,
-	       .exit			= (void *)width_exit,
+SCX_OPS_DEFINE(pfs_ops,
+	       .select_cpu		= (void *)pfs_select_cpu,
+	       .enqueue			= (void *)pfs_enqueue,
+	       .dispatch		= (void *)pfs_dispatch,
+	       .runnable		= (void *)pfs_runnable,
+	       .running			= (void *)pfs_running,
+	       .stopping		= (void *)pfs_stopping,
+	       .quiescent		= (void *)pfs_quiescent,
+	       .enable			= (void *)pfs_enable,
+	       .disable			= (void *)pfs_disable,
+	       .init_task		= (void *)pfs_init_task,
+	       .cgroup_init		= (void *)pfs_cgroup_init,
+	       .cgroup_exit		= (void *)pfs_cgroup_exit,
+	       .cgroup_move		= (void *)pfs_cgroup_move,
+	       .cgroup_set_weight	= (void *)pfs_cgroup_set_weight,
+	       .cgroup_set_bandwidth	= (void *)pfs_cgroup_set_bandwidth,
+	       .init			= (void *)pfs_init,
+	       .exit			= (void *)pfs_exit,
 	       .flags			= SCX_OPS_ENQ_EXITING | SCX_OPS_ENQ_LAST,
-	       .name			= "width");
+	       .name			= "pfs");
