@@ -23,7 +23,6 @@ enum pfs_stat_idx {
 	PFS_STAT_CUT,		/* rotated holders cut short for a woken waiter */
 	PFS_STAT_YIELD_KEEP,		/* yields that kept the slots */
 	PFS_STAT_YIELD_ROTATE,	/* yields that gave the slots to a waiter */
-	PFS_STAT_KICK,		/* idle CPUs kicked to process a retry */
 	PFS_STAT_RESCUE,		/* waiting cgroups retried by the timer sweep */
 	PFS_STAT_LOST_PATH,		/* slots of a removed cgroup not given back */
 

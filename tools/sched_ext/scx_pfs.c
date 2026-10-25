@@ -78,7 +78,7 @@ static void print_stats(struct scx_pfs *skel)
 	       "admit=%llu repark=%llu retry=%llu overflow=%llu race=%llu\n"
 	       "too_deep=%llu activate=%llu hweight=%llu keep=%llu\n"
 	       "park_woken=%llu cut=%llu yield_keep=%llu yield_rotate=%llu "
-	       "kick=%llu rescue=%llu lost_path=%llu\n",
+	       "rescue=%llu lost_path=%llu\n",
 	       stats[PFS_STAT_DIRECT], stats[PFS_STAT_SHARED],
 	       stats[PFS_STAT_PARK_FULL], stats[PFS_STAT_PARK_BUDGET],
 	       stats[PFS_STAT_ADMIT], stats[PFS_STAT_REPARK],
@@ -87,7 +87,7 @@ static void print_stats(struct scx_pfs *skel)
 	       stats[PFS_STAT_ACTIVATE], stats[PFS_STAT_HWEIGHT],
 	       stats[PFS_STAT_KEEP], stats[PFS_STAT_PARK_WOKEN],
 	       stats[PFS_STAT_CUT], stats[PFS_STAT_YIELD_KEEP],
-	       stats[PFS_STAT_YIELD_ROTATE], stats[PFS_STAT_KICK],
+	       stats[PFS_STAT_YIELD_ROTATE],
 	       stats[PFS_STAT_RESCUE], stats[PFS_STAT_LOST_PATH]);
 	fflush(stdout);
 }

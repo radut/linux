@@ -36,10 +36,7 @@
  * would otherwise wait a whole turn per yield, while the threads woken for the
  * lock take its slots only to block again.
  *
- * Retries are processed by ops.dispatch() and by the window timer. A retry
- * queued elsewhere, e.g. for slots given back in ops.stopping(), kicks an idle
- * CPU so that the slots don't stay free until some CPU runs out of work. The
- * timer also sweeps the cgroups which have waiting tasks and retries any that
+ * The window timer also sweeps the cgroups which have waiting tasks and retries any that
  * no retry walked for RESCUE_NS, which should never be needed and is counted.
  * Slots are given back through the cgroup IDs of the task's path remembered
  * when it joined its cgroup, so that the slots an exiting task holds on the
@@ -379,7 +376,7 @@ static void kick_idle_cpu(struct task_struct *p)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
-static bool kick_idle_cpu_any(void)
+static void kick_idle_cpu_any(void)
 {
 	const struct cpumask *idle;
 	s32 cpu;
@@ -387,22 +384,8 @@ static bool kick_idle_cpu_any(void)
 	idle = scx_bpf_get_idle_cpumask();
 	cpu = scx_bpf_pick_idle_cpu(idle, 0);
 	scx_bpf_put_idle_cpumask(idle);
-	if (cpu < 0)
-		return false;
-	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-	return true;
-}
-
-/*
- * Retries are processed by ops.dispatch() and by the window timer. A retry
- * queued outside of dispatch, e.g. for slots given back in ops.stopping(),
- * would wait for the next CPU to run out of work, up to a window on a
- * mostly idle machine, while the slots stay free. Wake an idle CPU for it.
- */
-static void queue_retry_kick(struct pfs_cgrp_ctx *cgc, u64 cgid)
-{
-	if (queue_retry(cgc, cgid) && kick_idle_cpu_any())
-		stat_inc(PFS_STAT_KICK);
+	if (cpu >= 0)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 /* list @cgid in waitset for the timer's sweep, see rescue_cb() */
@@ -525,17 +508,12 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
  */
 enum put_flags {
 	PUT_RETRY	= 1 << 0,	/* queue a retry for levels with waiters */
-	PUT_KICK	= 1 << 1,	/* and kick an idle CPU to process it */
 };
 
 static void put_one_slot(struct pfs_cgrp_ctx *cgc, u64 cgid, u32 flags)
 {
 	__sync_fetch_and_sub(&cgc->nr_slots, 1);
-	if (!(flags & PUT_RETRY) || !nr_waiting(cgid))
-		return;
-	if (flags & PUT_KICK)
-		queue_retry_kick(cgc, cgid);
-	else
+	if ((flags & PUT_RETRY) && nr_waiting(cgid))
 		queue_retry(cgc, cgid);
 }
 
@@ -725,7 +703,7 @@ static bool unpublish_slots(struct pfs_task_ctx *taskc, u64 val)
  * Give back the slots @p holds. The xchg makes sure that the slots are put
  * once when several paths try to release them concurrently.
  */
-static void release_slots(struct pfs_task_ctx *taskc, u32 flags)
+static void release_slots(struct pfs_task_ctx *taskc)
 {
 	u64 mask;
 
@@ -733,7 +711,7 @@ static void release_slots(struct pfs_task_ctx *taskc, u32 flags)
 	if (!mask)
 		return;
 
-	put_path_slots(taskc, mask & SLOT_LEVELS_MASK, PUT_RETRY | flags);
+	put_path_slots(taskc, mask & SLOT_LEVELS_MASK, PUT_RETRY);
 }
 
 /* @taskc took its slots at @now, after a wakeup unless @rotated */
@@ -780,19 +758,14 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 		/*
 		 * The slots may have been given back between the failed
 		 * reservation and the insertion above, in which case nobody
-		 * would queue a retry. Queue one unconditionally. If the level
-		 * has free slots, the task only parked behind other waiting
-		 * tasks, make sure that the retry runs soon.
+		 * would queue a retry. Queue one unconditionally.
 		 */
 		if (ret == RESERVE_BUDGET) {
 			stat_inc(PFS_STAT_PARK_BUDGET);
 			queue_budget(cgc, cgid);
 		} else {
 			stat_inc(PFS_STAT_PARK_FULL);
-			if (cgc->nr_slots < div_round_up(cgc->limit, FRAC_ONE))
-				queue_retry_kick(cgc, cgid);
-			else
-				queue_retry(cgc, cgid);
+			queue_retry(cgc, cgid);
 		}
 	}
 	bpf_cgroup_release(wait_cgrp);
@@ -1305,7 +1278,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * @p may have been admitted and then dequeued without running, e.g.
 	 * for an attribute change. Start over.
 	 */
-	release_slots(taskc, PUT_KICK);
+	release_slots(taskc);
 
 	/* release_slots() and retries find the slots through ->cgid */
 	cgrp = scx_bpf_task_cgroup(p);
@@ -1333,17 +1306,11 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 		 * SCX_ENQ_LAST: @p's slice expired and nothing else is queued
 		 * for the CPU. Keep it running, the CPU would idle otherwise.
 		 */
-		if (enq_flags & SCX_ENQ_LAST) {
+		if (enq_flags & SCX_ENQ_LAST)
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, enq_flags);
-		} else {
+		else
 			scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime,
 						 enq_flags);
-			/*
-			 * @p holds its slots from now on: don't let it wait
-			 * for this CPU if another one is idle.
-			 */
-			kick_idle_cpu(p);
-		}
 	} else {
 		park(p, fail_cgid, ret, vtime, enq_flags, woken);
 		/* run a dispatch cycle on the CPU to admit a waiting task */
@@ -1521,7 +1488,7 @@ void BPF_STRUCT_OPS(pfs_dispatch, s32 cpu, struct task_struct *prev)
 		if (taskc) {
 			if (nr_limited && taskc->slot_mask)
 				charge_prev(prev, taskc);
-			release_slots(taskc, 0);
+			release_slots(taskc);
 		}
 	}
 
@@ -1576,7 +1543,7 @@ void BPF_STRUCT_OPS(pfs_stopping, struct task_struct *p, bool runnable)
 	charge_task(p, taskc, cgrp, now);
 	bpf_cgroup_release(cgrp);
 
-	release_slots(taskc, PUT_KICK);
+	release_slots(taskc);
 }
 
 /*
@@ -1757,7 +1724,7 @@ void BPF_STRUCT_OPS(pfs_disable, struct task_struct *p)
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
 	if (taskc) {
-		release_slots(taskc, PUT_KICK);
+		release_slots(taskc);
 		put_runnable(taskc);
 	}
 }
@@ -1800,7 +1767,7 @@ void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 		return;
 
 	/* the slots are on @from's path */
-	release_slots(taskc, PUT_KICK);
+	release_slots(taskc);
 	set_task_cgrp(taskc, to);
 }
 
@@ -1879,7 +1846,7 @@ void BPF_STRUCT_OPS(pfs_cgroup_set_bandwidth, struct cgroup *cgrp,
 
 	/* the limit may have grown, give the waiting tasks a chance */
 	if (nr_waiting(cgrp->kn->id))
-		queue_retry_kick(cgc, cgrp->kn->id);
+		queue_retry(cgc, cgrp->kn->id);
 }
 
 void BPF_STRUCT_OPS(pfs_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
