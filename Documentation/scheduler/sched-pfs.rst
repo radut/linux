@@ -412,10 +412,10 @@ class' sched domain balancer is not used.
   of the LLC (and, at a quarter of the rate, of the machine) and pull queued
   tasks which aren't cache hot while the imbalance exceeds 17%. As the loads
   are instantaneous rather than averaged, the busiest CPU must also have at
-  least two more admitted tasks, or one more if its load is more than twice
-  as high (which equal weights can't reach): a slot holder of a limited
-  group, which carries the group's weight, then gets a CPU of its own next
-  to the light tasks of an unlimited neighbour.
+  least two more admitted tasks, or two tasks and a load more than twice as
+  high (the same with equal weights): a slot holder of a limited group,
+  which carries the group's weight, then gets a CPU of its own next to the
+  light tasks of an unlimited neighbour.
 - Newly idle pull (``pick_task`` with an empty tree): pull a queued, not
   running, allowed task from the busiest CPU (by queued count), searching the
   LLC first. As in the fair class, a CPU whose idle periods are usually
@@ -494,7 +494,7 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    behaviour switches for comparisons within one boot: 1 the ported fair
    wakeup placement (off), 2 periodic balance, 4 negative lag served while
    asleep, 8 slice protection updates, 16 periodic balance of unequal
-   weights with one task more (default 30).
+   weights by load alone (default 30).
 
 
 Measurements
@@ -520,12 +520,15 @@ CPU:
   busy threads of the same group), median/p99: 3.9/6.0 ms at limit 1
   (CFS bandwidth control 13.9/61.4, width mode 5.9/24.1, sched_ext 7.0/9.3)
   and 5.0/10.0 ms at limit 0.5 (42.3/83.2, 11.8/50.5, 16.9/38.1).
-- Tasks without limits (median of six runs, alternating boots of the same
-  kernel with and without ``sched_pfs=1``): busy loops as with the fair
-  class; hackbench 5-30% faster, a pipe ping-pong 6% faster; wakeup
-  latency of a periodic task next to busy threads lower (p99 0.54-0.83 of
-  the fair class); request latency next to 8 busy threads 10% higher at the
-  median and 16% at p99 (1.82 vs 1.65 ms, 16.0 vs 13.9 ms).
+- Tasks without limits (median of nine runs in three alternating boots of
+  the same kernel with and without ``sched_pfs=1``, on an otherwise quiet
+  host): busy loops as with the fair class; hackbench with threads 2-9%
+  slower, with processes 26-39% slower (remote wakeups contend on run queue
+  locks where the fair class more often wakes an idle CPU through its wake
+  list); a pipe ping-pong 3% faster; wakeup latency of a periodic task next
+  to 8 busy threads p99 0.41 of the fair class, next to 16 busy threads
+  1.16; request latency next to 8 busy threads 25% higher at the median and
+  29% lower at p99 (1.89 vs 1.51 ms, 7.2 vs 10.1 ms).
 - Lock probes in a group limited to 2 and 4 CPUs: threads handing a lock
   over with ``sched_yield()``, threads spinning on a flag set by a thread
   that waits for a slot, and a spin-then-futex barrier all keep the group

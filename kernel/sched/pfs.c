@@ -2501,15 +2501,16 @@ static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 	 * The load is instantaneous, not averaged as in the fair class: only
 	 * act on an imbalance in the number of tasks too, so that the
 	 * moment-to-moment noise of wakeup-heavy loads doesn't migrate tasks.
-	 * One task more is enough when the loads differ by more than twice,
-	 * which equal weights can't do: a heavy task (the slot holder of a
-	 * limited group carries its group's weight) then gets a CPU of its
-	 * own instead of sharing one with a light task.
+	 * A load more than twice as high is enough on its own if the busiest
+	 * CPU has two tasks; with equal weights that implies two tasks more,
+	 * but it lets a heavy task (the slot holder of a limited group
+	 * carries its group's weight) get a CPU of its own instead of sharing
+	 * one with light tasks.
 	 */
 	this_nr = READ_ONCE(this_rq->pfs.nr_queued);
 	busiest_nr = READ_ONCE(busiest->pfs.nr_queued);
 	if (busiest_nr < this_nr + 2 &&
-	    !(pfs_feat(PFS_F_BALANCE_WEIGHT) && busiest_nr > this_nr &&
+	    !(pfs_feat(PFS_F_BALANCE_WEIGHT) && busiest_nr >= 2 &&
 	      busiest_load > 2 * this_load))
 		return;
 	imbalance = (busiest_load - this_load) / 2;
