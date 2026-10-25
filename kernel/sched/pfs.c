@@ -955,16 +955,35 @@ static void pfs_unqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	sub_nr_running(rq, 1);
 }
 
-/* Give back the slots @p holds. */
-static void pfs_release_slots(struct rq *rq, struct task_struct *p)
+/* Ask for retries of the levels of @g's path which have waiting tasks. */
+static void pfs_retry_path(struct pfs_group *g)
+{
+	struct pfs_group *lg;
+
+	for_each_pfs_level(lg, g) {
+		if (READ_ONCE(lg->nr_waiting) && pfs_slot_free(lg))
+			pfs_queue_retry(lg);
+	}
+}
+
+/*
+ * Give back the slots @p holds. With @handoff, @p is the previous task of a
+ * schedule() on @rq: the pick that follows hands the slots to waiting tasks,
+ * see pfs_handoff(), otherwise a retry does.
+ */
+static void pfs_release_slots(struct rq *rq, struct task_struct *p, bool handoff)
 {
 	struct sched_pfs_entity *pe = &p->pfs;
 	u64 mask = pe->slot_mask;
 
 	pe->slot_mask = 0;
 	pe->granted = 0;
-	if (mask)
-		pfs_put_slots(pe->grp, mask, true);
+	if (!mask || !pfs_put_slots(pe->grp, mask, !handoff) || !handoff)
+		return;
+
+	if (rq->pfs.handoff && rq->pfs.handoff != pe->grp)
+		pfs_retry_path(rq->pfs.handoff);
+	rq->pfs.handoff = pe->grp;
 }
 
 /* Admit @p on @rq if it gets its slots, otherwise make it wait. */
@@ -1059,7 +1078,7 @@ static void enqueue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 		return;
 	}
 	if (pe->slot_mask)
-		pfs_release_slots(rq, p);
+		pfs_release_slots(rq, p, false);
 
 	pfs_admit_or_park(rq, p, flags);
 }
@@ -1083,7 +1102,8 @@ static bool dequeue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 		if (pe->slot_mask && pfs_dequeue_keeps(p, flags))
 			pe->granted = 1;
 		else
-			pfs_release_slots(rq, p);
+			pfs_release_slots(rq, p, (flags & DEQUEUE_SLEEP) &&
+					  task_current_donor(rq, p));
 		break;
 	case PFS_WAITING:
 		/*
@@ -1165,6 +1185,7 @@ preempt:
 }
 
 static int pfs_newidle(struct rq *this_rq, struct rq_flags *rf);
+static int pfs_handoff(struct rq *rq, struct rq_flags *rf);
 
 static struct task_struct *pick_task_pfs(struct rq *rq, struct rq_flags *rf)
 {
@@ -1173,6 +1194,10 @@ static struct task_struct *pick_task_pfs(struct rq *rq, struct rq_flags *rf)
 	int pulled;
 
 again:
+	if (prq->handoff && rf && !sched_core_enabled(rq) &&
+	    pfs_handoff(rq, rf) < 0)
+		return RETRY_TASK;
+
 	if (prq->nr_queued) {
 		if (pfs_curr_entity(prq))
 			update_curr_pfs(rq);
@@ -1228,6 +1253,12 @@ static void put_prev_task_pfs(struct rq *rq, struct task_struct *prev,
 		break;
 	default:
 		break;
+	}
+
+	/* a hand-off that no pick consumed */
+	if (prq->handoff) {
+		pfs_retry_path(prq->handoff);
+		prq->handoff = NULL;
 	}
 }
 
@@ -1299,7 +1330,7 @@ static void prio_changed_pfs(struct rq *rq, struct task_struct *p, u64 oldprio)
 static void switched_from_pfs(struct rq *rq, struct task_struct *p)
 {
 	if (p->pfs.slot_mask)
-		pfs_release_slots(rq, p);
+		pfs_release_slots(rq, p, false);
 	p->pfs.granted = 0;
 }
 
@@ -1617,8 +1648,105 @@ static void pfs_rotate_out(struct rq *rq, struct task_struct *prev)
 
 	update_curr_pfs(rq);
 	pfs_unqueue_task(rq, prev, 0);
-	pfs_release_slots(rq, prev);
+	pfs_release_slots(rq, prev, true);
 	pe->state = PFS_PARKING;
+}
+
+/*
+ * Same-CPU hand-off: the previous task of this CPU gave back slots of
+ * rq->pfs.handoff's path while tasks wait for them. Admit the first waiting
+ * task of the deepest level which has waiting tasks and pull it here, so that
+ * it runs on the CPU which was just freed. A waiting task which can't run
+ * here is admitted on its own CPU instead.
+ *
+ * Returns 1 if a task was queued here, 0 if not, -1 if a higher class became
+ * runnable while the run queue lock was dropped.
+ */
+static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
+{
+	struct pfs_group *leaf = rq->pfs.handoff, *lg;
+	int this_cpu = cpu_of(rq), tries = 0, got = 0;
+	bool unpinned = false;
+
+	rq->pfs.handoff = NULL;
+
+	for_each_pfs_level(lg, leaf) {
+		while (!got && READ_ONCE(lg->nr_waiting) &&
+		       tries++ < PFS_HANDOFF_TRIES) {
+			struct task_struct *p;
+			struct rq *src;
+			int ret;
+
+			/* waiting tasks are freed after a grace period */
+			p = pfs_first_waiter(lg);
+			if (!p)
+				break;
+			src = task_rq(p);
+
+			if (src == rq) {
+				if (!pfs_waiting_at(rq, p, lg))
+					continue;
+				if (!sched_task_cpu_allowed(p, this_cpu))
+					break;
+				ret = pfs_try_waiter(rq, p, lg);
+				if (ret < 0)
+					break;
+				if (ret > 0) {
+					pfs_unpark(rq, p);
+					pfs_queue_task(rq, p, 0);
+					got = 1;
+				}
+				continue;
+			}
+
+			if (!unpinned) {
+				rq_unpin_lock(rq, rf);
+				rq_modified_begin(rq, &pfs_sched_class);
+				unpinned = true;
+			}
+
+			double_lock_balance(rq, src);
+			if (!pfs_waiting_at(src, p, lg)) {
+				double_unlock_balance(rq, src);
+				continue;
+			}
+
+			update_rq_clock(src);
+			if (pfs_can_migrate(src, p, this_cpu)) {
+				ret = pfs_try_waiter(src, p, lg);
+				if (ret > 0) {
+					/* keeps its slots, enqueue_task_pfs() */
+					pfs_unpark(src, p);
+					p->pfs.granted = 1;
+					deactivate_task(src, p, 0);
+					set_task_cpu(p, this_cpu);
+					activate_task(rq, p, 0);
+					got = 1;
+				}
+			} else if (sched_task_cpu_allowed(p, cpu_of(src))) {
+				ret = pfs_try_waiter(src, p, lg);
+				if (ret > 0)
+					pfs_admit_in_place(src, p);
+			} else {
+				/* hotplug moves it, see pfs_get_dying_waiter() */
+				ret = -1;
+			}
+			double_unlock_balance(rq, src);
+
+			if (ret < 0)
+				break;
+		}
+	}
+
+	/* slots left over, e.g. no waiting task could run here */
+	pfs_retry_path(leaf);
+
+	if (unpinned) {
+		rq_repin_lock(rq, rf);
+		if (rq_modified_above(rq, &pfs_sched_class))
+			return -1;
+	}
+	return got;
 }
 
 static int balance_pfs(struct rq *rq, struct rq_flags *rf)
@@ -1627,6 +1755,9 @@ static int balance_pfs(struct rq *rq, struct rq_flags *rf)
 
 	if (prev->sched_class == &pfs_sched_class && prev->pfs.rotate)
 		pfs_rotate_out(rq, prev);
+
+	if (rq->pfs.handoff && pfs_handoff(rq, rf) < 0)
+		return 1;
 
 	return rq->pfs.nr_queued || sched_stop_runnable(rq) ||
 	       sched_dl_runnable(rq) || sched_rt_runnable(rq);
