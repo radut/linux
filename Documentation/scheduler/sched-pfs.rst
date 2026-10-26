@@ -134,9 +134,12 @@ keep running on credit until they block.
 A task gives its slots back when it
 
 - blocks, exits, or moves to another cgroup;
-- calls ``sched_yield()`` while tasks wait for its slots: a thread spinning
-  on a lock with ``sched_yield()`` may wait for the lock holder, which waits
-  for a slot;
+- calls ``sched_yield()`` while tasks wait for its slots, after it held them
+  for 0.5 ms (since it took them or since its last round began): a thread
+  spinning on a lock with ``sched_yield()`` may wait for the lock holder,
+  which waits for a slot. A thread which yields while it holds the lock, on
+  the other hand, must not hand its slots to the threads woken for that lock,
+  which would find it still taken; the 0.5 ms let it finish first;
 - reaches the end of its slice (``sched_base_slice``) while one of its levels
   has waiting tasks, has no budget left, or holds more slots than its limit
   allows (after the limit was lowered). If the slice ends while the task runs
@@ -505,7 +508,8 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    behaviour switches for comparisons within one boot: 1 the ported fair
    wakeup placement (off), 2 periodic balance, 4 negative lag served while
    asleep, 8 slice protection updates, 16 periodic balance of unequal
-   weights by load alone, 32 periodic balance of task counts (default 62).
+   weights by load alone, 32 periodic balance of task counts, 64 slot
+   holders keep their slots on a yield for 0.5 ms (default 126).
 
 ``wakeup_gran_us``
    wakeup granularity for short sleepers, see above; 0 turns it off

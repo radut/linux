@@ -62,11 +62,12 @@ enum {
 	PFS_F_PROTECT		= 1 << 3,	/* fair's slice protection updates */
 	PFS_F_BALANCE_WEIGHT	= 1 << 4,	/* balance unequal weights */
 	PFS_F_BALANCE_COUNT	= 1 << 5,	/* balance task counts */
+	PFS_F_YIELD_KEEP	= 1 << 6,	/* keep slots on an early yield */
 };
 
 static unsigned int pfs_features __read_mostly =
 	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT |
-	PFS_F_BALANCE_COUNT;
+	PFS_F_BALANCE_COUNT | PFS_F_YIELD_KEEP;
 
 static inline bool pfs_feat(unsigned int f)
 {
@@ -1738,6 +1739,26 @@ static bool dequeue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 	return true;
 }
 
+/*
+ * Should a slot holder which calls sched_yield() give its slots to a waiting
+ * task? A thread spinning on a lock with sched_yield() may wait for the lock
+ * holder, which waits for a slot, so the slots go to the next waiting task.
+ * But the yielding thread may be the lock holder itself, e.g. a thread which
+ * yields with a mutex held: the threads woken for that mutex would take its
+ * slots and find the mutex still taken. So it keeps its slots until it held
+ * them for PFS_WAKE_GRAN_NS since it took them or started a new round, as a
+ * task holding slots since a rotation does for a woken waiter.
+ */
+static bool pfs_yield_rotates(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+
+	if (pfs_feat(PFS_F_YIELD_KEEP) &&
+	    p->se.sum_exec_runtime - pe->run_start < PFS_WAKE_GRAN_NS)
+		return false;
+	return pfs_should_rotate(p);
+}
+
 static void yield_task_pfs(struct rq *rq)
 {
 	struct task_struct *curr = rq->donor;
@@ -1747,14 +1768,13 @@ static void yield_task_pfs(struct rq *rq)
 	if (pe->state != PFS_QUEUED)
 		return;
 
-	/*
-	 * A task holding a slot which yields, e.g. spinning on a lock with
-	 * sched_yield(), may wait for a task which waits for that slot: give
-	 * the slot to the next waiting task. It holds no kernel locks here,
-	 * so it may wait, see pfs_admit_or_park().
-	 */
+	update_rq_clock(rq);
+	update_curr_pfs(rq);
+	rq_clock_skip_update(rq);
+
+	/* it holds no kernel locks here and may wait, pfs_admit_or_park() */
 	if (pe->slot_mask && atomic_read(&pfs_nr_limited) &&
-	    pfs_should_rotate(curr)) {
+	    pfs_yield_rotates(curr)) {
 		pe->rotate = 1;
 		pfs_stat(PFS_STAT_YIELD);
 		return;
@@ -1762,10 +1782,6 @@ static void yield_task_pfs(struct rq *rq)
 
 	if (unlikely(rq->nr_running == 1))
 		return;
-
-	update_rq_clock(rq);
-	update_curr_pfs(rq);
-	rq_clock_skip_update(rq);
 
 	/* forfeit the rest of the request, if it is owed service at all */
 	if (pfs_entity_eligible(prq, pe)) {
