@@ -64,11 +64,13 @@ enum {
 	PFS_F_BALANCE_COUNT	= 1 << 5,	/* balance task counts */
 	PFS_F_YIELD_KEEP	= 1 << 6,	/* keep slots on an early yield */
 	PFS_F_WAKE_WAKER	= 1 << 7,	/* waking CPU before a busier prev */
+	PFS_F_GRAN_SYNC		= 1 << 8,	/* wakeup granularity: sync only */
 };
 
 static unsigned int pfs_features __read_mostly =
 	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT |
-	PFS_F_BALANCE_COUNT | PFS_F_YIELD_KEEP | PFS_F_WAKE_WAKER;
+	PFS_F_BALANCE_COUNT | PFS_F_YIELD_KEEP | PFS_F_WAKE_WAKER |
+	PFS_F_GRAN_SYNC;
 
 static inline bool pfs_feat(unsigned int f)
 {
@@ -1802,15 +1804,20 @@ static unsigned int pfs_wakeup_gran_us __read_mostly = 1000;
  * Without it, tasks which sleep for microseconds, e.g. readers of a pipe,
  * preempt the writer on every wakeup and run in lockstep with it; with it
  * they batch up. A task which slept longer, e.g. a request handler, preempts
- * as EEVDF decides.
+ * as EEVDF decides. It applies to synchronous wakeups, whose waker is about
+ * to block (pipes, sockets), and not to others, e.g. a futex wakeup by a
+ * thread which wakes several and keeps running: there a wakee which doesn't
+ * preempt may wait behind another task for a whole slice.
  */
 static bool pfs_wakeup_far_ahead(struct task_struct *curr,
-				 struct task_struct *p)
+				 struct task_struct *p, int wake_flags)
 {
 	u64 gran = (u64)READ_ONCE(pfs_wakeup_gran_us) * NSEC_PER_USEC;
 	s64 ahead = (s64)(curr->pfs.vruntime - p->pfs.vruntime);
 
 	if (!gran || p->pfs.slept >= gran)
+		return true;
+	if (!(wake_flags & WF_SYNC) && pfs_feat(PFS_F_GRAN_SYNC))
 		return true;
 	return ahead > (s64)pfs_calc_delta(gran, &p->pfs);
 }
@@ -1854,7 +1861,7 @@ static void wakeup_preempt_pfs(struct rq *rq, struct task_struct *p, int wake_fl
 	if (wake_flags & WF_FORK)
 		return;
 
-	if (pfs_wakeup_far_ahead(donor, p) &&
+	if (pfs_wakeup_far_ahead(donor, p, wake_flags) &&
 	    pfs_pick_eevdf(prq, true) == &p->pfs)
 		goto preempt;
 

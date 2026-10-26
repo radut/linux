@@ -269,6 +269,12 @@ the run queue locks of their wakeups and on the pipe's mutex, and hackbench
 with processes 25-40% slower. The fair class avoids most of these
 preemptions through the state delayed dequeue leaves in its run queues.
 Tasks which slept longer, such as request handlers, preempt as EEVDF decides.
+The granularity applies to synchronous wakeups only (pipes, sockets), whose
+waker is about to block. A thread which wakes several others with a futex and
+keeps running would otherwise leave each wakee that doesn't preempt it queued
+behind another task for a whole slice: with schbench (message threads waking
+workers), 16 workers on 8 CPUs saw a median wakeup latency of 2 ms instead of
+a few microseconds.
 
 Instead of delayed dequeue (``DELAY_DEQUEUE``, ``DELAY_ZERO``), a task which
 goes to sleep with negative lag remembers when and at which rate its CPU's
@@ -515,7 +521,8 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    asleep, 8 slice protection updates, 16 periodic balance of unequal
    weights by load alone, 32 periodic balance of task counts, 64 slot
    holders keep their slots on a yield for 0.5 ms, 128 wakeups on the
-   waking CPU if it is no busier than the previous one (default 254).
+   waking CPU if it is no busier than the previous one, 256 the wakeup
+   granularity for synchronous wakeups only (default 510).
 
 ``wakeup_gran_us``
    wakeup granularity for short sleepers, see above; 0 turns it off
