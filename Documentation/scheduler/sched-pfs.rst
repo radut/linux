@@ -555,18 +555,24 @@ CPU:
   busy threads of the same group), median/p99: 3.9/6.0 ms at limit 1
   (CFS bandwidth control 13.9/61.4, width mode 5.9/24.1, sched_ext 7.0/9.3)
   and 5.0/10.0 ms at limit 0.5 (42.3/83.2, 11.8/50.5, 16.9/38.1).
-- Tasks without limits (median of nine runs in three alternating boots of
-  the same kernel with and without ``sched_pfs=1``, on an otherwise quiet
-  host): busy loops as with the fair class; hackbench with processes 0.68,
-  0.99 and 1.09 of the fair class' time with 4, 8 and 16 groups, with
-  threads 0.85, 0.85 and 1.07; a pipe ping-pong 10% slower; wakeup latency
-  of a periodic task next to 8 busy threads p99 0.77 of the fair class, next
-  to 16 busy threads 1.26; request latency next to 8 busy threads the same
-  at the median and 30% lower at p99 (1.63 vs 1.62 ms, 7.1 vs 10.2 ms).
+- Tasks without limits (median of nine runs in alternating boots of the
+  same kernel with and without ``sched_pfs=1``, on an otherwise quiet host):
+  busy loops as with the fair class; hackbench with processes 0.53, 0.83 and
+  1.10 of the fair class' time with 4, 8 and 16 groups, with threads 0.76,
+  0.82 and 1.02; a pipe ping-pong 5% slower; schbench (two message threads
+  waking 8 or 16 workers) wakeup latency p99 0.31 and 1.01 of the fair
+  class at 1.07 and 1.00 of its request rate; wakeup latency of a periodic
+  task next to 8 busy threads p99 1.06, next to 16 busy threads 0.96;
+  request latency next to 8 busy threads 0.89 at the median and 1.13 at
+  p99, within the run-to-run spread.
 - Lock probes in a group limited to 2 and 4 CPUs: threads handing a lock
   over with ``sched_yield()``, threads spinning on a flag set by a thread
   that waits for a slot, and a spin-then-futex barrier all keep the group
-  at its limit. A barrier with more threads than slots runs at 0.35-0.56
+  at its limit. Sixteen threads which yield 100 times while holding one of
+  four mutexes run 5.6 and 5.9 times as fast as under CFS bandwidth control
+  at limits 2 and 4. Sixteen threads passing flags in pairs while spinning
+  run at 0.53 and 0.88 of its rate at limits 2 and 4: they take turns on the
+  slots, and some runs at limit 2 collapse to a hand-off per rotation. A barrier with more threads than slots runs at 0.35-0.56
   of the fair class' rate, as its threads take turns on the slots.
 
 
