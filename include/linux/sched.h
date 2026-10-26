@@ -687,6 +687,8 @@ struct sched_pfs_entity {
 	unsigned char			fresh;
 	/* rotations since the wakeup which kept its wakeup priority */
 	unsigned char			fresh_rounds;
+	/* runtime not charged to its group yet, see update_curr_pfs() */
+	u64				charge_pending;
 	/* when it went to sleep, and the CPU's load then if its lag was negative */
 	u64				sleep_stamp;
 	unsigned long			sleep_load;

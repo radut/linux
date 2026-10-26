@@ -139,10 +139,13 @@ since the window began plus the budget of the budget slot, by more than a
 margin, the level does not hand out its last full slot nor its budget slot,
 and a slot holder whose slice ends while the level holds that many slots
 gives its slots back. A timer retries when the remaining full slots would
-have paid the excess back. The margin, one tick per slot plus one window's
-budget, absorbs runtime charged late (by a tick, or by much more in a
-virtual machine whose CPU the host preempted), which would otherwise look
-like an excess at the start of a window; it bounds the excess only once.
+have paid the excess back. Each task charges its runtime to the levels in
+batches of 100 us, so that tasks which switch every few microseconds don't
+bounce the counters between CPUs. The margin, one tick per slot plus one
+window's budget, absorbs runtime charged late (by a tick or a batch, or by
+much more in a virtual machine whose CPU the host preempted), which would
+otherwise look like an excess at the start of a window; it bounds the excess
+only once.
 Without this, a database with many backends, which wake up for every query
 and run on credit until they return to user space, used 2-20% more than its
 limit: each wakeup without a free slot costs a few microseconds in the

@@ -1710,6 +1710,9 @@ static u64 pfs_run_limit(struct task_struct *p)
  * Runtime accounting.
  */
 
+/* runtime charged to the group at once, see update_curr_pfs() */
+#define PFS_CHARGE_BATCH_NS	(100 * NSEC_PER_USEC)
+
 static void update_curr_pfs(struct rq *rq)
 {
 	struct pfs_rq *prq = &rq->pfs;
@@ -1728,16 +1731,28 @@ static void update_curr_pfs(struct rq *rq)
 	dl_server_update(&rq->fair_server, delta);
 
 	pe = &curr->pfs;
-	if (pe->slot_mask) {
-		pfs_charge(pe->grp, delta);
-		pfs_stat_add(PFS_STAT_SLOT_NS, delta);
-	} else if (atomic_read(&pfs_nr_limited) &&
-		   pfs_charge(task_pfs_group(curr), delta)) {
-		/*
-		 * On credit, or switching out after giving its slots back:
-		 * beyond the slots, but it counts all the same.
-		 */
-		pfs_stat_add(PFS_STAT_CREDIT_NS, delta);
+	/*
+	 * Charge the group in batches: tasks which switch every few
+	 * microseconds would otherwise bounce the group's counters between
+	 * CPUs on every update; the margin of pfs_over_limit() absorbs the
+	 * delay.
+	 */
+	pe->charge_pending += delta;
+	if (pe->charge_pending >= PFS_CHARGE_BATCH_NS) {
+		u64 pending = pe->charge_pending;
+
+		pe->charge_pending = 0;
+		if (pe->slot_mask) {
+			pfs_charge(pe->grp, pending);
+			pfs_stat_add(PFS_STAT_SLOT_NS, pending);
+		} else if (atomic_read(&pfs_nr_limited) &&
+			   pfs_charge(task_pfs_group(curr), pending)) {
+			/*
+			 * On credit, or switching out after giving its slots
+			 * back: beyond the slots, but it counts all the same.
+			 */
+			pfs_stat_add(PFS_STAT_CREDIT_NS, pending);
+		}
 	}
 	if (pe->state != PFS_QUEUED)
 		return;
@@ -3075,6 +3090,7 @@ void pfs_init_entity(struct task_struct *p)
 	pe->wake_list = 0;
 	pe->fresh = 0;
 	pe->fresh_rounds = 0;
+	pe->charge_pending = 0;
 	pe->sleep_stamp = 0;
 	pe->slept = U64_MAX;
 	init_task_work(&pe->user_work, pfs_user_workfn);
