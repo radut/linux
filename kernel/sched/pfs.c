@@ -65,12 +65,13 @@ enum {
 	PFS_F_YIELD_KEEP	= 1 << 6,	/* keep slots on an early yield */
 	PFS_F_WAKE_WAKER	= 1 << 7,	/* waking CPU before a busier prev */
 	PFS_F_GRAN_SYNC		= 1 << 8,	/* wakeup granularity: sync only */
+	PFS_F_HRTICK		= 1 << 9,	/* end requests with the hrtick */
 };
 
 static unsigned int pfs_features __read_mostly =
 	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT |
 	PFS_F_BALANCE_COUNT | PFS_F_YIELD_KEEP | PFS_F_WAKE_WAKER |
-	PFS_F_GRAN_SYNC;
+	PFS_F_GRAN_SYNC | PFS_F_HRTICK;
 
 static inline bool pfs_feat(unsigned int f)
 {
@@ -1078,6 +1079,7 @@ static bool pfs_woken_waiting(struct pfs_group *g)
 }
 
 static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags);
+static void pfs_hrtick_update(struct rq *rq);
 
 /*
  * Admit the waiting task @p, which holds its slots now, on its own CPU, and
@@ -1691,12 +1693,14 @@ static void enqueue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 	if (pe->granted && pe->grp == task_pfs_group(p)) {
 		pe->granted = 0;
 		pfs_queue_task(rq, p, flags);
+		pfs_hrtick_update(rq);
 		return;
 	}
 	if (pe->slot_mask)
 		pfs_release_slots(rq, p, false);
 
 	pfs_admit_or_park(rq, p, flags, false);
+	pfs_hrtick_update(rq);
 }
 
 /* A dequeue which is followed by an enqueue into the same group. */
@@ -1965,14 +1969,54 @@ static void put_prev_task_pfs(struct rq *rq, struct task_struct *prev,
 	}
 }
 
+#ifdef CONFIG_SCHED_HRTICK
+/*
+ * As hrtick_start_fair(): with other tasks queued, end the running task's
+ * request on time instead of at the next tick.
+ */
+static void pfs_hrtick_start(struct rq *rq, struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	s64 vdelta;
+
+	if (!pfs_feat(PFS_F_HRTICK) || !hrtick_enabled_fair(rq) ||
+	    rq->pfs.nr_queued <= 1 || pe->state != PFS_QUEUED)
+		return;
+
+	vdelta = (s64)(pe->deadline - pe->vruntime);
+	if (vdelta < 0) {
+		if (task_current_donor(rq, p))
+			resched_curr(rq);
+		return;
+	}
+	hrtick_start(rq, mul_u64_u64_div_u64(vdelta, pe->weight.weight,
+					     NICE_0_LOAD));
+}
+
+/* A task was queued: start the hrtick for the running task. */
+static void pfs_hrtick_update(struct rq *rq)
+{
+	struct task_struct *donor = rq->donor;
+
+	if (donor->sched_class != &pfs_sched_class || hrtick_active(rq))
+		return;
+	pfs_hrtick_start(rq, donor);
+}
+#else
+static inline void pfs_hrtick_start(struct rq *rq, struct task_struct *p) { }
+static void pfs_hrtick_update(struct rq *rq) { }
+#endif
+
 static void set_next_task_pfs(struct rq *rq, struct task_struct *p,
 			      enum snt_e type)
 {
 	struct pfs_rq *prq = &rq->pfs;
 	struct sched_pfs_entity *pe = &p->pfs;
 
-	if (type == SNT_REPICK)
+	if (type == SNT_REPICK) {
+		pfs_hrtick_start(rq, p);
 		return;
+	}
 
 	if (pe->on_tree)
 		__pfs_dequeue_entity(prq, pe);
@@ -1986,8 +2030,10 @@ static void set_next_task_pfs(struct rq *rq, struct task_struct *p,
 		update_pfs_rq_load_avg(rq_clock_pelt(rq), rq, 0);
 	}
 
-	if (type == SNT_PICK)
+	if (type == SNT_PICK) {
 		pfs_queue_push(rq);
+		pfs_hrtick_start(rq, p);
+	}
 }
 
 static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)

@@ -257,7 +257,9 @@ As with ``RUN_TO_PARITY`` and ``PREEMPT_SHORT`` in the fair class, a running
 task is not preempted by a waking task before its request is used up, unless
 the waking task has a shorter slice; a waking task which doesn't preempt
 shortens the protection (``update_protect_slice()``), and once it ends the
-running task is picked again at the next update of its runtime.
+running task is picked again at the next update of its runtime. As in the
+fair class, the hrtick (``HRTICK`` scheduler feature) ends a request on time
+while other tasks are queued, instead of at the next tick.
 
 A task which slept for less than the wakeup granularity (1 ms by default)
 preempts only if the running task is also ahead of it by more than that much
@@ -522,7 +524,8 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    weights by load alone, 32 periodic balance of task counts, 64 slot
    holders keep their slots on a yield for 0.5 ms, 128 wakeups on the
    waking CPU if it is no busier than the previous one, 256 the wakeup
-   granularity for synchronous wakeups only (default 510).
+   granularity for synchronous wakeups only, 512 the hrtick ends requests
+   (default 1022).
 
 ``wakeup_gran_us``
    wakeup granularity for short sleepers, see above; 0 turns it off
