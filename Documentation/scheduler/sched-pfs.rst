@@ -131,6 +131,25 @@ returns to user space. This is the same model as the task based throttling
 of CFS bandwidth control. Kernel threads, which never return to user space,
 keep running on credit until they block.
 
+Runtime on credit is beyond the slots, so it is paid back. Every limited
+level counts the CPU time of all tasks of its subtree, with or without slots,
+in the windows of the budget slot. If the usage in the current window,
+including what was carried over, exceeds what the full slots could have used
+since the window began plus the budget of the budget slot, by more than a
+margin, the level does not hand out its last full slot nor its budget slot,
+and a slot holder whose slice ends while the level holds that many slots
+gives its slots back. A timer retries when the remaining full slots would
+have paid the excess back. The margin, one tick per slot plus one window's
+budget, absorbs runtime charged late (by a tick, or by much more in a
+virtual machine whose CPU the host preempted), which would otherwise look
+like an excess at the start of a window; it bounds the excess only once.
+Without this, a database with many backends, which wake up for every query
+and run on credit until they return to user space, used 2-20% more than its
+limit: each wakeup without a free slot costs a few microseconds in the
+kernel (finishing the system call, the task work, two context switches),
+and they add up to a tenth or more of a CPU. CFS bandwidth control charges
+the same time to its quota.
+
 A task gives its slots back when it
 
 - blocks, exits, or moves to another cgroup;
@@ -311,7 +330,8 @@ Data structures
 
 ``struct pfs_group`` (``task_group::pfs``)
    limit in milli-CPUs, slots taken (atomic), the FIFO wait queue and its lock,
-   the budget window (window id, usage, hrtimer for the next window), weight,
+   the window (window id, usage including runtime on credit, hrtimer for the
+   next window or the end of a pay-back), weight,
    active children count and their weight sum, own admitted tasks' count and
    weight, cached hierarchical weight with its generation, depth.
 
@@ -497,17 +517,19 @@ Under ``/sys/kernel/debug/sched/pfs/``:
 
 ``stats``
    sums of per-CPU counters: ``admit`` (slots taken), ``park_full``,
-   ``park_budget``, ``park_fifo`` (waits by reason), ``rotate`` (slots given
+   ``park_budget``, ``park_fifo`` (waits by reason), ``park_debt`` (slots
+   refused while runtime beyond the limit is paid back), ``rotate`` (slots given
    back at the end of a slice), ``handoff`` (waiting task pulled to the CPU
    that freed the slot), ``handoff_local`` (it was already there), ``inplace``
    (admitted on its own CPU), ``retry``, ``pull``, ``push``, ``kick``,
    ``credit`` (admitted without slots while in the kernel), ``user_park``
-   (parked or rotated on the way back to user space); plus the number of
-   limited groups and of waiting tasks.
+   (parked or rotated on the way back to user space), ``slot_ns`` and
+   ``credit_ns`` (runtime of tasks holding slots and of tasks of limited
+   groups on credit); plus the number of limited groups and of waiting tasks.
 
 ``groups``
    limited groups and groups with waiting tasks: limit in milli-CPUs, slots
-   taken, waiting tasks, budget used in the current window, weight,
+   taken, waiting tasks, CPU time used in the current window, weight,
    hierarchical weight, active count and path.
 
 ``waiters``
@@ -587,8 +609,12 @@ Limits of this implementation
   to a tick per running thread per window, which is carried over (as debt of
   up to ten budgets, so that limits much smaller than a tick per window are
   still met on average).
-- Tasks running in the kernel on credit can exceed the limit for as long as
-  they stay in the kernel, as under CFS bandwidth control.
+- Tasks running in the kernel on credit run beyond the slots for as long as
+  they stay in the kernel, so more than L threads of a group can be on a CPU
+  at once, as under CFS bandwidth control. Their runtime is paid back
+  afterwards, which keeps the average at the limit, except for runtime
+  beyond the debt cap of ten budgets (e.g. many threads exiting at once),
+  which is forgiven.
 - Effective weights of queued, not running tasks are refreshed only when they
   start running or are admitted again.
 - Within a limited group, slots are shared by weight between its children, but

@@ -90,6 +90,7 @@ enum pfs_stat {
 	PFS_STAT_PARK_FULL,	/* waits: no free slot */
 	PFS_STAT_PARK_BUDGET,	/* waits: no budget */
 	PFS_STAT_PARK_FIFO,	/* waits: others wait already */
+	PFS_STAT_PARK_DEBT,	/* slot refused: the group ran beyond its limit */
 	PFS_STAT_ROTATE,	/* gave its slots back at the end of a slice */
 	PFS_STAT_HANDOFF,	/* waiting task pulled to the CPU that freed slots */
 	PFS_STAT_HANDOFF_LOCAL,	/* ... which was already on that CPU */
@@ -102,13 +103,15 @@ enum pfs_stat {
 	PFS_STAT_USER_PARK,	/* parked or rotated on the way to user space */
 	PFS_STAT_YIELD,		/* gave its slots back in sched_yield() */
 	PFS_STAT_BALANCE,	/* tasks moved by the periodic balancer */
+	PFS_STAT_SLOT_NS,	/* runtime of tasks holding slots, ns */
+	PFS_STAT_CREDIT_NS,	/* runtime of tasks of limited groups on credit, ns */
 	PFS_NR_STATS,
 };
 
 static const char * const pfs_stat_names[PFS_NR_STATS] = {
-	"admit", "park_full", "park_budget", "park_fifo", "rotate", "handoff",
+	"admit", "park_full", "park_budget", "park_fifo", "park_debt", "rotate", "handoff",
 	"handoff_local", "inplace", "retry", "pull", "push", "kick", "credit",
-	"user_park", "yield", "balance",
+	"user_park", "yield", "balance", "slot_ns", "credit_ns",
 };
 
 static DEFINE_PER_CPU(unsigned long [PFS_NR_STATS], pfs_stats);
@@ -116,6 +119,11 @@ static DEFINE_PER_CPU(unsigned long [PFS_NR_STATS], pfs_stats);
 static inline void pfs_stat(enum pfs_stat idx)
 {
 	this_cpu_inc(pfs_stats[idx]);
+}
+
+static inline void pfs_stat_add(enum pfs_stat idx, u64 val)
+{
+	this_cpu_add(pfs_stats[idx], val);
 }
 
 /* groups with a limit; while there are none, admission is a no-op */
@@ -495,6 +503,7 @@ enum pfs_reserve {
 	PFS_RES_FULL,		/* all slots of a level are taken */
 	PFS_RES_BUDGET,		/* the budget slot has no budget left */
 	PFS_RES_FIFO,		/* others wait at the level */
+	PFS_RES_DEBT,		/* the level ran beyond its limit, see pfs_over_limit() */
 };
 
 static inline struct task_group *pfs_tg(struct pfs_group *g)
@@ -572,8 +581,37 @@ static u64 pfs_window_left(struct pfs_group *lg, u64 now)
 	return used < budget ? budget - used : 0;
 }
 
+/*
+ * Has @lg's subtree used more CPU time in the current window, including the
+ * debt carried over, than its limit allows? Every limited level counts the
+ * runtime of all tasks of its subtree, with or without slots: tasks running
+ * in the kernel on credit (see pfs_admit_or_park()) are beyond the slots, and
+ * with many short wakeups, as in a database, their runtime adds up to a
+ * tenth or more of the limit. The full slots may have used floor(limit)
+ * CPUs since the window began, the budget slot its whole budget. Runtime is
+ * charged late, by a tick or, in a virtual machine whose CPU was preempted,
+ * by much more, and usage below the budget is not carried over, so late
+ * charges look like an excess at the start of a window: a margin of a tick
+ * per slot plus one window's budget absorbs them. While the excess is above
+ * the margin, the last full slot and the budget slot are not handed out, so
+ * that the group pays it back; the margin only bounds the excess once.
+ */
+static u64 pfs_over_limit(struct pfs_group *lg, u64 now)
+{
+	unsigned int limit = READ_ONCE(lg->limit);
+	u64 full = limit / 1000, allowed, elapsed, used;
+
+	pfs_window_left(lg, now);
+	elapsed = now - div64_u64(now, pfs_window_ns) * pfs_window_ns;
+	allowed = full * elapsed + 2 * pfs_budget(limit) - full * pfs_window_ns +
+		  pfs_width(limit) * TICK_NSEC;
+	used = atomic64_read(&lg->window_used);
+	return used > allowed ? used - allowed : 0;
+}
+
 static void pfs_queue_retry(struct pfs_group *lg);
 static bool pfs_slot_free(struct pfs_group *lg);
+static void pfs_arm_window_timer(struct pfs_group *lg, u64 now, u64 delay);
 
 /*
  * Undo the increment of a refused pfs_take_slot(). A task parking at @lg
@@ -592,7 +630,8 @@ static void pfs_untake_slot(struct pfs_group *lg)
 /*
  * Take one slot at the limited level @lg. The first floor(limit) slots are
  * free, the last slot of a fractional limit needs budget left in the window,
- * and clips *@run_limit to it.
+ * and clips *@run_limit to it. The last full slot and the budget slot also
+ * need the group to be within its limit, see pfs_over_limit().
  */
 static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 				      u64 *run_limit)
@@ -616,6 +655,22 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 			return PFS_RES_BUDGET;
 		}
 		*run_limit = min(*run_limit, left);
+	}
+
+	if (taken + 1 >= limit / 1000) {
+		u64 excess = pfs_over_limit(lg, now);
+
+		if (excess) {
+			pfs_stat(PFS_STAT_PARK_DEBT);
+			atomic_dec(&lg->nr_slots);
+			/*
+			 * Retry when the full slots, if any, would have paid
+			 * the excess back by running below the limit.
+			 */
+			pfs_arm_window_timer(lg, now, limit >= 1000 ?
+					     div_u64(excess, limit / 1000) : 0);
+			return PFS_RES_DEBT;
+		}
 	}
 	return PFS_RES_OK;
 }
@@ -738,7 +793,8 @@ static bool pfs_slot_free(struct pfs_group *lg)
  * The running task @p has used up its run limit: should it give its slots
  * back? Yes if a level of its path has waiting tasks, holds more slots than
  * its limit allows (the limit went down), is out of budget while its budget
- * slot is taken, or became limited after @p took its slots.
+ * slot is taken, ran beyond its limit while its last full slot is taken, or
+ * became limited after @p took its slots.
  */
 static bool pfs_should_rotate(struct task_struct *p)
 {
@@ -759,23 +815,27 @@ static bool pfs_should_rotate(struct task_struct *p)
 		taken = atomic_read(&lg->nr_slots);
 		if (taken > pfs_width(limit))
 			return true;
-		if (taken > limit / 1000) {
-			if (!now)
-				now = pfs_now();
-			if (!pfs_window_left(lg, now))
-				return true;
-		}
+		if (taken < limit / 1000)
+			continue;
+		if (!now)
+			now = pfs_now();
+		if (taken > limit / 1000 && !pfs_window_left(lg, now))
+			return true;
+		if (pfs_over_limit(lg, now))
+			return true;
 	}
 	return false;
 }
 
 /*
- * Charge @delta of runtime of a task of @g, which holds slots, to the limited
- * levels of its path: to the budget window of a fractional limit, and to the
- * slot service of the child of the level the task belongs to, which shares
- * the level's slots between its children by weight, see pfs_next_waiter().
+ * Charge @delta of runtime of a task of @g, with or without slots, to the
+ * limited levels of its path: to the window of the level, see
+ * pfs_window_left() and pfs_over_limit(), and to the slot service of the
+ * child of the level the task belongs to, which shares the level's slots
+ * between its children by weight, see pfs_next_waiter(). Returns true if a
+ * level is limited.
  */
-static void pfs_charge(struct pfs_group *g, u64 delta)
+static bool pfs_charge(struct pfs_group *g, u64 delta)
 {
 	struct pfs_group *lg, *child = NULL;
 	u64 now = 0;
@@ -784,12 +844,10 @@ static void pfs_charge(struct pfs_group *g, u64 delta)
 		if (!pfs_level_limited(lg))
 			continue;
 
-		if (READ_ONCE(lg->limit) % 1000) {
-			if (!now)
-				now = pfs_now();
-			pfs_window_left(lg, now);
-			atomic64_add(delta, &lg->window_used);
-		}
+		if (!now)
+			now = pfs_now();
+		pfs_window_left(lg, now);
+		atomic64_add(delta, &lg->window_used);
 
 		if (child)
 			atomic64_add(div64_ul(delta * scale_load_down(NICE_0_LOAD),
@@ -798,6 +856,7 @@ static void pfs_charge(struct pfs_group *g, u64 delta)
 		else
 			atomic64_add(delta, &lg->own_slot_vtime);
 	}
+	return now;
 }
 
 /**************************************************************
@@ -807,16 +866,27 @@ static void pfs_charge(struct pfs_group *g, u64 delta)
 static enum hrtimer_restart pfs_window_timer_fn(struct hrtimer *timer);
 static void pfs_group_retry(struct pfs_group *g);
 
-/* Start @lg's timer for the next window, for tasks waiting for budget. */
-static void pfs_arm_window_timer(struct pfs_group *lg)
+/*
+ * Start @lg's timer for the next window, for tasks waiting for budget, or
+ * after @delay if it is non-zero and earlier (at least PFS_MIN_BUDGET_NS),
+ * for tasks waiting for the group to pay back runtime beyond its limit.
+ */
+static void pfs_arm_window_timer(struct pfs_group *lg, u64 now, u64 delay)
 {
-	u64 now, next;
+	u64 next;
 
-	if (atomic_cmpxchg(&lg->timer_armed, 0, 1))
-		return;
-
-	now = pfs_now();
+	if (!now)
+		now = pfs_now();
 	next = (div64_u64(now, pfs_window_ns) + 1) * pfs_window_ns;
+	if (delay)
+		next = min(next, now + max_t(u64, delay, PFS_MIN_BUDGET_NS));
+
+	if (atomic_cmpxchg(&lg->timer_armed, 0, 1)) {
+		/* armed already, bring it forward if needed */
+		if (!delay || ktime_before(hrtimer_get_expires(&lg->window_timer),
+					   ns_to_ktime(next)))
+			return;
+	}
 	hrtimer_start(&lg->window_timer, ns_to_ktime(next), HRTIMER_MODE_ABS_PINNED_HARD);
 }
 
@@ -905,7 +975,10 @@ static void pfs_waiter_linked(struct pfs_group *lg, enum pfs_reserve why)
 	switch (why) {
 	case PFS_RES_BUDGET:
 		pfs_stat(PFS_STAT_PARK_BUDGET);
-		pfs_arm_window_timer(lg);
+		pfs_arm_window_timer(lg, 0, 0);
+		break;
+	case PFS_RES_DEBT:
+		/* pfs_take_slot() counted it and armed the timer */
 		break;
 	case PFS_RES_FIFO:
 		pfs_stat(PFS_STAT_PARK_FIFO);
@@ -967,7 +1040,7 @@ static int pfs_try_waiter(struct rq *rq, struct task_struct *p,
 
 	if (fail == lg) {
 		if (ret == PFS_RES_BUDGET)
-			pfs_arm_window_timer(lg);
+			pfs_arm_window_timer(lg, 0, 0);
 		return -1;
 	}
 
@@ -1655,8 +1728,17 @@ static void update_curr_pfs(struct rq *rq)
 	dl_server_update(&rq->fair_server, delta);
 
 	pe = &curr->pfs;
-	if (pe->slot_mask)
+	if (pe->slot_mask) {
 		pfs_charge(pe->grp, delta);
+		pfs_stat_add(PFS_STAT_SLOT_NS, delta);
+	} else if (atomic_read(&pfs_nr_limited) &&
+		   pfs_charge(task_pfs_group(curr), delta)) {
+		/*
+		 * On credit, or switching out after giving its slots back:
+		 * beyond the slots, but it counts all the same.
+		 */
+		pfs_stat_add(PFS_STAT_CREDIT_NS, delta);
+	}
 	if (pe->state != PFS_QUEUED)
 		return;
 
