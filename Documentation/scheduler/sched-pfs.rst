@@ -411,8 +411,13 @@ PFS has its own balancer, with parts ported from the fair class; the fair
 class' sched domain balancer is not used.
 
 - Wake-up placement (``select_task_rq``): the previous CPU if idle; for a
-  synchronous wakeup from a CPU running only the waker, the waking CPU; else
-  an idle CPU close to that choice, LLC first; else the choice itself. The
+  synchronous wakeup from a CPU running only the waker, or for any wakeup
+  from a CPU running no more tasks than the previous CPU, the waking CPU;
+  else an idle CPU close to that choice, LLC first; else the choice itself.
+  The waking CPU matters for a thread which wakes others and then waits for
+  them (a dispatcher and its workers): its wakees run there as soon as it
+  blocks, instead of waiting behind a busy task on their previous CPU for
+  the rest of its slice. The
   idle CPU scan is skipped while no CPU went idle in its last pick (a global
   count of such CPUs), which is what keeps an overloaded machine from paying
   for scans that find nothing (``SIS_UTIL`` in the fair class). Fork and exec
@@ -509,7 +514,8 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    wakeup placement (off), 2 periodic balance, 4 negative lag served while
    asleep, 8 slice protection updates, 16 periodic balance of unequal
    weights by load alone, 32 periodic balance of task counts, 64 slot
-   holders keep their slots on a yield for 0.5 ms (default 126).
+   holders keep their slots on a yield for 0.5 ms, 128 wakeups on the
+   waking CPU if it is no busier than the previous one (default 254).
 
 ``wakeup_gran_us``
    wakeup granularity for short sleepers, see above; 0 turns it off

@@ -63,11 +63,12 @@ enum {
 	PFS_F_BALANCE_WEIGHT	= 1 << 4,	/* balance unequal weights */
 	PFS_F_BALANCE_COUNT	= 1 << 5,	/* balance task counts */
 	PFS_F_YIELD_KEEP	= 1 << 6,	/* keep slots on an early yield */
+	PFS_F_WAKE_WAKER	= 1 << 7,	/* waking CPU before a busier prev */
 };
 
 static unsigned int pfs_features __read_mostly =
 	PFS_F_BALANCE | PFS_F_SLEEP_LAG | PFS_F_PROTECT | PFS_F_BALANCE_WEIGHT |
-	PFS_F_BALANCE_COUNT | PFS_F_YIELD_KEEP;
+	PFS_F_BALANCE_COUNT | PFS_F_YIELD_KEEP | PFS_F_WAKE_WAKER;
 
 static inline bool pfs_feat(unsigned int f)
 {
@@ -2409,6 +2410,29 @@ static int pfs_find_idlest_cpu(struct task_struct *p, int this_cpu)
 	return best;
 }
 
+/*
+ * Wake @p on the waking CPU instead of its busy previous CPU if no idle CPU
+ * turns up: for a synchronous wakeup when the waking CPU runs only the waker,
+ * else when it runs no more tasks than the previous CPU. A thread which wakes
+ * others and then waits for them, e.g. a dispatcher waking its workers, gets
+ * them on its CPU, where they run as soon as it blocks, instead of behind a
+ * busy task on their previous CPU for the rest of its slice. The fair class
+ * gets there through wake_affine() and its load averages.
+ */
+static bool pfs_wake_on_waker(struct task_struct *p, int this_cpu,
+			      int prev_cpu, int sync)
+{
+	unsigned int nr = cpu_rq(this_cpu)->nr_running;
+
+	if (!cpumask_test_cpu(this_cpu, p->cpus_ptr) ||
+	    !cpus_share_cache(this_cpu, prev_cpu))
+		return false;
+	if (sync && nr == 1)
+		return true;
+	return pfs_feat(PFS_F_WAKE_WAKER) &&
+	       nr <= READ_ONCE(cpu_rq(prev_cpu)->nr_running);
+}
+
 static int select_task_rq_pfs(struct task_struct *p, int prev_cpu, int wake_flags)
 {
 	int this_cpu = smp_processor_id();
@@ -2439,9 +2463,7 @@ static int select_task_rq_pfs(struct task_struct *p, int prev_cpu, int wake_flag
 
 		if (cpumask_test_cpu(prev_cpu, p->cpus_ptr) && pfs_cpu_idle(prev_cpu))
 			return prev_cpu;
-		if (sync && cpu_rq(this_cpu)->nr_running == 1 &&
-		    cpumask_test_cpu(this_cpu, p->cpus_ptr) &&
-		    cpus_share_cache(this_cpu, prev_cpu))
+		if (pfs_wake_on_waker(p, this_cpu, prev_cpu, sync))
 			target = this_cpu;
 		cpu = pfs_find_idle_cpu(p, target);
 		return cpu >= 0 ? cpu : target;
