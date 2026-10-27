@@ -1,8 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0
-# Run scx_pfs as a privileged container (--privileged --pid=host), the
-# Docker equivalent of a Kubernetes DaemonSet. The scheduler then applies to
-# every task on the host, not only to containers.
+# Run scx_pfs in a container with only the capabilities it needs to load
+# (CAP_SYS_ADMIN, CAP_BPF, CAP_PERFMON), the Docker equivalent of a
+# Kubernetes DaemonSet. The scheduler then applies to every task on the host,
+# not only to containers.
 set -euo pipefail
 KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$KIT/lib.sh"

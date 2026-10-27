@@ -217,7 +217,7 @@ latency although the average usage is below the limit.
 ### Options
 
 ```
-scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i SECS] [-v]
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-v]
 ```
 
 | Option | Default | Meaning |
@@ -226,7 +226,11 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i SECS] [-v]
 | `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
 | `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
 | `-w` | 10000 | Accounting window for fractional limits (minimum 1000). |
+| `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
 | `-i` | 1 | Interval of the counter report, in seconds. |
+
+`-s` takes 100 to 1000000 us, `-c` and `-r` at most 1000000 us, `-w` 1000
+to 1000000 us and `-i` 1 to 86400 s; scx_pfs refuses other values.
 
 ### Counters
 
@@ -235,17 +239,25 @@ Printed every `-i` seconds: `park_full` (a thread waited for a slot),
 thread waited), `admit` (waiting threads let in), `retry`, `cut` (slots
 taken back for a woken thread), `yield_keep`/`yield_rotate` (what
 `sched_yield()` did), `too_deep` (threads of cgroups deeper than 31 levels,
-not limited), `rescue` and `lost_path` (retries the timer had to make, should
-stay 0 or close to it), and internal ones (`direct`, `shared`, `repark`,
-`overflow`, `race`, `activate`, `hweight`, `keep`). CFS's `nr_throttled` stays
-0: waiting threads are queued by scx_pfs, not throttled.
+not limited), `rescue` (waiting cgroups the timer retried because no retry
+walked them for 50 ms; it grows when admitted threads wait long for a CPU),
+`lost_path` (threads whose cgroup was removed under them), `credit` (threads
+that ran without a slot instead of waiting, see below), `overflow` (cgroups
+that didn't fit in the queues, see `-q`), `drain` (threads still waiting
+when their cgroup was removed, moved/kept; should stay 0/0), `no_dsq`
+(cgroups not limited because their queue couldn't be allocated),
+`park_race` (retries repeated for a thread about to start waiting), and
+internal ones (`direct`, `shared`, `repark`, `race`, `activate`, `hweight`,
+`keep`). CFS's `nr_throttled` stays 0: waiting threads are queued by
+scx_pfs, not throttled.
 
 ### Running it
 
 Start it as root and stop it with Ctrl-C (the kernel scheduler takes over
-again), or install `pfs-test/scx_pfs.service` as a systemd unit, or run it in
-a privileged container with `--pid=host` (`pfs-test/scx-container.sh`), which
-is the shape of a Kubernetes DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
+again), or install `pfs-test/scx_pfs.service` as a sandboxed systemd unit,
+or run it in a container with `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON`
+only (`pfs-test/scx-container.sh`), which is the shape of a Kubernetes
+DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
 following run-time changes of `cpu.max` needs the `cgroup_set_bandwidth`
 operation (6.17 or later). `pfs-test/` compares it with CFS bandwidth control
 on plain cgroups, systemd units, Docker and Podman; its README has the
@@ -291,6 +303,15 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
 - Waiting for a slot costs latency even in an otherwise idle cgroup: four
   request threads at limit 1 have a median of 3.1 ms vs 1.15 ms under CFS.
 - `cpu.max.burst` is ignored, and so are cgroups deeper than 31 levels.
+- A thread waiting for a slot while it holds a kernel lock stalls every
+  thread waiting for that lock, in any cgroup. Threads that woke up (and
+  io_uring workers) therefore run without a slot while their cgroups have
+  budget left in the current window, and exiting threads, kernel threads and
+  threads being killed never wait. A cgroup's usage stays at its limit over a
+  window, but its concurrency can exceed the limit meanwhile. A thread
+  preempted, rotated or yielding (also through the in-kernel `yield()`) in
+  the kernel with a sleeping lock held can still wait: sched_ext doesn't tell
+  whether a thread is returning to user space.
 
 
 # Troubleshooting

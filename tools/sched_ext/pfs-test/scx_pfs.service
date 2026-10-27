@@ -22,6 +22,30 @@ RestartSec=10
 # keep the loader itself responsive under load
 Nice=-10
 CPUWeight=1000
+# Sandboxing. Loading the scheduler needs bpf() with CAP_BPF, CAP_PERFMON
+# and CAP_SYS_ADMIN (struct_ops), read access to /sys/kernel/btf and
+# /sys/kernel/sched_ext, and nothing else: the loader writes no files, opens
+# no sockets and only reports on stdout.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

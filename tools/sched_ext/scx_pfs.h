@@ -5,6 +5,8 @@
 #define HWEIGHT_ONE		(1LLU << 28)	/* the whole machine */
 /* bound on how long a task of a small cgroup waits for its next slice */
 #define WAIT_MAX_NS		(1000 * 1000 * 1000LLU)
+/* default size of the per-cgroup queues, see -q */
+#define NR_CGRP_Q		65536
 
 enum pfs_stat_idx {
 	PFS_STAT_DIRECT,		/* dispatched straight to an idle CPU */
@@ -14,7 +16,7 @@ enum pfs_stat_idx {
 	PFS_STAT_ADMIT,		/* parked task admitted by a retry */
 	PFS_STAT_REPARK,		/* parked task moved to another level */
 	PFS_STAT_RETRY,		/* cgroup retries processed */
-	PFS_STAT_RETRY_OVERFLOW,	/* retry queue full, scheduler ejected */
+	PFS_STAT_RETRY_OVERFLOW,	/* cgroup queue full, rescued by the timer */
 	PFS_STAT_MOVE_RACE,		/* admission raced, slots given back */
 	PFS_STAT_TOO_DEEP,		/* task of a too deep cgroup not limited */
 	PFS_STAT_ACTIVATE,		/* cgroup (de)activations changing weights */
@@ -26,6 +28,11 @@ enum pfs_stat_idx {
 	PFS_STAT_YIELD_ROTATE,	/* yields that gave the slots to a waiter */
 	PFS_STAT_RESCUE,		/* waiting cgroups retried by the timer sweep */
 	PFS_STAT_LOST_PATH,		/* slots of a removed cgroup not given back */
+	PFS_STAT_CREDIT,		/* ran without slots instead of waiting */
+	PFS_STAT_DRAIN,		/* waiting tasks let run as their cgroup went */
+	PFS_STAT_DRAIN_FAIL,		/* wait DSQ not empty after the drain, kept */
+	PFS_STAT_NO_DSQ,		/* cgroups not limited, DSQ creation failed */
+	PFS_STAT_PARK_RACE,		/* retries queued again for a landing park */
 
 	PFS_NR_STATS,
 };

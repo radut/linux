@@ -97,9 +97,13 @@ main() {
 	done
 	shift $((OPTIND - 1))
 	[ $# -eq 3 ] || { usage >&2; exit 2; }
+	check_case "$2" "$3" "$secs"
+	check_int WEIGHT "$weight"
 	case $wl in spin|reqlat) ;; *) die "workload must be spin or reqlat" ;; esac
 	case $neigh in none|noisy) ;; *) die "neighbour must be none or noisy" ;; esac
-	[ -x "$KIT/bin/spin" ] && [ -x "$KIT/bin/reqlat" ] || die "build first: make -C $KIT"
+	if [ ! -x "$KIT/bin/spin" ] || [ ! -x "$KIT/bin/reqlat" ]; then
+		die "build first: make -C $KIT"
+	fi
 	need_root
 	check_cgroup2
 	trap cleanup EXIT INT TERM

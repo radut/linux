@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <assert.h>
@@ -15,23 +17,31 @@ const char help_fmt[] =
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i INTERVAL]\n"
-"       [-v]\n"
+"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR]\n"
+"       [-i INTERVAL] [-v]\n"
 "\n"
-"  -s SLICE_US   Slice duration (default: 2500)\n"
+"  -s SLICE_US   Slice duration (default: 2500, 100 to 1000000)\n"
 "  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
 "                which woke up after this, also the least time a yielding\n"
-"                task keeps its slots (default: 500)\n"
+"                task keeps its slots (default: 500, at most 1000000)\n"
 "  -r ROT_US     ... and to any waiting task after this, 0 for the end of the\n"
-"                slice (default: 0)\n"
+"                slice (default: 0, at most 1000000)\n"
 "  -w WINDOW_US  Accounting window for fractional limits (default: 10000,\n"
-"                min: 1000)\n"
-"  -i INTERVAL   Report interval in seconds\n"
+"                1000 to 1000000)\n"
+"  -q NR         Size of the queues of cgroups with waiting tasks; more\n"
+"                such cgroups are found by a slower sweep (default: 65536,\n"
+"                16 to 16777216)\n"
+"  -i INTERVAL   Report interval in seconds (default: 1, at most 86400)\n"
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
 
 /* bounds the timer frequency, budgets are refilled every window */
 #define MIN_WINDOW_US	1000
+#define MAX_US		(1000 * 1000)	/* bounds for -s, -c, -r and -w */
+#define MIN_SLICE_US	100
+#define MAX_INTERVAL	(24 * 3600)
+#define MIN_CGRP_Q	16
+#define MAX_CGRP_Q	(1 << 24)
 
 static bool verbose;
 static volatile int exit_req;
@@ -48,12 +58,40 @@ static void sigint_handler(int dummy)
 	exit_req = 1;
 }
 
+/*
+ * Parse @arg of option @opt as a number between @min and @max, or exit. The
+ * microsecond options are multiplied by 1000, the bounds keep that in range.
+ */
+static __u64 parse_opt(int opt, const char *arg, __u64 min, __u64 max)
+{
+	unsigned long long val;
+	char *end;
+
+	errno = 0;
+	val = strtoull(arg, &end, 0);
+	if (errno || end == arg || *end || arg[0] == '-' || val < min ||
+	    val > max) {
+		fprintf(stderr, "-%c: '%s' is not a number from %llu to %llu\n",
+			opt, arg, (unsigned long long)min,
+			(unsigned long long)max);
+		exit(1);
+	}
+	return val;
+}
+
 static void read_stats(struct scx_pfs *skel, __u64 *stats)
 {
-	int nr_cpus = libbpf_num_possible_cpus();
-	assert(nr_cpus > 0);
-	__u64 cnts[PFS_NR_STATS][nr_cpus];
+	static __u64 *cnts;
+	static int nr_cpus;
 	__u32 idx;
+
+	/* one row of per-CPU counters, on the heap: there may be many CPUs */
+	if (!cnts) {
+		nr_cpus = libbpf_num_possible_cpus();
+		assert(nr_cpus > 0);
+		cnts = calloc(nr_cpus, sizeof(*cnts));
+		assert(cnts);
+	}
 
 	memset(stats, 0, sizeof(stats[0]) * PFS_NR_STATS);
 
@@ -61,11 +99,11 @@ static void read_stats(struct scx_pfs *skel, __u64 *stats)
 		int ret, cpu;
 
 		ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.stats),
-					  &idx, cnts[idx]);
+					  &idx, cnts);
 		if (ret < 0)
 			continue;
 		for (cpu = 0; cpu < nr_cpus; cpu++)
-			stats[idx] += cnts[idx][cpu];
+			stats[idx] += cnts[cpu];
 	}
 }
 
@@ -78,7 +116,8 @@ static void print_stats(struct scx_pfs *skel)
 	       "admit=%llu repark=%llu retry=%llu overflow=%llu race=%llu\n"
 	       "too_deep=%llu activate=%llu hweight=%llu keep=%llu\n"
 	       "park_woken=%llu cut=%llu yield_keep=%llu yield_rotate=%llu "
-	       "rescue=%llu lost_path=%llu\n",
+	       "rescue=%llu lost_path=%llu credit=%llu drain=%llu/%llu no_dsq=%llu\n"
+	       "park_race=%llu\n",
 	       stats[PFS_STAT_DIRECT], stats[PFS_STAT_SHARED],
 	       stats[PFS_STAT_PARK_FULL], stats[PFS_STAT_PARK_BUDGET],
 	       stats[PFS_STAT_ADMIT], stats[PFS_STAT_REPARK],
@@ -88,7 +127,10 @@ static void print_stats(struct scx_pfs *skel)
 	       stats[PFS_STAT_KEEP], stats[PFS_STAT_PARK_WOKEN],
 	       stats[PFS_STAT_CUT], stats[PFS_STAT_YIELD_KEEP],
 	       stats[PFS_STAT_YIELD_ROTATE],
-	       stats[PFS_STAT_RESCUE], stats[PFS_STAT_LOST_PATH]);
+	       stats[PFS_STAT_RESCUE], stats[PFS_STAT_LOST_PATH],
+	       stats[PFS_STAT_CREDIT], stats[PFS_STAT_DRAIN],
+	       stats[PFS_STAT_DRAIN_FAIL], stats[PFS_STAT_NO_DSQ],
+	       stats[PFS_STAT_PARK_RACE]);
 	fflush(stdout);
 }
 
@@ -96,7 +138,7 @@ int main(int argc, char **argv)
 {
 	struct scx_pfs *skel;
 	struct bpf_link *link;
-	__u64 intv = 1;
+	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q;
 	long nr_cpus;
 	__s32 opt;
 	__u64 ecode;
@@ -115,22 +157,30 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:c:r:w:i:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:w:q:i:vh")) != -1) {
 		switch (opt) {
 		case 's':
-			skel->rodata->slice_ns = strtoull(optarg, NULL, 0) * 1000;
+			skel->rodata->slice_ns = 1000 *
+				parse_opt(opt, optarg, MIN_SLICE_US, MAX_US);
 			break;
 		case 'c':
-			skel->rodata->cut_ns = strtoull(optarg, NULL, 0) * 1000;
+			skel->rodata->cut_ns = 1000 *
+				parse_opt(opt, optarg, 0, MAX_US);
 			break;
 		case 'r':
-			skel->rodata->rot_ns = strtoull(optarg, NULL, 0) * 1000;
+			skel->rodata->rot_ns = 1000 *
+				parse_opt(opt, optarg, 0, MAX_US);
 			break;
 		case 'w':
-			skel->rodata->window_ns = strtoull(optarg, NULL, 0) * 1000;
+			skel->rodata->window_ns = 1000 *
+				parse_opt(opt, optarg, MIN_WINDOW_US, MAX_US);
+			break;
+		case 'q':
+			nr_cgrp_q = parse_opt(opt, optarg, MIN_CGRP_Q,
+					      MAX_CGRP_Q);
 			break;
 		case 'i':
-			intv = strtoul(optarg, NULL, 0);
+			intv = parse_opt(opt, optarg, 1, MAX_INTERVAL);
 			break;
 		case 'v':
 			verbose = true;
@@ -139,16 +189,6 @@ restart:
 			fprintf(stderr, help_fmt, basename(argv[0]));
 			return opt != 'h';
 		}
-	}
-
-	if (!skel->rodata->slice_ns || !skel->rodata->window_ns || !intv) {
-		fprintf(stderr, "slice, window and interval must be positive\n");
-		return 1;
-	}
-
-	if (skel->rodata->window_ns < MIN_WINDOW_US * 1000) {
-		fprintf(stderr, "window must be at least %dus\n", MIN_WINDOW_US);
-		return 1;
 	}
 
 	if (skel->rodata->rot_ns && skel->rodata->cut_ns > skel->rodata->rot_ns)
@@ -164,11 +204,16 @@ restart:
 	skel->rodata->min_share = HWEIGHT_ONE * skel->rodata->slice_ns /
 				  (WAIT_MAX_NS * nr_cpus) ?: 1;
 
-	printf("slice=%lluus cut=%lluus rot=%lluus window=%lluus\n",
+	printf("slice=%lluus cut=%lluus rot=%lluus window=%lluus queues=%llu\n",
 	       (unsigned long long)skel->rodata->slice_ns / 1000,
 	       (unsigned long long)skel->rodata->cut_ns / 1000,
 	       (unsigned long long)skel->rodata->rot_ns / 1000,
-	       (unsigned long long)skel->rodata->window_ns / 1000);
+	       (unsigned long long)skel->rodata->window_ns / 1000,
+	       (unsigned long long)nr_cgrp_q);
+
+	bpf_map__set_max_entries(skel->maps.retry_q, nr_cgrp_q);
+	bpf_map__set_max_entries(skel->maps.budget_q, nr_cgrp_q);
+	bpf_map__set_max_entries(skel->maps.waitset, nr_cgrp_q);
 
 	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);
 	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
