@@ -501,11 +501,19 @@ bool update_other_load_avgs(struct rq *rq)
 	const struct sched_class *curr_class = rq->donor->sched_class;
 	unsigned long hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
 
+	bool decayed = false;
+
 	lockdep_assert_rq_held(rq);
+
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		decayed = update_pfs_rq_load_avg(now, rq,
+						 curr_class == &pfs_sched_class);
+#endif
 
 	/* hw_pressure doesn't care about invariance */
 	return update_rt_rq_load_avg(now, rq, curr_class == &rt_sched_class) |
 		update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
 		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
-		update_irq_load_avg(rq, 0);
+		update_irq_load_avg(rq, 0) | decayed;
 }

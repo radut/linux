@@ -383,7 +383,12 @@ Not carried over: next/short buddies, PELT per task and per
 group, util_est, energy aware placement, misfit migration, NUMA balancing and
 ``cpu.idle`` (treated as a plain weight). For schedutil, PFS keeps one PELT
 utilisation signal per CPU, like the RT class does, and ``cpu_util_cfs()``
-returns it while PFS is active.
+returns it while PFS is active. PFS calls ``cpufreq_update_util()`` on every
+tick, when the signal decays at a context switch or when the first task is
+queued on an idle CPU, and with ``SCHED_CPUFREQ_IOWAIT`` when a task that
+waited for I/O is queued, as the fair class does. The blocked signals of idle
+CPUs (PFS, RT, deadline, IRQ) are decayed by the NOHZ idle balance, which
+under PFS only does that and moves no tasks.
 
 
 Data structures
@@ -504,7 +509,8 @@ new one) by ``sched_move_task()``.
 
 When PFS is active the fair class has no tasks: CFS bandwidth state is still
 configured by ``cpu.max`` writes but its timers never run, and the fair load
-balancer softirq is not raised.
+balancer does not run; ``SCHED_SOFTIRQ`` runs the PFS balancer and the
+blocked load updates of the NOHZ idle balance.
 
 
 Load balancing

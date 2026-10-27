@@ -5890,10 +5890,8 @@ void sched_tick(void)
 	if (curr->flags & PF_WQ_WORKER)
 		wq_worker_tick(curr);
 
-	/* PFS balances on its own, the fair class has no tasks then */
-	if (pfs_enabled()) {
-		pfs_balance_trigger(rq);
-	} else if (!scx_switched_all()) {
+	/* PFS balances in sched_balance_trigger(), sched_ext can't be on */
+	if (!scx_switched_all()) {
 		rq->idle_balance = idle_cpu(cpu);
 		sched_balance_trigger(rq);
 	}

@@ -1961,6 +1961,14 @@ static void enqueue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 
 	update_curr_pfs(rq);
 
+	/* as enqueue_task_fair(): schedutil boosts after I/O waits */
+	if (p->in_iowait)
+		cpufreq_update_util(rq, SCHED_CPUFREQ_IOWAIT);
+	/* the CPU starts running PFS tasks: decay the signal first */
+	if (!rq->pfs.nr_queued &&
+	    update_pfs_rq_load_avg(rq_clock_pelt(rq), rq, 0))
+		cpufreq_update_util(rq, 0);
+
 	/* tasks migrated here aren't cache hot */
 	if (flags & ENQUEUE_MIGRATED)
 		p->se.exec_start = 0;
@@ -2221,7 +2229,8 @@ static void put_prev_task_pfs(struct rq *rq, struct task_struct *prev,
 
 	if (pe->state == PFS_QUEUED || pe->state == PFS_PARKING)
 		update_curr_pfs(rq);
-	update_pfs_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+	if (update_pfs_rq_load_avg(rq_clock_pelt(rq), rq, 1))
+		cpufreq_update_util(rq, 0);
 
 	WARN_ON_ONCE(prq->curr != prev);
 	prq->curr = NULL;
@@ -2332,6 +2341,7 @@ static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 
 	update_curr_pfs(rq);
 	update_pfs_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+	cpufreq_update_util(rq, 0);
 
 	if (pe->state != PFS_QUEUED) {
 		resched_curr(rq);
