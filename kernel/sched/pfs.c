@@ -2509,14 +2509,27 @@ static const struct cpumask *pfs_llc_span(int cpu)
 	return sd ? sched_domain_span(sd) : cpu_active_mask;
 }
 
-/* The CPU with the most queued, not running tasks, LLC first. */
+/* the newly idle pull looks beyond the LLC at most this often */
+#define PFS_REMOTE_PULL_MS	4
+
+/*
+ * The CPU with the most queued, not running tasks, LLC first. The scan of
+ * the whole machine, with this run queue locked and interrupts off, is
+ * rate limited: idle CPUs elsewhere are also pushed to, see pfs_push().
+ */
 static struct rq *pfs_find_busiest(struct rq *this_rq)
 {
-	int this_cpu = cpu_of(this_rq), cpu, pass;
+	int this_cpu = cpu_of(this_rq), cpu, pass, passes = 1;
 	struct rq *busiest = NULL;
 	unsigned int max_nr = 0;
 
-	for (pass = 0; pass < 2 && !busiest; pass++) {
+	if (time_after_eq(jiffies, this_rq->pfs.next_remote_pull)) {
+		this_rq->pfs.next_remote_pull = jiffies +
+			max(msecs_to_jiffies(PFS_REMOTE_PULL_MS), 1UL);
+		passes = 2;
+	}
+
+	for (pass = 0; pass < passes && !busiest; pass++) {
 		const struct cpumask *span = pass ? cpu_active_mask :
 						    pfs_llc_span(this_cpu);
 
@@ -2746,9 +2759,14 @@ static int pfs_select_idle_sibling(struct task_struct *p, int prev, int target)
 	return target;
 }
 
-/* For fork and exec: an idle CPU, else the one with the fewest tasks. */
+/*
+ * For fork and exec: an idle CPU, else the one with the fewest tasks in the
+ * LLC of the forking CPU (the whole machine only if @p may not run there):
+ * on a busy machine every fork would otherwise read every run queue.
+ */
 static int pfs_find_idlest_cpu(struct task_struct *p, int this_cpu)
 {
+	const struct cpumask *span = pfs_llc_span(this_cpu);
 	unsigned int nr, min_nr = UINT_MAX;
 	int cpu, best = this_cpu;
 
@@ -2756,8 +2774,10 @@ static int pfs_find_idlest_cpu(struct task_struct *p, int this_cpu)
 	if (cpu >= 0)
 		return cpu;
 
-	for_each_cpu_wrap(cpu, cpu_active_mask, this_cpu) {
-		if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+	if (!cpumask_intersects(span, p->cpus_ptr))
+		span = cpu_active_mask;
+	for_each_cpu_wrap(cpu, span, this_cpu) {
+		if (!cpumask_test_cpu(cpu, p->cpus_ptr) || !cpu_active(cpu))
 			continue;
 		nr = READ_ONCE(cpu_rq(cpu)->nr_running);
 		if (nr < min_nr) {

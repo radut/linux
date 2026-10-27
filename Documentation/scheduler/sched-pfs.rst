@@ -806,7 +806,13 @@ Limits of this implementation
 =============================
 
 - The balancer scans CPU masks linearly; it is meant for machines up to a few
-  hundred CPUs, not for large NUMA systems.
+  hundred CPUs, not for large NUMA systems. The newly idle pull scans its LLC
+  and looks at the rest of the machine at most every 4 ms, and fork and exec
+  look for the least loaded CPU within the forking CPU's LLC, but wakeups and
+  pushes still scan the whole machine for an idle CPU while the global count
+  of idle CPUs is non-zero; that count is one atomic written on every idle
+  entry and exit of a CPU. Using the sched domain hierarchy and per-LLC idle
+  hints, as the fair class does, would need its own balancer design.
 - Active-set changes of a group (0 <-> 1 transitions of its admitted count)
   take the parent's weight lock, so sibling groups share a lock and a cache
   line: all pods of a Kubernetes QoS class have the same parent.

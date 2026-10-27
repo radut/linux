@@ -566,6 +566,8 @@ struct pfs_rq {
 	unsigned int		nr_idle_policy;
 	/* jiffies of the next periodic balance */
 	unsigned long		next_balance;
+	/* jiffies of the next newly idle scan beyond the LLC */
+	unsigned long		next_remote_pull;
 	/* counted in pfs_idle_cpus, see pfs_set_idle_hint() */
 	unsigned int		idle_hint;
 };
