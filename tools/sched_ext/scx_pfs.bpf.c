@@ -803,6 +803,19 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 	struct cgroup *wait_cgrp;
 
 	/*
+	 * The DSQs of a removed cgroup are destroyed with it, see
+	 * pfs_cgroup_exit(), and inserting into one is a scheduler error.
+	 * Run without slots instead.
+	 */
+	wait_cgrp = bpf_cgroup_from_id(cgid);
+	if (!wait_cgrp) {
+		stat_inc(PFS_STAT_LOST_PATH);
+		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice_ns, vtime,
+					 enq_flags);
+		return;
+	}
+
+	/*
 	 * Waiting tasks are admitted in FIFO order, which bounds the wait to
 	 * about one slice per task queued ahead divided by the width. In vtime
 	 * order, the tick-granular run lengths make the vtimes of the waiting
@@ -816,10 +829,6 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 	scx_bpf_dsq_insert(p, woken ? cgid | WOKEN_DSQ : cgid, slice_ns,
 			   enq_flags & ~(SCX_ENQ_HEAD | SCX_ENQ_PREEMPT |
 					 SCX_ENQ_PREEMPT_LAZY));
-
-	wait_cgrp = bpf_cgroup_from_id(cgid);
-	if (!wait_cgrp)
-		return;
 
 	cgc = find_cgrp_ctx(wait_cgrp);
 	if (cgc) {
@@ -1921,6 +1930,36 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 	return 0;
 }
 
+/*
+ * Let the tasks still waiting in @dsq_id run on credit and destroy it. The
+ * cgroup going offline only waits for its live tasks, an exiting task may
+ * still be queued, and destroying a DSQ with tasks in it is a scheduler error.
+ * A DSQ which isn't empty after the drain is left alone rather than destroyed.
+ */
+static void drain_destroy_dsq(u64 dsq_id)
+{
+	struct pfs_task_ctx *taskc;
+	struct task_struct *p;
+
+	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+		taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
+		if (taskc)
+			set_admitted(taskc, window_now(),
+				     !(dsq_id & WOKEN_DSQ));
+		if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p, SHARED_DSQ,
+					   0)) {
+			stat_inc(PFS_STAT_DRAIN);
+			kick_idle_cpu(p);
+		}
+	}
+
+	if (scx_bpf_dsq_nr_queued(dsq_id) > 0) {
+		stat_inc(PFS_STAT_DRAIN_FAIL);
+		return;
+	}
+	scx_bpf_destroy_dsq(dsq_id);
+}
+
 void BPF_STRUCT_OPS(pfs_cgroup_exit, struct cgroup *cgrp)
 {
 	struct pfs_cgrp_ctx *cgc;
@@ -1930,8 +1969,8 @@ void BPF_STRUCT_OPS(pfs_cgroup_exit, struct cgroup *cgrp)
 	if (cgc)
 		set_limit(cgc, 0);
 
-	scx_bpf_destroy_dsq(cgid);
-	scx_bpf_destroy_dsq(cgid | WOKEN_DSQ);
+	drain_destroy_dsq(cgid);
+	drain_destroy_dsq(cgid | WOKEN_DSQ);
 	bpf_map_delete_elem(&waitset, &cgid);
 }
 

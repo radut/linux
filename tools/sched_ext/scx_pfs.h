@@ -27,6 +27,8 @@ enum pfs_stat_idx {
 	PFS_STAT_RESCUE,		/* waiting cgroups retried by the timer sweep */
 	PFS_STAT_LOST_PATH,		/* slots of a removed cgroup not given back */
 	PFS_STAT_CREDIT,		/* ran without slots instead of waiting */
+	PFS_STAT_DRAIN,		/* waiting tasks let run as their cgroup went */
+	PFS_STAT_DRAIN_FAIL,		/* wait DSQ not empty after the drain, kept */
 
 	PFS_NR_STATS,
 };
