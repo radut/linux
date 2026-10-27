@@ -17,8 +17,8 @@ const char help_fmt[] =
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR]\n"
-"       [-i INTERVAL] [-v]\n"
+"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US]\n"
+"       [-q NR] [-i INTERVAL] [-v]\n"
 "\n"
 "  -s SLICE_US   Slice duration (default: 2500, 100 to 1000000)\n"
 "  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
@@ -26,6 +26,9 @@ const char help_fmt[] =
 "                task keeps its slots (default: 500, at most 1000000)\n"
 "  -r ROT_US     ... and to any waiting task after this, 0 for the end of the\n"
 "                slice (default: 0, at most 1000000)\n"
+"  -k CREDIT_US  A task which woke up and found no free slot runs without one\n"
+"                for up to this long while its cgroup has unused budget, 0\n"
+"                to make it wait (default: 1000, at most 1000000)\n"
 "  -w WINDOW_US  Accounting window for fractional limits (default: 10000,\n"
 "                1000 to 1000000)\n"
 "  -q NR         Size of the queues of cgroups with waiting tasks; more\n"
@@ -37,7 +40,7 @@ const char help_fmt[] =
 
 /* bounds the timer frequency, budgets are refilled every window */
 #define MIN_WINDOW_US	1000
-#define MAX_US		(1000 * 1000)	/* bounds for -s, -c, -r and -w */
+#define MAX_US		(1000 * 1000)	/* bounds for -s, -c, -r, -k and -w */
 #define MIN_SLICE_US	100
 #define MAX_INTERVAL	(24 * 3600)
 #define MIN_CGRP_Q	16
@@ -157,7 +160,7 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:c:r:w:q:i:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:k:w:q:i:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = 1000 *
@@ -169,6 +172,10 @@ restart:
 			break;
 		case 'r':
 			skel->rodata->rot_ns = 1000 *
+				parse_opt(opt, optarg, 0, MAX_US);
+			break;
+		case 'k':
+			skel->rodata->credit_ns = 1000 *
 				parse_opt(opt, optarg, 0, MAX_US);
 			break;
 		case 'w':
@@ -204,10 +211,11 @@ restart:
 	skel->rodata->min_share = HWEIGHT_ONE * skel->rodata->slice_ns /
 				  (WAIT_MAX_NS * nr_cpus) ?: 1;
 
-	printf("slice=%lluus cut=%lluus rot=%lluus window=%lluus queues=%llu\n",
+	printf("slice=%lluus cut=%lluus rot=%lluus credit=%lluus window=%lluus queues=%llu\n",
 	       (unsigned long long)skel->rodata->slice_ns / 1000,
 	       (unsigned long long)skel->rodata->cut_ns / 1000,
 	       (unsigned long long)skel->rodata->rot_ns / 1000,
+	       (unsigned long long)skel->rodata->credit_ns / 1000,
 	       (unsigned long long)skel->rodata->window_ns / 1000,
 	       (unsigned long long)nr_cgrp_q);
 

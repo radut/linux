@@ -217,7 +217,7 @@ latency although the average usage is below the limit.
 ### Options
 
 ```
-scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-v]
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-v]
 ```
 
 | Option | Default | Meaning |
@@ -225,11 +225,12 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR] [-i SECS] [
 | `-s` | 2500 | Slice. A thread whose slice ends while others of its cgroup wait gives its slots back and queues again. |
 | `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
 | `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
-| `-w` | 10000 | Accounting window for fractional limits and debt (minimum 1000). |
+| `-k` | 1000 | A thread that woke up and found no free slot runs without one for up to this long, if its cgroup has budget its slot holders can't use (see below); 0 makes it wait. |
+| `-w` | 10000 | Accounting window for fractional limits, credit and debt (minimum 1000). |
 | `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
 | `-i` | 1 | Interval of the counter report, in seconds. |
 
-`-s` takes 100 to 1000000 us, `-c` and `-r` at most 1000000 us, `-w` 1000
+`-s` takes 100 to 1000000 us, `-c`, `-r` and `-k` at most 1000000 us, `-w` 1000
 to 1000000 us and `-i` 1 to 86400 s; scx_pfs refuses other values.
 
 ### Counters
@@ -305,14 +306,21 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
   request threads at limit 1 have a median of 3.1 ms vs 1.15 ms under CFS.
 - `cpu.max.burst` is ignored, and so are cgroups deeper than 31 levels.
 - A thread waiting for a slot while it holds a kernel lock stalls every
-  thread waiting for that lock, in any cgroup. Threads that woke up (and
-  io_uring workers) therefore run without a slot while their cgroups have
-  budget left in the current window, and exiting threads, kernel threads and
-  threads being killed never wait. A cgroup's usage stays at its limit over a
-  window, but its concurrency can exceed the limit meanwhile. A thread
-  preempted, rotated or yielding (also through the in-kernel `yield()`) in
-  the kernel with a sleeping lock held can still wait: sched_ext doesn't tell
-  whether a thread is returning to user space.
+  thread waiting for that lock, in any cgroup. Exiting threads, kernel threads
+  and threads being killed never wait. A thread that woke up (or an io_uring
+  worker) and finds no free slot runs without one for up to `-k` (1 ms) if its
+  cgroup has budget that the threads holding its slots can't use until the
+  10 ms window ends, i.e. time the cgroup left unused earlier in the window. Its
+  concurrency can then exceed the limit, its usage can't. A cgroup that keeps
+  all its slots busy gives no credit: its woken threads wait for a slot, ahead
+  of the rotated ones, and take one from a rotated holder after `-c`. That is
+  the trade-off: credit whenever the window has budget left would bound a
+  woken lock owner's wait further, but threads taking turns on a contended
+  mutex then burn the limit on wakeups that block again (lock+yield at limit 4
+  fell to 0.18 of its throughput). A thread preempted, rotated or yielding
+  (also through the in-kernel `yield()`) in the kernel with a sleeping lock
+  held can still wait: sched_ext doesn't tell whether a thread is returning to
+  user space.
 - All runtime is charged, with or without a slot, and usage beyond the limit
   (credit, threads that never wait, slices ending on a tick) is carried over
   as debt, up to one second's worth of the limit. While a cgroup is beyond its

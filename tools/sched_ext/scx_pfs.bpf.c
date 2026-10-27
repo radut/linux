@@ -34,17 +34,26 @@
  * A task can hold kernel locks wherever it is enqueued, and one which waits
  * for a slot with a lock held stalls every task waiting for that lock, in any
  * cgroup. Tasks which woke up are in the kernel and may have been woken as the
- * new owner of a lock, so they don't wait while every limited cgroup on their
- * path has budget left in the current window: they run without slots, on
- * credit, and their runtime is charged to the windows, which bounds the
- * cgroup's usage to its limit over a window but lets its concurrency exceed
- * the width meanwhile. A task whose credit ran out waits with the woken tasks.
- * io_uring workers, which never return to user space, are treated as woken.
- * Exiting tasks, kernel threads and tasks with SIGKILL pending never wait, as
- * they are about to give up what they hold. Other tasks wait for a slot when
- * their slice ends, when they are preempted and when they yield, also if that
- * happens in the kernel with a sleeping lock held: sched_ext doesn't tell
- * whether a task is returning to user space when it is enqueued.
+ * new owner of a lock, so one which finds no free slot runs without one, on
+ * credit, for up to credit_ns (-k, 1ms) if every limited cgroup on its path
+ * has budget the tasks holding its slots can't use: the budget left in the
+ * window minus what the holders would use until the window ends, see
+ * credit_ok(). Credit thus comes out of what the cgroup left unused earlier in
+ * the window, e.g. while its threads slept, and lets the concurrency exceed
+ * the width meanwhile but not the usage the limit. A cgroup which keeps its
+ * slots busy gives no credit; its woken tasks wait for a slot, are admitted
+ * before the rotated ones and cut a rotated holder's turn after cut_ns. Credit
+ * whenever the window has budget left would bound the wait of a woken lock
+ * owner further, but threads which take turns on a contended lock then spend
+ * the cgroup's limit on futex wakeups that only block again, which cost them
+ * more than 80% of their throughput, and the limit is then only met by
+ * refusing slots for the debt. A task whose credit ran out waits with the
+ * woken tasks. io_uring workers, which never return to user space, are treated
+ * as woken. Exiting tasks, kernel threads and tasks with SIGKILL pending never
+ * wait, as they are about to give up what they hold. Other tasks wait for a
+ * slot when their slice ends, when they are preempted and when they yield,
+ * also if that happens in the kernel with a sleeping lock held: sched_ext
+ * doesn't tell whether a task is returning to user space when it is enqueued.
  *
  * sched_yield() doesn't give the slots away, unless the task has held them for
  * cut_ns and others wait for them: a thread which yields with a lock held
@@ -196,6 +205,8 @@ const volatile u64 cut_ns = 500 * 1000;
 /* and to any waiting task after this, 0 (default) for the end of the slice */
 const volatile u64 rot_ns;
 const volatile u64 min_share = 1;	/* see scale_by_cgrp_share() */
+/* the longest a task runs on credit before it waits for a slot */
+const volatile u64 credit_ns = 1000 * 1000;
 
 static u64 vtime_now;
 
@@ -838,10 +849,39 @@ static bool must_not_park(struct task_struct *p)
 }
 
 /*
+ * Can @cgc let a task run on credit, without a slot, and for how long? Only
+ * with the part of the window's budget which the tasks holding full slots
+ * can't use until the window ends, i.e. what the cgroup left unused earlier
+ * in the window, and only while it is within its limit, see over_limit(). The
+ * rate limited slot draws on the same budget as credit. A cgroup which keeps
+ * its slots busy, e.g. threads that take turns on a lock, gives no credit;
+ * one whose tasks often sleep, e.g. a database or pipes, does.
+ */
+static bool credit_ok(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
+{
+	u64 full = cgc->limit / FRAC_ONE, taken = cgc->nr_slots;
+	u64 left, held, min_left;
+
+	if (over_limit(cgc, now))
+		return false;
+
+	left = window_left(cgc, now);
+	held = (taken < full ? taken : full) * (window_ns - now % window_ns);
+	min_left = cgc->limit * window_ns / FRAC_ONE;
+	if (min_left > MIN_BUDGET_NS)
+		min_left = MIN_BUDGET_NS;
+	if (left <= held || left - held < min_left)
+		return false;
+	if (left - held < *slicep)
+		*slicep = left - held;
+	return true;
+}
+
+/*
  * Whether a task of @cgrp which found no free slot may run on credit, without
- * slots: every limited cgroup on the path has budget left in the current
- * window, the smallest of which clips *@slicep. The runtime is charged to the
- * windows, so credit stops once a cgroup used its limit's worth of the window.
+ * slots: every limited cgroup on the path can give credit, see credit_ok(),
+ * the smallest of which clips *@slicep. The runtime is charged to the
+ * windows, and any excess is paid back as debt.
  */
 static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
 {
@@ -859,7 +899,7 @@ static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
 		cgc = find_ancestor_ctx(cgrp, level, &cgid);
 		if (!cgc)
 			return false;
-		if (cgc->limit && !budget_left(cgc, now, slicep))
+		if (cgc->limit && !credit_ok(cgc, now, slicep))
 			return false;
 	}
 	return true;
@@ -1549,9 +1589,10 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * lasts, as do io_uring workers, which never return to user space.
 	 */
 	if (ret != RESERVE_OK) {
-		slice = slice_ns;
+		slice = credit_ns && credit_ns < slice_ns ? credit_ns : slice_ns;
 		if (must_not_park(p) ||
-		    (((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
+		    (credit_ns &&
+		     ((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
 		     credit_left(cgrp, window_now(), &slice))) {
 			stat_inc(PFS_STAT_CREDIT);
 			ret = RESERVE_OK;
