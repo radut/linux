@@ -225,7 +225,7 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR] [-i SECS] [
 | `-s` | 2500 | Slice. A thread whose slice ends while others of its cgroup wait gives its slots back and queues again. |
 | `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
 | `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
-| `-w` | 10000 | Accounting window for fractional limits (minimum 1000). |
+| `-w` | 10000 | Accounting window for fractional limits and debt (minimum 1000). |
 | `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
 | `-i` | 1 | Interval of the counter report, in seconds. |
 
@@ -246,7 +246,8 @@ that ran without a slot instead of waiting, see below), `overflow` (cgroups
 that didn't fit in the queues, see `-q`), `drain` (threads still waiting
 when their cgroup was removed, moved/kept; should stay 0/0), `no_dsq`
 (cgroups not limited because their queue couldn't be allocated),
-`park_race` (retries repeated for a thread about to start waiting), and
+`park_race` (retries repeated for a thread about to start waiting),
+`park_debt` (slots refused because the cgroup ran beyond its limit), and
 internal ones (`direct`, `shared`, `repark`, `race`, `activate`, `hweight`,
 `keep`). CFS's `nr_throttled` stays 0: waiting threads are queued by
 scx_pfs, not throttled.
@@ -312,6 +313,13 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
   preempted, rotated or yielding (also through the in-kernel `yield()`) in
   the kernel with a sleeping lock held can still wait: sched_ext doesn't tell
   whether a thread is returning to user space.
+- All runtime is charged, with or without a slot, and usage beyond the limit
+  (credit, threads that never wait, slices ending on a tick) is carried over
+  as debt, up to one second's worth of the limit. While a cgroup is beyond its
+  limit by more than a window's budget, its last full slot and the fractional
+  slot aren't handed out until it paid the debt back (`park_debt`). Usage
+  averages at the limit, but pipe and database loads can run slightly above it
+  for a window and below it in the next.
 
 
 # Troubleshooting
