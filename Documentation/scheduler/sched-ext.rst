@@ -555,6 +555,13 @@ Where to Look
   * ``scx_pair[.bpf].c``: A core-scheduling example that always makes
     sibling CPU pairs execute tasks from the same CPU cgroup.
 
+  * ``scx_pfs[.bpf].c``: Enforces ``cpu.max`` as a cap on the number of
+    threads of a cgroup which run at once instead of a CPU time budget per
+    period, using ``ops.cgroup_set_bandwidth()`` and a waiting DSQ per
+    cgroup. ``tools/sched_ext/README.md`` lists its options, measurements and
+    disadvantages, and ``tools/sched_ext/pfs-test/`` compares it with CFS
+    bandwidth control.
+
   * ``scx_sdt[.bpf].c``: A variation of ``scx_simple`` demonstrating BPF
     arena memory management for per-task data.
 

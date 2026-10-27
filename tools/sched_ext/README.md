@@ -197,6 +197,101 @@ Similar to scx_simple, in limited scenarios, this scheduler can perform
 reasonably well on single socket-socket systems with a unified L3 cache and show
 significantly lowered hierarchical scheduling overhead.
 
+## scx_pfs
+
+The Parallel Fair Scheduler: cgroup v2 CPU limits (`cpu.max`) as a cap on the
+number of threads of a cgroup that run at once, instead of a CPU time budget
+per period. A cgroup limited to N CPUs has floor(N) slots without any time
+accounting; threads beyond them wait in a queue of the cgroup and take a slot
+as soon as one is given back, on the CPU that gave it back. A fractional
+limit adds one slot whose use is limited to the fraction of a 10 ms window.
+Limits apply at every level of the hierarchy, and `cpu.weight` splits the
+machine between cgroups under contention as in scx_flatcg. The header comment
+of `scx_pfs.bpf.c` describes the design.
+
+The motivation is container CPU limits: with CFS bandwidth control a pod
+limited to 4 CPUs with 32 runnable threads runs on 32 CPUs for 1/8 of the
+100 ms period and then stalls for the rest of it, which shows up as tail
+latency although the average usage is below the limit.
+
+### Options
+
+```
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i SECS] [-v]
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `-s` | 2500 | Slice. A thread whose slice ends while others of its cgroup wait gives its slots back and queues again. |
+| `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
+| `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
+| `-w` | 10000 | Accounting window for fractional limits (minimum 1000). |
+| `-i` | 1 | Interval of the counter report, in seconds. |
+
+### Counters
+
+Printed every `-i` seconds: `park_full` (a thread waited for a slot),
+`park_budget` (the fractional slot was out of budget), `park_woken` (a woken
+thread waited), `admit` (waiting threads let in), `retry`, `cut` (slots
+taken back for a woken thread), `yield_keep`/`yield_rotate` (what
+`sched_yield()` did), `too_deep` (threads of cgroups deeper than 31 levels,
+not limited), `rescue` and `lost_path` (retries the timer had to make, should
+stay 0 or close to it), and internal ones (`direct`, `shared`, `repark`,
+`overflow`, `race`, `activate`, `hweight`, `keep`). CFS's `nr_throttled` stays
+0: waiting threads are queued by scx_pfs, not throttled.
+
+### Running it
+
+Start it as root and stop it with Ctrl-C (the kernel scheduler takes over
+again), or install `pfs-test/scx_pfs.service` as a systemd unit, or run it in
+a privileged container with `--pid=host` (`pfs-test/scx-container.sh`), which
+is the shape of a Kubernetes DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
+following run-time changes of `cpu.max` needs the `cgroup_set_bandwidth`
+operation (6.17 or later). `pfs-test/` compares it with CFS bandwidth control
+on plain cgroups, systemd units, Docker and Podman; its README has the
+reproduction steps and the full result tables.
+
+### Measurements
+
+On an 8-vCPU local VM (median of 5 boots, same kernel image for both):
+
+- Limit 1 with 8 busy threads: 0.83 vs 0.61 million iterations/s, worst stall
+  of a thread 23 vs 93 ms, CPUs used 0.99 in both, `nr_throttled` 0.
+- Four request threads with 1 ms of work every 20 ms next to 8 busy threads
+  of the same cgroup, limit 1: p50/p99 2.2/3.1 ms vs 349/1036 ms.
+- Request latency at limit 0.5 through the kit (cgroup, Docker and systemd
+  paths): p99 30-34 ms vs 82-84 ms.
+
+On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
+
+- PostgreSQL pgbench TPC-B, 32 clients, limit 4: p99 10.0 ms vs 46.9 ms, at
+  6050 vs 9003 transactions/s; select-only p99 1.46 vs 12.4 ms.
+- 16 threads calling `sched_yield()` 100 times while holding one of 4
+  mutexes, limit 4: 37.6k vs 11.1k events/s; sysbench cpu p99 9.2 vs 44 ms.
+- hackbench in a pod limited to 4 CPUs: 2.22 s vs 3.26 s (processes).
+
+### Disadvantages
+
+- Databases lose 27-37% of their throughput against CFS at the same limit
+  (PostgreSQL, MariaDB at limits 4 and 2), with much better tails: the pod
+  uses 2.8-3.0 of 4 CPUs. Against a 4-vCPU VM without limit, limit 4 gives
+  89-91% of its transactions/s.
+- More spinning threads than slots collapse: Redis with 4 I/O threads at
+  limit 2 serves 5.1k requests/s vs 86k under CFS; two threads passing a flag
+  in a busy loop, 8 pairs at limit 2, reach 0.08 of CFS's rate. Keep
+  busy-polling threads at or below the limit.
+- A web server at limit 4 with 8 threads next to heavy neighbours (two
+  unlimited 16-thread spinners and 20 limited pods) reached only 3197 vs
+  5337 requests/s using 2.23 of 4 CPUs, and missed its fixed rate (p99 14.9 s).
+- With 50-100 pods on the node, a 1 ms sleeper outside the pods overshoots by
+  4.7-8.0 ms at p99 vs 1.0-2.4 ms under CFS, and migrations are about 100
+  times as frequent.
+- `cpu.stat` over-reports the usage of cgroups with many threads under
+  sched_ext; use a `sched_switch` trace to count CPUs.
+- Waiting for a slot costs latency even in an otherwise idle cgroup: four
+  request threads at limit 1 have a median of 3.1 ms vs 1.15 ms under CFS.
+- `cpu.max.burst` is ignored, and so are cgroups deeper than 31 levels.
+
 
 # Troubleshooting
 
