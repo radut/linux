@@ -143,6 +143,13 @@ after running the group's tasks for the slice per task, so that the CPUs
 take turns. Limits apply at every level of the hierarchy. cpu.cfs_burst_us
 is ignored in width mode, and nr_periods and nr_throttled count windows.
 
+The sysctl is global and only root of the initial namespaces can change it,
+but whoever may write a group's cpu.max, e.g. the owner of a delegated
+subtree for the groups below its root, puts that group into the mode the
+sysctl has at that time. After a change, groups thus end up in mixed modes
+as their limits are written. Set the sysctl before limits are configured,
+or write the limits of all groups again after changing it.
+
 A throttled task keeps running until it returns to user space, so a slot
 alone doesn't bound the time a group spends in the kernel, e.g. in long reads
 of /dev/urandom or in pipe writes. Width mode therefore charges all runtime
