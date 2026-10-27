@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+// SPDX-License-Identifier: GPL-2.0
 /*
  * scx_pfs, the Parallel Fair Scheduler: a demo sched_ext scheduler which
  * enforces cgroup CPU limits as a cap on concurrency instead of a time quota.
@@ -282,8 +282,8 @@ struct {
 static void stat_inc(enum pfs_stat_idx idx)
 {
 	u32 idx_v = idx;
-
 	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx_v);
+
 	if (cnt_p)
 		(*cnt_p)++;
 }
@@ -325,7 +325,7 @@ static struct pfs_cgrp_ctx *find_cgrp_ctx(struct cgroup *cgrp)
  * by @cgrp, so the context stays valid after the ancestor is released.
  */
 static struct pfs_cgrp_ctx *find_ancestor_ctx(struct cgroup *cgrp, int level,
-						u64 *cgidp)
+					      u64 *cgidp)
 {
 	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *anc;

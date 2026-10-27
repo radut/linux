@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __SCX_EXAMPLE_PFS_H
 #define __SCX_EXAMPLE_PFS_H
 
