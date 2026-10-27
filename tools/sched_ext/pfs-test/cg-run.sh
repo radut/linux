@@ -35,7 +35,7 @@ EOF
 # The variant must already be active (variant_start).
 run_cg_case() {
 	local variant=$1 limit=$2 threads=$3 secs=$4 wl=$5 neigh=$6 weight=$7
-	local lim noisy out st conc wpid tmp
+	local lim noisy out st conc wpid tmp pfs
 	tmp=$(mktemp -d)
 	cg_setup
 	lim=$(cg_new lim "$limit" "$weight")
@@ -57,20 +57,25 @@ run_cg_case() {
 	kill_pids
 	out=$(cat "$tmp/out")
 	st=$(cg_stat "$lim")
+	# scx_pfs rewrites its counters every second, let the last one land
+	[ "$variant" != scx ] || sleep 1.2
+	pfs=$(pfs_stat "$lim")
 	conc=$(conc_of "$wl" "$tmp/trace" "$limit")
-	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | conc avg/max/%over: $conc"
+	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | scx_pfs nr_throttled/throttled_ms: $pfs | conc avg/max/%over: $conc"
 	[ -z "${KEEP_TRACE:-}" ] || cp "$tmp/trace" "$KEEP_TRACE" 2>/dev/null || true
 	rm -rf "$tmp"
 	cg_rm "$lim"
 	[ "$neigh" != noisy ] || cg_rm "$noisy"
-	emit_row cgroup "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc"
+	emit_row cgroup "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc" "$pfs"
 }
 
 # emit_row PATH VARIANT LIMIT THREADS NEIGH SECS WORKLOAD OUT "NR THR_MS USE_MS" "AVG MAX PCT"
+#          ["PFS_NR PFS_THR_MS"]
 emit_row() {
 	local out=$8 iters miter stall stalls p50 p99 mx
 	read -r nr thr _ <<< "$9"
 	read -r cavg cmax cpct <<< "${10}"
+	read -r pnr pthr <<< "${11:-- -}"
 	if [ "$7" = reqlat ]; then
 		iters=$(kv burn_iters "$out"); stall=-; stalls=-
 		p50=$(kv p50_ms "$out"); p99=$(kv p99_ms "$out"); mx=$(kv max_ms "$out")
@@ -79,7 +84,7 @@ emit_row() {
 		p50=-; p99=-; mx=-
 	fi
 	miter=$(awk -v i="$iters" -v s="$6" 'BEGIN { printf "%.2f", i / s / 1e6 }')
-	echo "$1,$2,$3,$4,$5,$6,$miter,$nr,$thr,$stall,$stalls,$cavg,$cmax,$cpct,$p50,$p99,$mx"
+	echo "$1,$2,$3,$4,$5,$6,$miter,$nr,$thr,$stall,$stalls,$cavg,$cmax,$cpct,$p50,$p99,$mx,$pnr,$pthr"
 }
 
 main() {

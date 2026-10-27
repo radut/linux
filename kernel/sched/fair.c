@@ -6910,8 +6910,22 @@ static void __throttle_cfs_rq(struct cfs_rq *cfs_rq);
  * of the group on its CPU, so that the CPUs, and roughly the tasks, take
  * turns. A cfs_rq throttled before the end of its turn queues at the head.
  * A task needs a slot in each limited group it is in.
+ *
+ * Throttling only takes effect when a task returns to user space, so the
+ * tasks of a cfs_rq without a slot keep running while they are in the
+ * kernel, e.g. in a long read() of /dev/urandom or a pipe write, and the
+ * slots alone don't bound the group's usage. All runtime of the group, with
+ * or without a slot, is therefore charged to cfs_b->width_runtime, and the
+ * usage beyond L is carried over as debt, see cfs_width_settle(). While the
+ * debt is above a margin which absorbs late charges, no slot is handed out,
+ * so that the group pays it back by running below its limit, as CFS pays
+ * back runtime overdrawn in the kernel with a throttled period.
  */
 #define CFS_WIDTH_WINDOW	(10 * NSEC_PER_MSEC)
+/* the debt is capped at what the limit allows in this time */
+#define CFS_WIDTH_DEBT_PERIOD	NSEC_PER_SEC
+/* runtime collected per cfs_rq before it is added to the group's */
+#define CFS_WIDTH_CHARGE_BATCH	(500 * NSEC_PER_USEC)
 
 enum {
 	CFS_WIDTH_NONE,
@@ -6919,9 +6933,57 @@ enum {
 	CFS_WIDTH_EXTRA,	/* the rate limited slot */
 };
 
+/*
+ * Add the runtime charged since the last call to the debt and take off what
+ * the limit allows for the time elapsed since then. Usage below the limit
+ * pays the debt back but isn't saved up.
+ */
+static void cfs_width_settle(struct cfs_bandwidth *cfs_b)
+{
+	u64 now = ktime_get_mono_fast_ns(), elapsed, used, allowed, debt;
+
+	lockdep_assert_held(&cfs_b->lock);
+
+	if (now <= cfs_b->width_settled)
+		return;
+
+	elapsed = now - cfs_b->width_settled;
+	cfs_b->width_settled = now;
+	used = atomic64_xchg(&cfs_b->width_runtime, 0);
+	allowed = mul_u64_u64_div_u64(cfs_b->quota, elapsed,
+				      ktime_to_ns(cfs_b->period));
+	debt = cfs_b->width_debt + used;
+	cfs_b->width_debt = debt > allowed ?
+			    min(debt - allowed, cfs_b->width_debt_max) : 0;
+}
+
+/* Has the group run beyond its limit by more than the margin? */
+static bool cfs_width_in_debt(struct cfs_bandwidth *cfs_b)
+{
+	cfs_width_settle(cfs_b);
+	return cfs_b->width_debt > cfs_b->width_margin;
+}
+
+/* Charge @delta_exec of runtime of @cfs_rq, with or without a slot */
+static void cfs_width_charge(struct cfs_bandwidth *cfs_b, struct cfs_rq *cfs_rq,
+			     u64 delta_exec)
+{
+	cfs_rq->width_charge += delta_exec;
+	if (cfs_rq->width_charge < CFS_WIDTH_CHARGE_BATCH)
+		return;
+
+	atomic64_add(cfs_rq->width_charge, &cfs_b->width_runtime);
+	cfs_rq->width_charge = 0;
+}
+
 static int cfs_width_free(struct cfs_bandwidth *cfs_b)
 {
-	int free = max(cfs_b->width_slots - cfs_b->width_active, 0);
+	int free;
+
+	if (cfs_width_in_debt(cfs_b))
+		return 0;
+
+	free = max(cfs_b->width_slots - cfs_b->width_active, 0);
 
 	if (cfs_b->width_extra && !cfs_b->width_extra_busy && cfs_b->runtime)
 		free++;
@@ -6969,6 +7031,10 @@ static bool cfs_width_acquire(struct cfs_bandwidth *cfs_b, struct cfs_rq *cfs_rq
 
 	if (slot == CFS_WIDTH_SLOT)
 		return true;
+
+	/* pay back the debt first, see the top of the width mode */
+	if (slot == CFS_WIDTH_NONE && cfs_width_in_debt(cfs_b))
+		return false;
 
 	if (cfs_b->width_active < cfs_b->width_slots) {
 		/* also trades the rate limited slot for a full one */
@@ -7022,6 +7088,8 @@ static bool throttle_cfs_rq_width(struct cfs_rq *cfs_rq, bool rotate)
 			cfs_rq->width_used = 0;
 		}
 		cfs_rq->width_woken = 0;
+		/* count the window as throttled, see do_cfs_width_period_timer() */
+		cfs_b->width_throttled = 1;
 
 		__cfs_width_release(cfs_b, cfs_rq);
 		cfs_width_kick(cfs_b);
@@ -7040,6 +7108,10 @@ static bool throttle_cfs_rq_width(struct cfs_rq *cfs_rq, bool rotate)
 static bool account_cfs_rq_width(struct cfs_rq *cfs_rq, u64 delta_exec)
 {
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+
+	/* also while throttled: tasks in the kernel run on, see above */
+	if (delta_exec)
+		cfs_width_charge(cfs_b, cfs_rq, delta_exec);
 
 	if (cfs_rq->throttled)
 		return true;
@@ -7085,7 +7157,7 @@ static __always_inline void cfs_width_put(struct cfs_rq *cfs_rq)
 /* Set up width mode from cfs_b->quota and cfs_b->period */
 void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width)
 {
-	u64 period = ktime_to_ns(cfs_b->period), window, slots;
+	u64 period = ktime_to_ns(cfs_b->period), window, slots, debt_max;
 
 	lockdep_assert_held(&cfs_b->lock);
 
@@ -7106,6 +7178,19 @@ void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width)
 	cfs_b->width_extra = cfs_b->width_budget > 0;
 	cfs_b->runtime = cfs_b->width_budget;
 	cfs_b->runtime_snap = cfs_b->runtime;
+
+	/*
+	 * Charges arrive late, by up to a tick per running CPU plus a batch,
+	 * and the margin absorbs that and one window's budget once.
+	 */
+	debt_max = mul_u64_u64_div_u64(cfs_b->quota, CFS_WIDTH_DEBT_PERIOD, period);
+	cfs_b->width_debt_max = max_t(u64, debt_max, 2 * TICK_NSEC);
+	cfs_b->width_margin = (cfs_b->width_slots + cfs_b->width_extra) *
+			      (TICK_NSEC + CFS_WIDTH_CHARGE_BATCH) +
+			      mul_u64_u64_div_u64(cfs_b->quota, window, period);
+	cfs_b->width_debt = 0;
+	cfs_b->width_settled = ktime_get_mono_fast_ns();
+	atomic64_set(&cfs_b->width_runtime, 0);
 }
 
 /* Called with the rq lock held, after cfs_width_config() */
@@ -7116,6 +7201,7 @@ void cfs_width_config_rq(struct cfs_rq *cfs_rq, bool width)
 	cfs_rq->width_enabled = width;
 	cfs_rq->width_used = 0;
 	cfs_rq->width_woken = 0;
+	cfs_rq->width_charge = 0;
 	if (!cfs_rq->width_slot)
 		return;
 
@@ -7779,13 +7865,21 @@ static int do_cfs_width_period_timer(struct cfs_bandwidth *cfs_b, int overrun,
 	cfs_b->nr_periods += overrun;
 	cfs_b->runtime = cfs_b->width_budget;
 
+	/*
+	 * A window counts as throttled if a cfs_rq waited for a slot or for
+	 * budget at any time in it, also if it got one before the window
+	 * ended, as CFS counts a period in which the group was throttled.
+	 */
 	if (list_empty(&cfs_b->throttled_cfs_rq)) {
+		cfs_b->nr_throttled += cfs_b->width_throttled;
+		cfs_b->width_throttled = 0;
 		if (cfs_b->idle)
 			return 1;
 		cfs_b->idle = 1;
 		return 0;
 	}
 
+	cfs_b->width_throttled = 0;
 	cfs_b->nr_throttled += overrun;
 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
 	distribute_cfs_width(cfs_b);

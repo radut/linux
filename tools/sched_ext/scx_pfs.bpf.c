@@ -34,17 +34,26 @@
  * A task can hold kernel locks wherever it is enqueued, and one which waits
  * for a slot with a lock held stalls every task waiting for that lock, in any
  * cgroup. Tasks which woke up are in the kernel and may have been woken as the
- * new owner of a lock, so they don't wait while every limited cgroup on their
- * path has budget left in the current window: they run without slots, on
- * credit, and their runtime is charged to the windows, which bounds the
- * cgroup's usage to its limit over a window but lets its concurrency exceed
- * the width meanwhile. A task whose credit ran out waits with the woken tasks.
- * io_uring workers, which never return to user space, are treated as woken.
- * Exiting tasks, kernel threads and tasks with SIGKILL pending never wait, as
- * they are about to give up what they hold. Other tasks wait for a slot when
- * their slice ends, when they are preempted and when they yield, also if that
- * happens in the kernel with a sleeping lock held: sched_ext doesn't tell
- * whether a task is returning to user space when it is enqueued.
+ * new owner of a lock, so one which finds no free slot runs without one, on
+ * credit, for up to credit_ns (-k, 1ms) if every limited cgroup on its path
+ * has budget the tasks holding its slots can't use: the budget left in the
+ * window minus what the holders would use until the window ends, see
+ * credit_ok(). Credit thus comes out of what the cgroup left unused earlier in
+ * the window, e.g. while its threads slept, and lets the concurrency exceed
+ * the width meanwhile but not the usage the limit. A cgroup which keeps its
+ * slots busy gives no credit; its woken tasks wait for a slot, are admitted
+ * before the rotated ones and cut a rotated holder's turn after cut_ns. Credit
+ * whenever the window has budget left would bound the wait of a woken lock
+ * owner further, but threads which take turns on a contended lock then spend
+ * the cgroup's limit on futex wakeups that only block again, which cost them
+ * more than 80% of their throughput, and the limit is then only met by
+ * refusing slots for the debt. A task whose credit ran out waits with the
+ * woken tasks. io_uring workers, which never return to user space, are treated
+ * as woken. Exiting tasks, kernel threads and tasks with SIGKILL pending never
+ * wait, as they are about to give up what they hold. Other tasks wait for a
+ * slot when their slice ends, when they are preempted and when they yield,
+ * also if that happens in the kernel with a sleeping lock held: sched_ext
+ * doesn't tell whether a task is returning to user space when it is enqueued.
  *
  * sched_yield() doesn't give the slots away, unless the task has held them for
  * cut_ns and others wait for them: a thread which yields with a lock held
@@ -109,14 +118,21 @@
  * hweights are cached and recomputed when the set of active cgroups or a
  * weight changes. cpu.max.burst is ignored.
  *
- * Usage accounting for the rate limited slot is approximate: the slice of a
- * task admitted to it is clipped to the budget left at admission, but other
- * running tasks of the cgroup consume the same budget concurrently, so the
- * cgroup can overrun its budget by up to one slice per running task per
- * window. The overrun is carried into the next window. The budget is reset
- * lazily by the first user in a new window, and a charge racing against the
- * reset can land in the new window, which can delay the rate limited slot by
- * up to one window.
+ * All runtime of a cgroup's tasks, with or without slots, is charged to the
+ * windows of the limited cgroups on their path: on every tick, when a task
+ * stops, and for a task which blocked, until ops.dispatch() is done with its
+ * CPU. Accounting is still approximate: the slice of a task admitted to the
+ * rate limited slot or on credit is clipped to the budget left at admission,
+ * but other running tasks of the cgroup consume the same budget concurrently,
+ * and the exiting tasks, kernel threads and killed tasks above run anyway.
+ * Usage beyond the budget is carried over as debt, up to what the limit
+ * allows in DEBT_MAX_NS. While a cgroup is beyond its limit by more than a
+ * margin of a window's budget and a tick per slot, see over_limit(), its last
+ * full slot and its rate limited slot aren't handed out and it gives no
+ * credit, so that it pays the debt back and its average usage stays at the
+ * limit. The budget is reset lazily by the first user in a new window, and a
+ * charge racing against the reset can land in the new window, which can delay
+ * the rate limited slot by up to one window.
  *
  * A task which is dequeued and enqueued again while it is running, e.g. on
  * sched_setaffinity(), a nice change or a cgroup move, gives its slots back at
@@ -163,6 +179,10 @@ enum {
 #define SLOT_LEVELS_MASK	0xffffffffLLU
 #define SLOT_SEQ_SHIFT		32
 #define MIN_BUDGET_NS		(100 * 1000LLU)
+/* runtime beyond the limit is carried over up to what it allows in this time */
+#define DEBT_MAX_NS		(1000 * 1000 * 1000LLU)
+/* a tick at HZ=250: how late a slot holder's slice can end, see over_limit() */
+#define TICK_SLACK_NS		(4 * 1000 * 1000LLU)
 #define PFS_SIGKILL		9
 #define HWEIGHT_REFRESH_NS	(1000 * 1000LLU)
 /* a waiting cgroup not walked by any retry for this long is retried */
@@ -185,6 +205,8 @@ const volatile u64 cut_ns = 500 * 1000;
 /* and to any waiting task after this, 0 (default) for the end of the slice */
 const volatile u64 rot_ns;
 const volatile u64 min_share = 1;	/* see scale_by_cgrp_share() */
+/* the longest a task runs on credit before it waits for a slot */
+const volatile u64 credit_ns = 1000 * 1000;
 
 static u64 vtime_now;
 
@@ -209,6 +231,8 @@ private(PFS_WEIGHT) struct bpf_spin_lock weight_lock;
 UEI_DEFINE(uei);
 
 struct pfs_cgrp_ctx {
+	/* first, user space reads it, see scx_pfs.h */
+	struct pfs_cgrp_stat stat;
 	u64		limit;		/* milli-CPUs from cpu.max, 0 if none */
 	u32		nr_slots;	/* slots taken by tasks of the subtree */
 	u32		retry_queued;
@@ -254,6 +278,7 @@ struct pfs_task_ctx {
 	u32		rotated;	/* admitted after a rotation, not a wakeup */
 	u32		credit;		/* runs on credit since a wakeup */
 	u64		parking_cgid;	/* parked there, not yet seen by a walk */
+	u64		wait_mask;	/* levels counted as waiting, see wait_begin() */
 	/*
 	 * IDs of the cgroups on cgid's path by level, set with ->cgid. Slots
 	 * are given back through them: the cgroup of an exiting task can be
@@ -481,31 +506,55 @@ static u64 window_now(void)
 	return bpf_ktime_get_ns();
 }
 
+/* the most runtime beyond @cgc's limit that is carried over, see window_left() */
+static u64 debt_max(struct pfs_cgrp_ctx *cgc)
+{
+	u64 budget = cgc->limit * window_ns / FRAC_ONE;
+	u64 max = cgc->limit * DEBT_MAX_NS / FRAC_ONE;
+
+	return max > 2 * budget ? max : 2 * budget;
+}
+
 /*
  * Return the part of @cgc's budget left in the current window. Windows are
  * aligned to multiples of window_ns so that the periodic timer finds the
  * budgets of all cgroups refilled when it fires. The reset can race against
  * concurrent charging, which loses at most a few slices worth of charge.
  *
- * Slices end on a tick, so admissions overrun the budget. The overrun of a
- * window is carried into the next one, up to a full budget, so that the
- * average stays at the limit.
+ * window_used counts the runtime of all tasks of the subtree, with or without
+ * slots. Usage beyond the budget (slices end on a tick, tasks run on credit)
+ * is carried over as debt and paid back with the budgets of the following
+ * windows, so that the average stays at the limit, see over_limit(). The debt
+ * is capped at what the limit allows in DEBT_MAX_NS, which bounds the wait
+ * after an overrun.
  */
 static u64 window_left(struct pfs_cgrp_ctx *cgc, u64 now)
 {
 	u64 id = now / window_ns;
 	u64 old_id = cgc->window_id;
-	u64 budget, used;
+	u64 budget, used, elapsed, max;
 
 	budget = cgc->limit * window_ns / FRAC_ONE;
 
-	if (old_id != id &&
+	/*
+	 * Callers sample @now before they get here, so another CPU may have
+	 * started the next window already. Never go back to an older window:
+	 * that throws the newer window's usage away, and coming back to it
+	 * starts it over with nothing used.
+	 */
+	if (id > old_id &&
 	    __sync_val_compare_and_swap(&cgc->window_id, old_id, id) == old_id) {
 		used = cgc->window_used;
-		if (id == old_id + 1 && used > budget)
-			used = used - budget < budget ? used - budget : budget;
-		else
+		elapsed = id - old_id;
+		max = debt_max(cgc);
+		/* elapsed * budget <= used, it can't overflow */
+		if (budget && elapsed <= used / budget) {
+			used -= elapsed * budget;
+			if (used > max)
+				used = max;
+		} else {
 			used = 0;
+		}
 		cgc->window_used = used;
 	}
 
@@ -534,9 +583,123 @@ static bool budget_left(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
 }
 
 /*
+ * Count the window of @now in @cgc's nr_periods, and in nr_throttled if
+ * @throttled, once per window each.
+ */
+static void count_window(struct pfs_cgrp_ctx *cgc, u64 now, bool throttled)
+{
+	u64 id = now / window_ns, old;
+
+	old = cgc->stat.period_id;
+	if (old < id &&
+	    __sync_val_compare_and_swap(&cgc->stat.period_id, old, id) == old)
+		__sync_fetch_and_add(&cgc->stat.nr_periods, 1);
+	if (!throttled)
+		return;
+	old = cgc->stat.throttled_id;
+	if (old < id &&
+	    __sync_val_compare_and_swap(&cgc->stat.throttled_id, old, id) == old)
+		__sync_fetch_and_add(&cgc->stat.nr_throttled, 1);
+}
+
+/*
+ * @taskc starts waiting in a DSQ of @wait_cgrp, which refused it a slot. The
+ * cgroup is throttled from its first waiter's start to its last waiter's end,
+ * and so is each limited ancestor whose slots are all taken too, as CFS's
+ * cpu.stat counts a throttled parent: the task is held back by its limit as
+ * well. The levels counted are remembered in ->wait_mask, by the cgroup IDs
+ * of the task's path.
+ */
+static void wait_begin(struct pfs_task_ctx *taskc, struct cgroup *wait_cgrp,
+		       u64 now)
+{
+	struct pfs_cgrp_ctx *cgc;
+	u64 mask = 0, cgid;
+	int level;
+
+	if (taskc->wait_mask || too_deep(wait_cgrp))
+		return;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (level > wait_cgrp->level)
+			break;
+		cgc = find_ancestor_ctx(wait_cgrp, level, &cgid);
+		if (!cgc)
+			return;
+		if (!cgc->limit || cgid != taskc->path_cgid[level])
+			continue;
+		if (level < wait_cgrp->level &&
+		    cgc->nr_slots < div_round_up(cgc->limit, FRAC_ONE))
+			continue;
+		mask |= 1LLU << level;
+		if (!__sync_fetch_and_add(&cgc->stat.nr_waiting, 1))
+			cgc->stat.wait_since = now;
+		count_window(cgc, now, true);
+	}
+	taskc->wait_mask = mask;
+}
+
+/* @taskc no longer waits, if it did, see wait_begin() */
+static void wait_end(struct pfs_task_ctx *taskc, u64 now)
+{
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+	u64 mask, since;
+	int level;
+
+	if (!taskc->wait_mask)
+		return;
+	mask = __sync_lock_test_and_set(&taskc->wait_mask, 0);
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (!(mask >> level))
+			break;
+		if (!(mask & (1LLU << level)))
+			continue;
+		cgrp = bpf_cgroup_from_id(taskc->path_cgid[level]);
+		if (!cgrp)
+			continue;
+		cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+		if (cgc) {
+			since = cgc->stat.wait_since;
+			if (__sync_sub_and_fetch(&cgc->stat.nr_waiting, 1) <= 0 &&
+			    since && now > since)
+				__sync_fetch_and_add(&cgc->stat.throttled_ns,
+						     now - since);
+		}
+		bpf_cgroup_release(cgrp);
+	}
+}
+
+/*
+ * Has @cgc's subtree used more CPU time in the current window, including the
+ * debt carried over, than its limit allows? The full slots may have used
+ * floor(limit) CPUs since the window began, the rate limited slot its whole
+ * budget. Runtime is charged late, by a tick or, in a virtual machine whose
+ * CPU was preempted, by much more, so a margin of a tick per slot plus one
+ * window's budget absorbs that. The margin only bounds the excess once.
+ */
+static bool over_limit(struct pfs_cgrp_ctx *cgc, u64 now)
+{
+	u64 full = cgc->limit / FRAC_ONE;
+	u64 width = div_round_up(cgc->limit, FRAC_ONE);
+	u64 budget = cgc->limit * window_ns / FRAC_ONE;
+	u64 allowed;
+
+	window_left(cgc, now);
+	/* 2 * budget >= full * window_ns, it can't underflow */
+	allowed = full * (now % window_ns) + 2 * budget - full * window_ns +
+		  width * TICK_SLACK_NS;
+	return cgc->window_used > allowed;
+}
+
+/*
  * Take a slot in a single limited cgroup. The first floor(limit) slots are
  * free. The last slot of a fractional limit needs budget left in the window,
- * see budget_left().
+ * see budget_left(). The last full slot and the rate limited slot also need
+ * the cgroup to be within its limit, see over_limit(), so that a cgroup which
+ * ran beyond it, e.g. with tasks on credit, pays the excess back. Once the
+ * debt reached its cap, no slot is handed out until it went down.
  */
 static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 				     u64 *slicep)
@@ -553,6 +716,14 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 
 	if (taken >= full && !budget_left(cgc, now, slicep)) {
 		__sync_fetch_and_sub(&cgc->nr_slots, 1);
+		return RESERVE_BUDGET;
+	}
+
+	/* the window timer retries the cgroups refused for budget */
+	if ((taken + 1 >= full || cgc->window_used >= debt_max(cgc)) &&
+	    over_limit(cgc, now)) {
+		__sync_fetch_and_sub(&cgc->nr_slots, 1);
+		stat_inc(PFS_STAT_PARK_DEBT);
 		return RESERVE_BUDGET;
 	}
 
@@ -770,10 +941,39 @@ static bool must_not_park(struct task_struct *p)
 }
 
 /*
+ * Can @cgc let a task run on credit, without a slot, and for how long? Only
+ * with the part of the window's budget which the tasks holding full slots
+ * can't use until the window ends, i.e. what the cgroup left unused earlier
+ * in the window, and only while it is within its limit, see over_limit(). The
+ * rate limited slot draws on the same budget as credit. A cgroup which keeps
+ * its slots busy, e.g. threads that take turns on a lock, gives no credit;
+ * one whose tasks often sleep, e.g. a database or pipes, does.
+ */
+static bool credit_ok(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
+{
+	u64 full = cgc->limit / FRAC_ONE, taken = cgc->nr_slots;
+	u64 left, held, min_left;
+
+	if (over_limit(cgc, now))
+		return false;
+
+	left = window_left(cgc, now);
+	held = (taken < full ? taken : full) * (window_ns - now % window_ns);
+	min_left = cgc->limit * window_ns / FRAC_ONE;
+	if (min_left > MIN_BUDGET_NS)
+		min_left = MIN_BUDGET_NS;
+	if (left <= held || left - held < min_left)
+		return false;
+	if (left - held < *slicep)
+		*slicep = left - held;
+	return true;
+}
+
+/*
  * Whether a task of @cgrp which found no free slot may run on credit, without
- * slots: every limited cgroup on the path has budget left in the current
- * window, the smallest of which clips *@slicep. The runtime is charged to the
- * windows, so credit stops once a cgroup used its limit's worth of the window.
+ * slots: every limited cgroup on the path can give credit, see credit_ok(),
+ * the smallest of which clips *@slicep. The runtime is charged to the
+ * windows, and any excess is paid back as debt.
  */
 static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
 {
@@ -791,7 +991,7 @@ static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
 		cgc = find_ancestor_ctx(cgrp, level, &cgid);
 		if (!cgc)
 			return false;
-		if (cgc->limit && !budget_left(cgc, now, slicep))
+		if (cgc->limit && !credit_ok(cgc, now, slicep))
 			return false;
 	}
 	return true;
@@ -896,6 +1096,7 @@ static void park(struct task_struct *p, struct pfs_task_ctx *taskc, u64 cgid,
 
 	cgc = find_cgrp_ctx(wait_cgrp);
 	if (cgc) {
+		wait_begin(taskc, wait_cgrp, window_now());
 		taskc->parking_cgid = cgid;
 		cgc->park_at = window_now();
 		__sync_fetch_and_add(&cgc->nr_parking, 1);
@@ -1011,6 +1212,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			set_admitted(taskc, window_now(), !woken_dsq);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
+				wait_end(taskc, window_now());
 				stat_inc(PFS_STAT_CREDIT);
 				kick_idle_cpu(p);
 			}
@@ -1028,6 +1230,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			set_admitted(taskc, window_now(), !woken_dsq);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
+				wait_end(taskc, window_now());
 				stat_inc(PFS_STAT_LOST_PATH);
 				kick_idle_cpu(p);
 			}
@@ -1060,6 +1263,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, slice);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
+				wait_end(taskc, window_now());
 				stat_inc(PFS_STAT_ADMIT);
 				if (*nr_nokick &&
 				    bpf_cpumask_test_cpu(bpf_get_smp_processor_id(),
@@ -1114,11 +1318,13 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			struct cgroup *fail_cgrp;
 
 			stat_inc(PFS_STAT_REPARK);
+			wait_end(taskc, window_now());
 			fail_cgrp = bpf_cgroup_from_id(fail_cgid);
 			if (!fail_cgrp)
 				continue;
 			fail_cgc = bpf_cgrp_storage_get(&cgrp_ctx, fail_cgrp, 0, 0);
 			if (fail_cgc) {
+				wait_begin(taskc, fail_cgrp, window_now());
 				waitset_add(fail_cgc, fail_cgid);
 				if (ret == RESERVE_BUDGET)
 					queue_budget(fail_cgc, fail_cgid);
@@ -1451,6 +1657,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	release_slots(taskc);
 	park_cancel(taskc);
+	wait_end(taskc, window_now());
 
 	/* release_slots() and retries find the slots through ->cgid */
 	cgrp = scx_bpf_task_cgroup(p);
@@ -1481,9 +1688,10 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * lasts, as do io_uring workers, which never return to user space.
 	 */
 	if (ret != RESERVE_OK) {
-		slice = slice_ns;
+		slice = credit_ns && credit_ns < slice_ns ? credit_ns : slice_ns;
 		if (must_not_park(p) ||
-		    (((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
+		    (credit_ns &&
+		     ((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
 		     credit_left(cgrp, window_now(), &slice))) {
 			stat_inc(PFS_STAT_CREDIT);
 			ret = RESERVE_OK;
@@ -1535,6 +1743,7 @@ static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
 
 		window_left(cgc, now);
 		__sync_fetch_and_add(&cgc->window_used, delta);
+		count_window(cgc, now, cgc->stat.nr_waiting > 0);
 	}
 }
 
@@ -1702,6 +1911,16 @@ void BPF_STRUCT_OPS(pfs_dispatch, s32 cpu, struct task_struct *prev)
 	/* an admitted task which wasn't kicked for may be left over */
 	if (!nr_nokick && scx_bpf_dsq_nr_queued(SHARED_DSQ) > 0)
 		kick_leftover(nokick_pid);
+
+	/*
+	 * A @prev which blocked was charged up to ops.stopping(), which runs
+	 * when it is dequeued, before this. It is still the CPU's current task
+	 * while the retries above run, and with tasks which block often, e.g.
+	 * pipes, that time added up to a quarter of the cgroup's usage, which
+	 * nobody charged. Charge it to @prev.
+	 */
+	if (taskc && nr_limited && !(prev->scx.flags & SCX_TASK_QUEUED))
+		charge_prev(prev, taskc);
 }
 
 void BPF_STRUCT_OPS(pfs_running, struct task_struct *p)
@@ -1709,8 +1928,11 @@ void BPF_STRUCT_OPS(pfs_running, struct task_struct *p)
 	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
-	if (taskc)
+	if (taskc) {
 		taskc->started_at = window_now();
+		/* moved out of a wait DSQ without a walk, e.g. by a drain */
+		wait_end(taskc, taskc->started_at);
+	}
 
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
@@ -1780,10 +2002,24 @@ static bool slots_wanted(struct pfs_task_ctx *taskc, u64 mask, bool woken_only)
 void BPF_STRUCT_OPS(pfs_tick, struct task_struct *p)
 {
 	struct pfs_task_ctx *taskc;
+	struct cgroup *cgrp;
 	u64 mask, held;
 
 	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-	if (!taskc || !taskc->rotated)
+	if (!taskc)
+		return;
+
+	/*
+	 * Charge the runtime as the task runs rather than only when it stops,
+	 * so that credit and the debt see it within a tick, see over_limit().
+	 */
+	if (nr_limited) {
+		cgrp = scx_bpf_task_cgroup(p);
+		charge_task(p, taskc, cgrp, window_now());
+		bpf_cgroup_release(cgrp);
+	}
+
+	if (!taskc->rotated)
 		return;
 
 	mask = taskc->slot_mask & SLOT_LEVELS_MASK;
@@ -1902,8 +2138,10 @@ void BPF_STRUCT_OPS(pfs_quiescent, struct task_struct *p, u64 deq_flags)
 	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
-	if (taskc)
+	if (taskc) {
+		wait_end(taskc, window_now());
 		put_runnable(taskc);
+	}
 }
 
 void BPF_STRUCT_OPS(pfs_enable, struct task_struct *p)
@@ -1919,6 +2157,7 @@ void BPF_STRUCT_OPS(pfs_disable, struct task_struct *p)
 	if (taskc) {
 		release_slots(taskc);
 		park_cancel(taskc);
+		wait_end(taskc, window_now());
 		put_runnable(taskc);
 	}
 }
@@ -1937,6 +2176,7 @@ s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 	taskc->slot_mask = 0;
 	taskc->credit = 0;
 	taskc->parking_cgid = 0;
+	taskc->wait_mask = 0;
 	taskc->run_cgid = 0;
 	taskc->cgid = 0;
 
@@ -1962,8 +2202,9 @@ void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 	if (!taskc)
 		return;
 
-	/* the slots are on @from's path */
+	/* the slots and the waits are on @from's path */
 	release_slots(taskc);
+	wait_end(taskc, window_now());
 	set_task_cgrp(taskc, to);
 }
 
@@ -2146,11 +2387,15 @@ static long rescue_cb(struct bpf_map *map, u64 *key, u8 *val, u64 *now)
 		/* a task may have parked after the test, list it again */
 		if (nr_waiting(cgid))
 			waitset_add(cgc, cgid);
-	} else if ((s64)(*now - cgc->retry_at) > (s64)RESCUE_NS &&
-		   !cgc->retry_running) {
-		stat_inc(PFS_STAT_RESCUE);
-		cgc->retry_queued = 0;
-		queue_retry(cgc, cgid);
+	} else {
+		/* a cgroup whose tasks only wait doesn't charge runtime */
+		count_window(cgc, *now, cgc->stat.nr_waiting > 0);
+		if ((s64)(*now - cgc->retry_at) > (s64)RESCUE_NS &&
+		    !cgc->retry_running) {
+			stat_inc(PFS_STAT_RESCUE);
+			cgc->retry_queued = 0;
+			queue_retry(cgc, cgid);
+		}
 	}
 
 	bpf_cgroup_release(cgrp);

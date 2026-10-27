@@ -106,6 +106,7 @@ neighbour with one busy thread per CPU), `-H` (CSV header).
 | `SCX_ARGS` | empty | extra scx_pfs options, e.g. `-s 2500 -c 500` (options and numbers only) |
 | `SCX_MODE` | `host` | `host` (started by the script), `service` (`systemctl start $SCX_UNIT`), `container` (`scx-container.sh`) |
 | `SCX_LOG`, `SCX_UNIT`, `SCX_CTR` | a new `mktemp` file, `scx_pfs.service`, `scx-pfs` | log, unit and container names |
+| `SCX_STATS` | a new `mktemp` file | file scx_pfs writes its throttling counters to (`-S`, host mode) |
 | `DOCKER`, `IMAGE` | `docker`, `pfs-test:local` | runtime command (Podman, rootless Podman) and image |
 
 scx_pfs itself takes `-s SLICE_US` (2500), `-c CUT_US` (500), `-r ROT_US`
@@ -297,6 +298,7 @@ one, then the latency test at 0.5 and 1 CPU. `summary.txt` gives median
 | `worst_stall_ms`, `stalls_5ms` | Longest pause of one thread, and the number of pauses over 5 ms. |
 | `avg_conc`, `max_conc`, `pct_over_cap` | CPUs running the workload at once (trace; average over the time it ran), and the share of time above the limit rounded up. |
 | `p50_ms`, `p99_ms`, `max_ms` | `reqlat` request latency. |
+| `pfs_nr_throttled`, `pfs_throttled_ms` | scx_pfs's own throttling counters of the cgroup (windows with a waiting thread, and wall time with one), read from its `-S` file when the kit runs scx_pfs itself (`SCX_MODE=host`); `-` otherwise. See the scx_pfs section of `tools/sched_ext/README.md`. |
 
 ## Reading the results
 

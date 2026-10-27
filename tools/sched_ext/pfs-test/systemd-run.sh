@@ -92,7 +92,7 @@ stop_slice() {
 # run_systemd_case VARIANT LIMIT THREADS SECS WORKLOAD NEIGHBOUR MODE PERIOD WEIGHT
 run_systemd_case() {
 	local variant=$1 limit=$2 threads=$3 secs=$4 wl=$5 neigh=$6 mode=$7 period=$8 weight=$9
-	local name noisy props cg out st conc tmp
+	local name noisy props cg out st conc tmp pfs
 	WT_SEQ=$((${WT_SEQ:-0} + 1))
 	name=wt-ctr-$$-$WT_SEQ noisy=wt-noisy-$$-$WT_SEQ
 	tmp=$(mktemp -d)
@@ -115,8 +115,10 @@ run_systemd_case() {
 	log "unit cgroup: ${cg#"$CG_FS"} cpu.max=\"$(cat "$cg/cpu.max")\" cpu.weight=$(cat "$cg/cpu.weight")"
 	# the cgroup goes away with the unit: poll cpu.stat while it runs
 	st=$(cg_stat "$cg")
+	pfs=$(pfs_stat "$cg")
 	while [ -d "$cg" ] && [ -n "$(cat "$cg/cgroup.procs" 2>/dev/null)" ]; do
 		st=$(cg_stat "$cg" 2>/dev/null || echo "$st")
+		pfs=$(pfs_stat "$cg")
 		sleep 0.2
 	done
 	trace_stop "$tmp/trace"
@@ -126,8 +128,8 @@ run_systemd_case() {
 	kill_pids
 	conc=$(conc_of "$wl" "$tmp/trace" "$limit")
 	rm -rf "$tmp"
-	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | conc avg/max/%over: $conc"
-	emit_row "systemd-$mode" "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc"
+	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | scx_pfs nr_throttled/throttled_ms: $pfs | conc avg/max/%over: $conc"
+	emit_row "systemd-$mode" "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc" "$pfs"
 }
 
 systemd_main() {

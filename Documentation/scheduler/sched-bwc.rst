@@ -146,6 +146,22 @@ after running the group's tasks for the slice per task, so that the CPUs
 take turns. Limits apply at every level of the hierarchy. cpu.cfs_burst_us
 is ignored in width mode, and nr_periods and nr_throttled count windows.
 
+The sysctl is global and only root of the initial namespaces can change it,
+but whoever may write a group's cpu.max, e.g. the owner of a delegated
+subtree for the groups below its root, puts that group into the mode the
+sysctl has at that time. After a change, groups thus end up in mixed modes
+as their limits are written. Set the sysctl before limits are configured,
+or write the limits of all groups again after changing it.
+
+A throttled task keeps running until it returns to user space, so a slot
+alone doesn't bound the time a group spends in the kernel, e.g. in long reads
+of /dev/urandom or in pipe writes. Width mode therefore charges all runtime
+of the group, with or without a slot, and carries the usage beyond L over as
+debt, up to what L allows in one second. While the debt is above a margin of
+one window's budget plus a tick per slot, no slot is handed out, so that the
+group pays it back by running below its limit. Such loads average at the
+limit, as with bandwidth control, but in throttled stretches.
+
 Width mode is meant for multi-threaded groups (request handlers, databases,
 garbage-collected runtimes) whose threads would otherwise run on many CPUs
 for part of a period and then all wait for the next one. It needs
