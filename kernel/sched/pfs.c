@@ -934,31 +934,52 @@ static void pfs_group_retry(struct pfs_group *g);
  * Start @lg's timer for the next window, for tasks waiting for budget, or
  * after @delay if it is non-zero and earlier (at least PFS_MIN_BUDGET_NS),
  * for tasks waiting for the group to pay back runtime beyond its limit.
+ *
+ * Tasks of the group reserve slots on many CPUs at once, so the timer is
+ * started under @lg->lock, as CFS bandwidth control starts its period timer
+ * under cfs_b->lock: concurrent hrtimer_start() calls on one timer from
+ * several CPUs race inside the hrtimer code on the timer's base, and each
+ * would move the pinned timer to its own CPU. Once armed, it is only started
+ * again to bring it forward, so the common case takes no lock.
  */
 static void pfs_arm_window_timer(struct pfs_group *lg, u64 now, u64 delay)
 {
 	u64 next, w = pfs_window();
+	unsigned long flags;
+
+	if (!delay && READ_ONCE(lg->timer_armed))
+		return;
 
 	if (!now)
 		now = pfs_now();
 	next = pfs_window_start(now, w) + w;
-	if (delay)
+	if (delay) {
 		next = min(next, now + max_t(u64, delay, PFS_MIN_BUDGET_NS));
-
-	if (atomic_cmpxchg(&lg->timer_armed, 0, 1)) {
-		/* armed already, bring it forward if needed */
-		if (!delay || ktime_before(hrtimer_get_expires(&lg->window_timer),
-					   ns_to_ktime(next)))
+		if (READ_ONCE(lg->timer_armed) &&
+		    READ_ONCE(lg->timer_expires) <= next)
 			return;
 	}
-	hrtimer_start(&lg->window_timer, ns_to_ktime(next), HRTIMER_MODE_ABS_PINNED_HARD);
+
+	raw_spin_lock_irqsave(&lg->lock, flags);
+	if (!lg->timer_armed || next < lg->timer_expires) {
+		WRITE_ONCE(lg->timer_armed, true);
+		WRITE_ONCE(lg->timer_expires, next);
+		hrtimer_start(&lg->window_timer, ns_to_ktime(next),
+			      HRTIMER_MODE_ABS_PINNED_HARD);
+	}
+	raw_spin_unlock_irqrestore(&lg->lock, flags);
 }
 
 static enum hrtimer_restart pfs_window_timer_fn(struct hrtimer *timer)
 {
 	struct pfs_group *lg = container_of(timer, struct pfs_group, window_timer);
 
-	atomic_set(&lg->timer_armed, 0);
+	raw_spin_lock(&lg->lock);
+	/* not if it was started again while this ran */
+	if (!hrtimer_is_queued(timer))
+		WRITE_ONCE(lg->timer_armed, false);
+	raw_spin_unlock(&lg->lock);
+
 	pfs_group_retry(lg);
 	return HRTIMER_NORESTART;
 }

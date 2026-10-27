@@ -495,7 +495,7 @@ struct cfs_bandwidth {
 
 /* Per task group state. */
 struct pfs_group {
-	/* protects ->waiters and ->nr_waiting */
+	/* protects ->waiters, ->nr_waiting and the window timer's state */
 	raw_spinlock_t		lock;
 	/* FIFO of tasks waiting for a slot at this level */
 	struct list_head	waiters;
@@ -514,8 +514,10 @@ struct pfs_group {
 	/* budget of the fractional slot */
 	atomic64_t		window_start;
 	atomic64_t		window_used;
+	/* the window timer, started under ->lock, see pfs_arm_window_timer() */
 	struct hrtimer		window_timer;
-	atomic_t		timer_armed;
+	u64			timer_expires;
+	bool			timer_armed;
 	/* admits waiting tasks when slots were freed without a hand-off */
 	struct irq_work		retry_work;
 

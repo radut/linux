@@ -465,6 +465,12 @@ Lock order::
 - Slot counts are atomics, taken with increment-and-check and given back with
   a decrement. A task's slot mask, state and group are protected by its run
   queue lock.
+- The window timer of a group is started under ``pfs_group::lock``, as CFS
+  bandwidth control starts its period timer under ``cfs_bandwidth::lock``:
+  tasks of the group reserve slots on many CPUs at once, and concurrent
+  ``hrtimer_start()`` calls on one timer race on the timer's base and move
+  the pinned timer from CPU to CPU. Once armed, the timer is only started
+  again to bring it forward, which keeps the lock out of the common case.
 - Lost wake-ups between a parking task and a releasing task are prevented as
   with wait queues: the parking side adds itself to the queue, then
   (``smp_mb()``) checks for a free slot and starts a retry if there is one;
