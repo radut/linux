@@ -571,7 +571,15 @@ class' sched domain balancer is not used.
   least two more admitted tasks, or two tasks and a load more than twice as
   high (the same with equal weights): a slot holder of a limited group,
   which carries the group's weight, then gets a CPU of its own next to the
-  light tasks of an unlimited neighbour.
+  light tasks of an unlimited neighbour. The task running the balancer is
+  not counted in its CPU's load if it is ``ksoftirqd``, which runs
+  ``SCHED_SOFTIRQ`` with ``CONFIG_PREEMPT_RT`` (and otherwise under softirq
+  load): a nice-0 task of the root group often weighs more than all the
+  tasks of weighted pods on its CPU together, and counted in, it hid every
+  imbalance, so that tasks stayed where fork put them: with
+  ``CONFIG_PREEMPT_RT``, two pods with weights 1:3 got a ratio of 1.5
+  instead of 3.0, and a group limited to 2 CPUs next to busy neighbours got
+  1.5-1.7 CPUs (now 3.0 and 1.85-1.9).
 - Newly idle pull (``pick_task`` with an empty tree): pull a queued, not
   running, allowed task from the busiest CPU (by queued count), searching the
   LLC first. As in the fair class, a CPU whose idle periods are usually

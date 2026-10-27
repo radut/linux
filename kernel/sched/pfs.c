@@ -3029,6 +3029,34 @@ static int pfs_detach_attach(struct rq *this_rq, struct rq *src, long imbalance)
 	return moved;
 }
 
+/*
+ * The load and the number of admitted tasks of this CPU, without the task
+ * that runs the balancer. That is the interrupted task, which belongs to the
+ * load, unless SCHED_SOFTIRQ runs in ksoftirqd: always with PREEMPT_RT,
+ * which runs every softirq raised by the tick there, otherwise under softirq
+ * load. ksoftirqd is a nice-0 task of the root group, whose weight is often
+ * larger than the load of all the tasks of limited or weighted groups on the
+ * CPU together (their groups' weights are shared by their admitted tasks):
+ * counted in, it hides every imbalance from this CPU, which then never
+ * pulls.
+ */
+static void pfs_balance_this_load(struct rq *this_rq, unsigned long *load,
+				  unsigned long *nr)
+{
+	struct task_struct *curr = current;
+	unsigned long w;
+
+	*load = READ_ONCE(this_rq->pfs.load);
+	*nr = READ_ONCE(this_rq->pfs.nr_queued);
+	if (curr != this_cpu_ksoftirqd() || curr->sched_class != &pfs_sched_class ||
+	    curr->pfs.state != PFS_QUEUED)
+		return;
+	/* the tick may reweight it meanwhile, the loads are approximate */
+	w = data_race(curr->pfs.weight.weight);
+	*load -= min(*load, w);
+	*nr -= min(*nr, 1UL);
+}
+
 static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 {
 	unsigned long this_load, busiest_load, this_nr, busiest_nr;
@@ -3039,7 +3067,7 @@ static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 	busiest = pfs_find_busiest_load(this_rq, span, &busiest_load);
 	if (!busiest)
 		return;
-	this_load = READ_ONCE(this_rq->pfs.load);
+	pfs_balance_this_load(this_rq, &this_load, &this_nr);
 	if (busiest_load * 100 <= this_load * PFS_IMBALANCE_PCT)
 		return;
 	/*
@@ -3052,7 +3080,6 @@ static void pfs_balance_one(struct rq *this_rq, const struct cpumask *span)
 	 * carries its group's weight) get a CPU of its own instead of sharing
 	 * one with light tasks.
 	 */
-	this_nr = READ_ONCE(this_rq->pfs.nr_queued);
 	busiest_nr = READ_ONCE(busiest->pfs.nr_queued);
 	if (!(pfs_feat(PFS_F_BALANCE_COUNT) && busiest_nr >= this_nr + 2) &&
 	    !(pfs_feat(PFS_F_BALANCE_WEIGHT) && busiest_nr >= 2 &&
