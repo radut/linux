@@ -552,7 +552,13 @@ Admitted tasks leave a CPU going offline through the core's ``balance_push``
 like tasks of other classes. Waiting tasks whose ``task_cpu()`` is the dying
 CPU are moved to an active CPU of their affinity mask in
 ``sched_cpu_dying()`` and admitted there or parked again. Admission never puts
-a task on the tree of an inactive CPU.
+a task on the tree of an inactive CPU. The dying CPU has flushed its
+``irq_work`` by then, so retries that moving the waiting tasks starts are
+queued on an active CPU instead.
+
+When a cgroup is removed, its group's window timer is cancelled and its retry
+``irq_work`` synchronised from ``css_free``, which may sleep, before the
+task group is freed after an RCU grace period.
 
 
 Shared and forked code

@@ -2013,6 +2013,7 @@ DECLARE_STATIC_KEY_FALSE(__pfs_enabled);	/* booted with sched_pfs=1 */
 extern bool pfs_init_rq(struct rq *rq);
 extern void pfs_init_entity(struct task_struct *p);
 extern void pfs_init_group(struct task_group *tg, struct task_group *parent);
+extern void pfs_offline_group(struct task_group *tg);
 extern void pfs_free_group(struct task_group *tg);
 extern void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 				    u64 quota_us, u64 burst_us);
@@ -2029,6 +2030,7 @@ extern void pfs_balance_softirq(void);
 static inline bool pfs_init_rq(struct rq *rq) { return false; }
 static inline void pfs_init_entity(struct task_struct *p) { }
 static inline void pfs_init_group(struct task_group *tg, struct task_group *parent) { }
+static inline void pfs_offline_group(struct task_group *tg) { }
 static inline void pfs_free_group(struct task_group *tg) { }
 static inline void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 					   u64 quota_us, u64 burst_us) { }

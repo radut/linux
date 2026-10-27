@@ -905,10 +905,24 @@ static void pfs_retry_workfn(struct irq_work *work)
 	pfs_group_retry(container_of(work, struct pfs_group, retry_work));
 }
 
-/* Admit @lg's waiting tasks soon, from a context without run queue locks. */
+/*
+ * Admit @lg's waiting tasks soon, from a context without run queue locks. A
+ * CPU going offline has flushed its irq_work already when it moves its
+ * waiting tasks away (sched_cpu_dying()), and a hard irq_work queued there
+ * would stay pending until the CPU comes back, so that no retry of the group
+ * could be queued anymore: use an active CPU instead.
+ */
 static void pfs_queue_retry(struct pfs_group *lg)
 {
-	irq_work_queue(&lg->retry_work);
+	int cpu = raw_smp_processor_id();
+
+	if (likely(cpu_active(cpu))) {
+		irq_work_queue(&lg->retry_work);
+		return;
+	}
+	cpu = cpumask_any_but(cpu_active_mask, cpu);
+	if (cpu < nr_cpu_ids)
+		irq_work_queue_on(&lg->retry_work, cpu);
 }
 
 static DEFINE_PER_CPU(struct cpumask, pfs_kick_mask);
@@ -933,6 +947,9 @@ static DEFINE_PER_CPU(struct irq_work, pfs_kick_work) =
  */
 static void pfs_kick_cpu(int cpu)
 {
+	/* not from a CPU going offline, see pfs_queue_retry() */
+	if (unlikely(!cpu_active(smp_processor_id())))
+		return;
 	pfs_stat(PFS_STAT_KICK);
 	cpumask_set_cpu(cpu, this_cpu_ptr(&pfs_kick_mask));
 	irq_work_queue(this_cpu_ptr(&pfs_kick_work));
@@ -3094,20 +3111,38 @@ void pfs_init_group(struct task_group *tg, struct task_group *parent)
 	g->retry_work = IRQ_WORK_INIT_HARD(pfs_retry_workfn);
 }
 
+/*
+ * A cgroup's task group is going away (css_free, which may sleep): it has no
+ * tasks left in its subtree and its files are gone, so nothing arms its
+ * timer or queues its retry anymore. Wait for those still in flight.
+ */
+void pfs_offline_group(struct task_group *tg)
+{
+	struct pfs_group *g = &tg->pfs;
+
+	if (!pfs_enabled())
+		return;
+	hrtimer_cancel(&g->window_timer);
+	irq_work_sync(&g->retry_work);
+}
+
+/*
+ * Called from an RCU callback. Cgroups went through pfs_offline_group();
+ * autogroups have no cpu.max, so their timer and retry are never used.
+ */
 void pfs_free_group(struct task_group *tg)
 {
 	struct pfs_group *g = &tg->pfs;
 
 	if (g->limit)
 		atomic_dec(&pfs_nr_limited);
-	hrtimer_cancel(&g->window_timer);
-	/*
-	 * Called from an RCU callback, irq_work_sync() may sleep. The group
-	 * has no tasks left, so no retry can be queued anymore; wait for one
-	 * that may still run, it is a hard irq_work.
-	 */
-	while (irq_work_is_busy(&g->retry_work))
-		cpu_relax();
+	if (WARN_ON_ONCE(hrtimer_active(&g->window_timer)))
+		hrtimer_cancel(&g->window_timer);
+	/* can't sleep here; irq_work isn't stranded, see pfs_queue_retry() */
+	if (WARN_ON_ONCE(irq_work_is_busy(&g->retry_work))) {
+		while (irq_work_is_busy(&g->retry_work))
+			cpu_relax();
+	}
 	WARN_ON_ONCE(!list_empty(&g->waiters) || !list_empty(&g->wake_waiters));
 }
 
