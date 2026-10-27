@@ -43,7 +43,7 @@ EOF
 # run_docker_case VARIANT LIMIT THREADS SECS WORKLOAD NEIGHBOUR PERIOD SHARES
 run_docker_case() {
 	local variant=$1 limit=$2 threads=$3 secs=$4 wl=$5 neigh=$6 period=$7 shares=$8
-	local name noisy cg out st conc tmp c cpuopt=()
+	local name noisy cg out st conc tmp c pfs cpuopt=()
 	# fresh names per case: Podman frees a name only once removal completes
 	WT_SEQ=$((${WT_SEQ:-0} + 1))
 	name=wt-ctr-$$-$WT_SEQ noisy=wt-noisy-$$-$WT_SEQ
@@ -72,8 +72,10 @@ run_docker_case() {
 	log "container cgroup: ${cg#"$CG_FS"} cpu.max=\"$(cat "$cg/cpu.max")\" cpu.weight=$(cat "$cg/cpu.weight")"
 	# poll cpu.stat while running: the cgroup goes away with the container
 	st=$(cg_stat "$cg")
+	pfs=$(pfs_stat "$cg")
 	while [ "$($DOCKER inspect -f '{{.State.Running}}' "$name")" = true ]; do
 		st=$(cg_stat "$cg" 2>/dev/null || echo "$st")
+		pfs=$(pfs_stat "$cg")
 		sleep 0.2
 	done
 	trace_stop "$tmp/trace"
@@ -83,8 +85,8 @@ run_docker_case() {
 	done
 	conc=$(conc_of "$wl" "$tmp/trace" "$limit")
 	rm -rf "$tmp"
-	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | conc avg/max/%over: $conc"
-	emit_row "$(runtime_label)" "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc"
+	log "$variant limit=$limit threads=$threads neigh=$neigh: $out | cpu.stat nr_throttled/throttled_ms/usage_ms: $st | scx_pfs nr_throttled/throttled_ms: $pfs | conc avg/max/%over: $conc"
+	emit_row "$(runtime_label)" "$variant" "$limit" "$threads" "$neigh" "$secs" "$wl" "$out" "$st" "$conc" "$pfs"
 }
 
 docker_main() {

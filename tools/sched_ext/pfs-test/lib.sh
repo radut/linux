@@ -11,6 +11,8 @@
 #   SCX        path to the scx_pfs binary (default: search, see find_scx)
 #   SCX_ARGS   extra scx_pfs options, e.g. "-s 2500 -w 10000"
 #   SCX_LOG    file for scx_pfs's output (default: a new mktemp file)
+#   SCX_STATS  file scx_pfs writes its per-cgroup throttling counters to (-S, host
+#              mode only; default: a new mktemp file)
 #   WT_CG      cgroup directory name under /sys/fs/cgroup (default pfs-test)
 #   WT_TRACE   0 disables the sched_switch trace (no concurrency columns)
 
@@ -21,7 +23,7 @@ TRACEFS=/sys/kernel/tracing
 SCX_STATE=/sys/kernel/sched_ext/state
 KW_SYSCTL=/proc/sys/kernel/sched_cfs_bandwidth_width
 PERIOD_US=${PERIOD_US:-100000}
-CSV_HEADER="path,variant,limit,threads,neighbours,secs,miter_s,nr_throttled,throttled_ms,worst_stall_ms,stalls_5ms,avg_conc,max_conc,pct_over_cap,p50_ms,p99_ms,max_ms"
+CSV_HEADER="path,variant,limit,threads,neighbours,secs,miter_s,nr_throttled,throttled_ms,worst_stall_ms,stalls_5ms,avg_conc,max_conc,pct_over_cap,p50_ms,p99_ms,max_ms,pfs_nr_throttled,pfs_throttled_ms"
 
 WT_PIDS=()
 SCX_PID=
@@ -65,6 +67,14 @@ scx_log() {
 		SCX_LOG=$(mktemp "${TMPDIR:-/tmp}/scx_pfs.XXXXXXXX") || die "mktemp failed"
 	fi
 	echo "$SCX_LOG"
+}
+
+# scx_stats: the file scx_pfs writes its throttling counters to, see pfs_stat
+scx_stats() {
+	if [ -z "${SCX_STATS:-}" ]; then
+		SCX_STATS=$(mktemp "${TMPDIR:-/tmp}/scx_pfs_stats.XXXXXXXX") || die "mktemp failed"
+	fi
+	echo "$SCX_STATS"
 }
 
 need_root() {
@@ -139,7 +149,8 @@ scx_start() {
 		bin=$(find_scx) || die "scx_pfs binary not found (set SCX=/path/to/scx_pfs)"
 		scx_args
 		scx_log > /dev/null
-		"$bin" "${SCX_ARGV[@]}" -i 3600 > "$SCX_LOG" 2>&1 &
+		scx_stats > /dev/null
+		"$bin" "${SCX_ARGV[@]}" -i 3600 -S "$SCX_STATS" > "$SCX_LOG" 2>&1 &
 		SCX_PID=$!
 		wait_scx_enabled || { cat "$SCX_LOG" >&2; die "scx_pfs did not enable"; }
 		log "scx_pfs output in $SCX_LOG"
@@ -261,6 +272,19 @@ cg_exec() {
 cg_stat() {
 	awk '/^nr_throttled/ {n = $2} /^throttled_usec/ {t = $2} /^usage_usec/ {u = $2}
 	     END { printf "%d %.1f %.1f\n", n, t / 1000, u / 1000 }' "$1/cpu.stat"
+}
+
+# scx_pfs's throttling counters of DIR as "nr_throttled throttled_ms", "- -"
+# without them (other variants, scx_pfs not run by this script). The file is
+# rewritten every second.
+pfs_stat() {
+	local f=${SCX_STATS:-}
+	if [ -z "${SCX_PID:-}" ] || [ ! -s "$f" ]; then
+		echo "- -"
+		return
+	fi
+	awk -v p="${1#"$CG_FS"}" '$1 == p { n = $5; t = $7 }
+	     END { if (n == "") print "0 0.0"; else printf "%d %.1f\n", n, t / 1000 }' "$f"
 }
 
 # --- tracing ---------------------------------------------------------------
