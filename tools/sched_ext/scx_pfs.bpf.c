@@ -167,6 +167,8 @@ enum {
 #define HWEIGHT_REFRESH_NS	(1000 * 1000LLU)
 /* a waiting cgroup not walked by any retry for this long is retried */
 #define RESCUE_NS		(50 * 1000 * 1000LLU)
+/* bounds the retries which wait for a park to land, see retry_cgroup() */
+#define PARK_LAND_NS		(10 * 1000 * 1000LLU)
 
 _Static_assert(MAX_LEVELS <= SLOT_SEQ_SHIFT, "level bits overlap the sequence");
 
@@ -217,6 +219,8 @@ struct pfs_cgrp_ctx {
 	u32		in_waitset;	/* listed in waitset */
 	u32		no_dsq;		/* wait DSQs not created, never limited */
 	u32		lost;		/* a queue or waitset was full, see mark_lost() */
+	s32		nr_parking;	/* parks not yet seen by a walk, see park() */
+	u64		park_at;	/* when a task last parked here */
 	u64		retry_at;	/* when a retry last walked the DSQs */
 	u64		window_id;
 	u64		window_used;	/* runtime charged in window_id */
@@ -249,6 +253,7 @@ struct pfs_task_ctx {
 	u64		admitted_at;	/* when the slots were taken */
 	u32		rotated;	/* admitted after a rotation, not a wakeup */
 	u32		credit;		/* runs on credit since a wakeup */
+	u64		parking_cgid;	/* parked there, not yet seen by a walk */
 	/*
 	 * IDs of the cgroups on cgid's path by level, set with ->cgid. Slots
 	 * are given back through them: the cgroup of an exiting task can be
@@ -816,13 +821,51 @@ static void set_admitted(struct pfs_task_ctx *taskc, u64 now, bool rotated)
 }
 
 /*
+ * A task parked by ops.enqueue() only lands in the wait DSQ after the op
+ * returns: the kernel carries out the insertion then. A retry which runs on
+ * another CPU in between finds the DSQ empty while the slots may already be
+ * free, and nobody would queue another retry. park() counts the task in
+ * ->nr_parking of the cgroup until a walk sees it in the DSQ, see
+ * park_landed(), or it leaves the DSQ otherwise, see park_cancel(), and
+ * retry_cgroup() queues the retry again while parks are in flight.
+ */
+static void park_landed(struct pfs_task_ctx *taskc, struct pfs_cgrp_ctx *cgc,
+			u64 cgid)
+{
+	if (taskc->parking_cgid == cgid &&
+	    __sync_val_compare_and_swap(&taskc->parking_cgid, cgid, 0) == cgid)
+		__sync_fetch_and_sub(&cgc->nr_parking, 1);
+}
+
+static void park_cancel(struct pfs_task_ctx *taskc)
+{
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+	u64 cgid;
+
+	if (!taskc->parking_cgid)
+		return;
+	cgid = __sync_lock_test_and_set(&taskc->parking_cgid, 0);
+	if (!cgid)
+		return;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp)
+		return;
+	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+	if (cgc)
+		__sync_fetch_and_sub(&cgc->nr_parking, 1);
+	bpf_cgroup_release(cgrp);
+}
+
+/*
  * Wait in @cgid's DSQ for the woken (@woken) or the rotated tasks. Tasks
  * which woke up and found no free slot are admitted first, see
  * retry_cgroup(): they are typically request threads or the holders of what
  * other threads spin or sleep for, while rotated tasks used up their slice.
  */
-static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
-		 u64 vtime, u64 enq_flags, bool woken)
+static void park(struct task_struct *p, struct pfs_task_ctx *taskc, u64 cgid,
+		 enum reserve_result ret, u64 vtime, u64 enq_flags, bool woken)
 {
 	struct pfs_cgrp_ctx *cgc;
 	struct cgroup *wait_cgrp;
@@ -850,12 +893,19 @@ static void park(struct task_struct *p, u64 cgid, enum reserve_result ret,
 	 */
 	if (woken)
 		stat_inc(PFS_STAT_PARK_WOKEN);
+
+	cgc = find_cgrp_ctx(wait_cgrp);
+	if (cgc) {
+		taskc->parking_cgid = cgid;
+		cgc->park_at = window_now();
+		__sync_fetch_and_add(&cgc->nr_parking, 1);
+	}
+
 	scx_bpf_task_set_dsq_vtime(p, vtime);
 	scx_bpf_dsq_insert(p, woken ? cgid | WOKEN_DSQ : cgid, slice_ns,
 			   enq_flags & ~(SCX_ENQ_HEAD | SCX_ENQ_PREEMPT |
 					 SCX_ENQ_PREEMPT_LAZY));
 
-	cgc = find_cgrp_ctx(wait_cgrp);
 	if (cgc) {
 		waitset_add(cgc, cgid);
 		/*
@@ -954,6 +1004,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			res = WK_MORE;
 			break;
 		}
+		park_landed(taskc, cgc, cgid);
 
 		/* e.g. SIGKILL arrived while @p waited, let it run on credit */
 		if (must_not_park(p)) {
@@ -1143,10 +1194,16 @@ static void retry_cgroup(u64 cgid, u32 *nr_nokick, s32 *nokick_pid)
 	/* paired with the cmpxchg above, fully ordered */
 	__sync_lock_test_and_set(&cgc->retry_running, 0);
 
-	if (res == WK_MORE)
+	if (res == WK_MORE) {
 		queue_retry(cgc, cgid);
-	else if (res == WK_BUDGET)
+	} else if (res == WK_BUDGET) {
 		queue_budget(cgc, cgid);
+	} else if (res == WK_EMPTY && READ_ONCE(cgc->nr_parking) > 0 &&
+		   window_now() - READ_ONCE(cgc->park_at) < PARK_LAND_NS) {
+		/* a task is about to land in the DSQ, see park_landed() */
+		stat_inc(PFS_STAT_PARK_RACE);
+		queue_retry(cgc, cgid);
+	}
 
 out_release:
 	bpf_cgroup_release(cgrp);
@@ -1390,9 +1447,10 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * @p may have been admitted and then dequeued without running, e.g.
-	 * for an attribute change. Start over.
+	 * for an attribute change, or dequeued while it waited. Start over.
 	 */
 	release_slots(taskc);
+	park_cancel(taskc);
 
 	/* release_slots() and retries find the slots through ->cgid */
 	cgrp = scx_bpf_task_cgroup(p);
@@ -1447,7 +1505,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 			scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, slice, vtime,
 						 enq_flags);
 	} else {
-		park(p, fail_cgid, ret, vtime, enq_flags, woken);
+		park(p, taskc, fail_cgid, ret, vtime, enq_flags, woken);
 		/* run a dispatch cycle on the CPU to admit a waiting task */
 		if (enq_flags & SCX_ENQ_LAST)
 			scx_bpf_kick_cpu(scx_bpf_task_cpu(p), 0);
@@ -1860,6 +1918,7 @@ void BPF_STRUCT_OPS(pfs_disable, struct task_struct *p)
 	taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
 	if (taskc) {
 		release_slots(taskc);
+		park_cancel(taskc);
 		put_runnable(taskc);
 	}
 }
@@ -1877,6 +1936,7 @@ s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 
 	taskc->slot_mask = 0;
 	taskc->credit = 0;
+	taskc->parking_cgid = 0;
 	taskc->run_cgid = 0;
 	taskc->cgid = 0;
 
@@ -1982,9 +2042,11 @@ static void drain_destroy_dsq(u64 dsq_id)
 
 	bpf_for_each(scx_dsq, p, dsq_id, 0) {
 		taskc = bpf_task_storage_get(&task_ctx, p, 0, 0);
-		if (taskc)
+		if (taskc) {
+			taskc->parking_cgid = 0;
 			set_admitted(taskc, window_now(),
 				     !(dsq_id & WOKEN_DSQ));
+		}
 		if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p, SHARED_DSQ,
 					   0)) {
 			stat_inc(PFS_STAT_DRAIN);
