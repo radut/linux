@@ -317,6 +317,33 @@ one, then the latency test at 0.5 and 1 CPU. `summary.txt` gives median
 - `/sys/kernel/sched_ext/state` is `enabled` while scx_pfs runs;
   `/sys/kernel/sched_ext/root/ops` names it.
 
+## Legend
+
+Short names used in the results tables:
+
+| Term | Meaning |
+|------|---------|
+| CFS, `cfs` | Stock Linux fair scheduler (EEVDF since 6.6) with CFS bandwidth control: `cpu.max` as a time quota per 100 ms period. On a `sched_pfs=1` boot the `cfs` variant measures kPFS. |
+| CFS (7.0), CFS (7.3) | Stock CFS on kernel 7.0 / 7.3. kwidth and kPFS run on 7.3, so compare them with CFS (7.3). |
+| scx_pfs, `scx` | The sched_ext (BPF) version of the policy (`tools/sched_ext/scx_pfs.bpf.c`). |
+| kPFS | The Parallel Fair Scheduler kernel class (`kernel/sched/pfs.c`), booted with `sched_pfs=1`. kPFS* / kPFS (final): see the notes under each table. |
+| kwidth, `kwidth` | The first in-kernel variant, a width mode inside CFS bandwidth control; kept for comparison. |
+| limit N | `cpu.max` quota / period = N CPUs. |
+| slot | Permission for one thread of the group to run on a CPU. Limit N gives floor(N) slots, plus one budget slot (a time budget per 10 ms window) for a fractional part. |
+| N × T | Limit N CPUs, T threads. |
+| none, noisy, heavy | Neighbour: nothing else; an unlimited busy group; two unlimited 16-thread spinners plus 20 limited pods. |
+| L1-L18, K1-K7, C1-C20 | Row numbers, referred to under "Reproducing the numbers". |
+| tps | Transactions per second. pgbench TPC-B-like: 5 statements; select-only: 1 `SELECT`; sysbench `oltp_read_write`: 18 queries. |
+| ops/s, events/s, req/s | Operations, probe events or requests per second. |
+| M iterations/s | Millions of `spin` loop iterations per second. |
+| p50, p99, p99.9, max | Latency percentiles and the worst value. |
+| CPUs used | From `cpu.stat` usage, or from a `sched_switch` trace (`conc.py`). Target: the limit. |
+| worst stall | Longest pause of one runnable thread. |
+| `nr_throttled`, `throttled_usec` | From `cpu.stat`: periods throttled, and throttled time summed over CPUs. |
+| ↑, ↓, target | Higher is better, lower is better, should equal the given value. |
+| 8-vCPU local VM | virtme / QEMU virtual machine, one variant per boot. |
+| 16-vCPU VM, 4-vCPU reference | Kubernetes node with the limited pods; a node running the same workload without a limit under CFS. |
+
 ## Results
 
 Direction: ↑ higher is better, ↓ lower is better, "target" means the value
