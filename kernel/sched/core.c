@@ -4684,8 +4684,8 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 	init_scx_entity(&p->scx);
-	pfs_init_entity(p);
 #endif
+	pfs_init_entity(p);
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
@@ -8992,10 +8992,10 @@ void __init sched_init(void)
 
 	root_task_group.shares = ROOT_TASK_GROUP_LOAD;
 	init_cfs_bandwidth(&root_task_group.cfs_bandwidth, NULL);
+	pfs_init_group(&root_task_group, NULL);
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 #ifdef CONFIG_EXT_GROUP_SCHED
 	scx_tg_init(&root_task_group);
-	pfs_init_group(&root_task_group, NULL);
 #endif /* CONFIG_EXT_GROUP_SCHED */
 #ifdef CONFIG_RT_GROUP_SCHED
 	ptr += 2 * nr_cpu_ids * sizeof(void **);
