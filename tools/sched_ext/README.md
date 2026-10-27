@@ -217,7 +217,7 @@ latency although the average usage is below the limit.
 ### Options
 
 ```
-scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i SECS] [-v]
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-v]
 ```
 
 | Option | Default | Meaning |
@@ -226,6 +226,7 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i SECS] [-v]
 | `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
 | `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
 | `-w` | 10000 | Accounting window for fractional limits (minimum 1000). |
+| `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
 | `-i` | 1 | Interval of the counter report, in seconds. |
 
 `-s` takes 100 to 1000000 us, `-c` and `-r` at most 1000000 us, `-w` 1000

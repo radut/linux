@@ -192,6 +192,12 @@ static u64 nr_limited;
 /* entries in budget_q, bounds the timer's pass to the ones queued before it */
 static u64 nr_budget_q;
 
+/* cgroups marked lost since the last rescue_lost(), see mark_lost() */
+static u64 nr_lost;
+
+/* the root cgroup, where rescue_lost() starts */
+static u64 root_cgid;
+
 /* bumped when the active cgroups or a weight change, expires the hweights */
 static u64 hweight_gen = 1;
 
@@ -210,6 +216,7 @@ struct pfs_cgrp_ctx {
 	u32		woken_streak;	/* woken tasks admitted in a row */
 	u32		in_waitset;	/* listed in waitset */
 	u32		no_dsq;		/* wait DSQs not created, never limited */
+	u32		lost;		/* a queue or waitset was full, see mark_lost() */
 	u64		retry_at;	/* when a retry last walked the DSQs */
 	u64		window_id;
 	u64		window_used;	/* runtime charged in window_id */
@@ -257,27 +264,30 @@ struct {
 	__type(value, struct pfs_task_ctx);
 } task_ctx SEC(".maps");
 
-/* cgroups whose waiting tasks may be admittable now */
+/*
+ * The cgroup queues and the waitset hold each cgroup at most once. User space
+ * sizes them (-q, NR_CGRP_Q by default). A cgroup which doesn't fit is marked
+ * lost and found again by the timer, see rescue_lost().
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_QUEUE);
-	__uint(max_entries, 16384);
+	__uint(max_entries, NR_CGRP_Q);
 	__type(value, u64);
-} retry_q SEC(".maps");
+} retry_q SEC(".maps");	/* cgroups whose waiting tasks may be admittable */
 
-/* cgroups which had waiting tasks, swept by the timer, see rescue_cb() */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 16384);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, NR_CGRP_Q);
 	__type(key, u64);
 	__type(value, u8);
-} waitset SEC(".maps");
+} waitset SEC(".maps");	/* cgroups which had waiting tasks, see rescue_cb() */
 
-/* cgroups whose waiting tasks need the next window's budget */
 struct {
 	__uint(type, BPF_MAP_TYPE_QUEUE);
-	__uint(max_entries, 16384);
+	__uint(max_entries, NR_CGRP_Q);
 	__type(value, u64);
-} budget_q SEC(".maps");
+} budget_q SEC(".maps");	/* cgroups waiting for the next window's budget */
 
 struct pfs_timer {
 	struct bpf_timer	timer;
@@ -369,17 +379,29 @@ static u32 nr_waiting(u64 cgid)
 	return (rotated > 0 ? rotated : 0) + (woken > 0 ? woken : 0);
 }
 
+/*
+ * A retry or budget wait of the cgroup of @cgc couldn't be queued, or the
+ * cgroup couldn't be listed in waitset: more cgroups than the maps hold, e.g.
+ * in a delegated subtree. Its waiting tasks would stall until the sched_ext
+ * watchdog ejects the scheduler. Mark the cgroup for rescue_lost() instead,
+ * which the timer runs within a window.
+ */
+static void mark_lost(struct pfs_cgrp_ctx *cgc)
+{
+	stat_inc(PFS_STAT_RETRY_OVERFLOW);
+	cgc->lost = 1;
+	__sync_fetch_and_add(&nr_lost, 1);
+}
+
 static bool queue_retry(struct pfs_cgrp_ctx *cgc, u64 cgid)
 {
 	/* paired with the clearing in retry_cgroup() */
 	if (__sync_val_compare_and_swap(&cgc->retry_queued, 0, 1))
 		return false;
 
-	/* a lost retry can stall the cgroup's waiting tasks forever */
 	if (bpf_map_push_elem(&retry_q, &cgid, 0)) {
 		cgc->retry_queued = 0;
-		stat_inc(PFS_STAT_RETRY_OVERFLOW);
-		scx_bpf_error("retry_q overflow for cgid %llu", cgid);
+		mark_lost(cgc);
 		return false;
 	}
 	return true;
@@ -414,8 +436,10 @@ static void waitset_add(struct pfs_cgrp_ctx *cgc, u64 cgid)
 	if (cgc->in_waitset ||
 	    __sync_val_compare_and_swap(&cgc->in_waitset, 0, 1))
 		return;
-	if (bpf_map_update_elem(&waitset, &cgid, &one, BPF_ANY))
+	if (bpf_map_update_elem(&waitset, &cgid, &one, BPF_ANY)) {
 		cgc->in_waitset = 0;
+		mark_lost(cgc);
+	}
 }
 
 static void queue_budget(struct pfs_cgrp_ctx *cgc, u64 cgid)
@@ -426,9 +450,9 @@ static void queue_budget(struct pfs_cgrp_ctx *cgc, u64 cgid)
 	if (!bpf_map_push_elem(&budget_q, &cgid, 0)) {
 		__sync_fetch_and_add(&nr_budget_q, 1);
 	} else {
+		/* a retry queues it again while the budget is out */
 		cgc->budget_queued = 0;
-		stat_inc(PFS_STAT_RETRY_OVERFLOW);
-		scx_bpf_error("budget_q overflow for cgid %llu", cgid);
+		mark_lost(cgc);
 	}
 }
 
@@ -1904,6 +1928,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 	u64 cgid = cgrp->kn->id;
 	s32 ret;
 
+	if (!cgrp->level)
+		root_cgid = cgid;
+
 	/*
 	 * Technically incorrect as cgroup ID is full 64bit while dsq ID is
 	 * 63bit. Should not be a problem in practice and easy to spot in the
@@ -2068,6 +2095,41 @@ static long rescue_cb(struct bpf_map *map, u64 *key, u8 *val, u64 *now)
 	return 0;
 }
 
+/*
+ * Find the cgroups marked by mark_lost() with a walk over all cgroups, which
+ * is only needed after the maps overflowed, and list and retry them again. A
+ * cgroup which still doesn't fit is marked again for the next window.
+ */
+static void rescue_lost(void)
+{
+	struct cgroup_subsys_state *pos;
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *root;
+	u64 cgid;
+
+	root = bpf_cgroup_from_id(root_cgid);
+	if (!root)
+		return;
+
+	bpf_rcu_read_lock();
+	bpf_for_each(css, pos, &root->self, BPF_CGROUP_ITER_DESCENDANTS_PRE) {
+		cgc = bpf_cgrp_storage_get(&cgrp_ctx, pos->cgroup, 0, 0);
+		if (!cgc || !cgc->lost)
+			continue;
+
+		cgc->lost = 0;
+		cgid = pos->cgroup->kn->id;
+		if (!nr_waiting(cgid))
+			continue;
+
+		stat_inc(PFS_STAT_RESCUE);
+		waitset_add(cgc, cgid);
+		queue_retry(cgc, cgid);
+	}
+	bpf_rcu_read_unlock();
+	bpf_cgroup_release(root);
+}
+
 static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 {
 	struct pfs_cgrp_ctx *cgc;
@@ -2101,6 +2163,9 @@ static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 
 	now = window_now();
 	bpf_for_each_map_elem(&waitset, rescue_cb, &now, 0);
+
+	if (nr_lost && __sync_lock_test_and_set(&nr_lost, 0))
+		rescue_lost();
 
 	/*
 	 * Retries are normally processed by dispatch. Drain some here too so

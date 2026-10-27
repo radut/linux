@@ -17,8 +17,8 @@ const char help_fmt[] =
 "\n"
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
-"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i INTERVAL]\n"
-"       [-v]\n"
+"Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-q NR]\n"
+"       [-i INTERVAL] [-v]\n"
 "\n"
 "  -s SLICE_US   Slice duration (default: 2500, 100 to 1000000)\n"
 "  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
@@ -28,6 +28,9 @@ const char help_fmt[] =
 "                slice (default: 0, at most 1000000)\n"
 "  -w WINDOW_US  Accounting window for fractional limits (default: 10000,\n"
 "                1000 to 1000000)\n"
+"  -q NR         Size of the queues of cgroups with waiting tasks; more\n"
+"                such cgroups are found by a slower sweep (default: 65536,\n"
+"                16 to 16777216)\n"
 "  -i INTERVAL   Report interval in seconds (default: 1, at most 86400)\n"
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
@@ -37,6 +40,8 @@ const char help_fmt[] =
 #define MAX_US		(1000 * 1000)	/* bounds for -s, -c, -r and -w */
 #define MIN_SLICE_US	100
 #define MAX_INTERVAL	(24 * 3600)
+#define MIN_CGRP_Q	16
+#define MAX_CGRP_Q	(1 << 24)
 
 static bool verbose;
 static volatile int exit_req;
@@ -131,7 +136,7 @@ int main(int argc, char **argv)
 {
 	struct scx_pfs *skel;
 	struct bpf_link *link;
-	__u64 intv = 1;
+	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q;
 	long nr_cpus;
 	__s32 opt;
 	__u64 ecode;
@@ -150,7 +155,7 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:c:r:w:i:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:w:q:i:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = 1000 *
@@ -167,6 +172,10 @@ restart:
 		case 'w':
 			skel->rodata->window_ns = 1000 *
 				parse_opt(opt, optarg, MIN_WINDOW_US, MAX_US);
+			break;
+		case 'q':
+			nr_cgrp_q = parse_opt(opt, optarg, MIN_CGRP_Q,
+					      MAX_CGRP_Q);
 			break;
 		case 'i':
 			intv = parse_opt(opt, optarg, 1, MAX_INTERVAL);
@@ -193,11 +202,16 @@ restart:
 	skel->rodata->min_share = HWEIGHT_ONE * skel->rodata->slice_ns /
 				  (WAIT_MAX_NS * nr_cpus) ?: 1;
 
-	printf("slice=%lluus cut=%lluus rot=%lluus window=%lluus\n",
+	printf("slice=%lluus cut=%lluus rot=%lluus window=%lluus queues=%llu\n",
 	       (unsigned long long)skel->rodata->slice_ns / 1000,
 	       (unsigned long long)skel->rodata->cut_ns / 1000,
 	       (unsigned long long)skel->rodata->rot_ns / 1000,
-	       (unsigned long long)skel->rodata->window_ns / 1000);
+	       (unsigned long long)skel->rodata->window_ns / 1000,
+	       (unsigned long long)nr_cgrp_q);
+
+	bpf_map__set_max_entries(skel->maps.retry_q, nr_cgrp_q);
+	bpf_map__set_max_entries(skel->maps.budget_q, nr_cgrp_q);
+	bpf_map__set_max_entries(skel->maps.waitset, nr_cgrp_q);
 
 	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);
 	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
