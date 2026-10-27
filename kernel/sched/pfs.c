@@ -588,6 +588,13 @@ static inline u64 pfs_budget(unsigned int limit, u64 w)
 /* time over which runtime beyond the limit is paid back at most */
 #define PFS_MAX_DEBT_NS		NSEC_PER_SEC
 
+/* the most runtime beyond the limit that is carried over, see below */
+static inline u64 pfs_debt_max(unsigned int limit)
+{
+	return max_t(u64, div_u64((u64)limit * PFS_MAX_DEBT_NS, 1000),
+		     2 * TICK_NSEC);
+}
+
 /*
  * The part of @lg's budget left in the current window. Windows are aligned
  * to multiples of the window length so that one timer per group finds the
@@ -618,9 +625,7 @@ static u64 pfs_window_left(struct pfs_group *lg, u64 now)
 		 */
 		elapsed = (s64)(start - (u64)old) > 0 ?
 			  div64_u64(start - (u64)old, w) : 0;
-		debt_max = max_t(u64, div_u64((u64)READ_ONCE(lg->limit) *
-					      PFS_MAX_DEBT_NS, 1000),
-				 2 * TICK_NSEC);
+		debt_max = pfs_debt_max(READ_ONCE(lg->limit));
 		/* elapsed * budget <= used, it can't overflow */
 		if (budget && elapsed <= div64_u64(used, budget))
 			used = min(used - elapsed * budget, debt_max);
@@ -710,7 +715,13 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 		*run_limit = min(*run_limit, left);
 	}
 
-	if (taken + 1 >= limit / 1000) {
+	/*
+	 * Once the carried over excess reached its cap (tasks on credit kept
+	 * running on CPUs nobody else wanted), no slot is handed out until it
+	 * went down: more would be forgiven otherwise.
+	 */
+	if (taken + 1 >= limit / 1000 ||
+	    (u64)atomic64_read(&lg->window_used) >= pfs_debt_max(limit)) {
 		u64 excess = pfs_over_limit(lg, now);
 
 		if (excess) {

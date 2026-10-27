@@ -217,9 +217,15 @@ get CPU time nobody else wants. Without this, a group whose work runs mostly
 in the kernel (long system calls that block and resume, I/O worker threads)
 would run on as many CPUs as it has threads, since such tasks rarely reach
 the return to user space where they would park. The debt is carried over up
-to what the limit allows in one second, which bounds the wait it causes;
-runtime on credit beyond that cap is only possible on CPUs that would
-otherwise be idle. io_uring workers never return to user space but run the
+to what the limit allows in one second, which bounds the wait it causes.
+While the debt is at that cap, the level hands out no slot at all, so its
+threads park when they return to user space, and runtime on credit beyond
+the cap is only possible on CPUs that would otherwise be idle. In a local
+test, 8 pairs of processes writing 16 MB per ``write()`` into pipes (most
+of their time in the kernel, woken inside the system call) used 4.94 CPUs
+at limit 4 before these changes and 4.17 after; 16 threads reading 32 MB
+per system call from ``/dev/urandom`` used 2.06 CPUs at limit 1.5 before
+and 1.56 after. io_uring workers never return to user space but run the
 task work between work items, where they park like user threads.
 
 A task gives its slots back when it
@@ -830,8 +836,10 @@ Limits of this implementation
   at once, as under CFS bandwidth control. Their runtime is paid back
   afterwards, which keeps the average at the limit; once the group is over
   its limit they only run with the weight of ``SCHED_IDLE`` tasks, and debt
-  beyond one second's worth of the limit is not carried over, so a group
-  can exceed its limit by using CPUs that are idle otherwise.
+  beyond one second's worth of the limit is not carried over (no slots are
+  handed out while it is at the cap), so a group whose work stays in the
+  kernel can still exceed its limit somewhat by using CPUs that are idle
+  otherwise.
 - Effective weights of queued, not running tasks are refreshed only when they
   start running or are admitted again.
 - Within a limited group, slots are shared by weight between its children, but
