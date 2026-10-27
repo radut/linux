@@ -77,6 +77,52 @@ kernel behaves as one built without ``CONFIG_SCHED_PFS``.
 sched_ext cannot be enabled while PFS is active (``scx_enable`` fails with
 ``-EBUSY``); both would want to own the normal class.
 
+Configuration
+-------------
+
+``CONFIG_SCHED_PFS`` depends on ``CONFIG_SMP``, ``CONFIG_CFS_BANDWIDTH`` and
+``CONFIG_FAIR_GROUP_SCHED``, and is not available with
+``CONFIG_SCHED_PROXY_EXEC``. The statistics and tunables below need
+``CONFIG_DEBUG_FS``. Slices and the rotation of slots end on a tick unless
+the hrtick ends them, so ``CONFIG_HZ`` sets their granularity; the
+measurements below used ``CONFIG_HZ=1000`` and ``CONFIG_PREEMPT_DYNAMIC``.
+With ``CONFIG_SCHED_PFS=n`` nothing of PFS is compiled in.
+
+How the cgroup files map
+------------------------
+
+========================== ===================================================
+``cpu.max`` "Q P"          limit L = Q / P: floor(L) slots without time
+                           accounting, plus a budget slot for the fraction
+``cpu.max`` "max P"        no limit at this level
+``cpu.max.burst``          ignored
+``cpu.weight``,            the group's weight W, used for the share under
+``cpu.weight.nice``        contention and for sharing a limited parent's slots
+``cpu.idle``               ignored; the weight applies as set
+``cpu.stat`` usage_usec    CPU time of the group's tasks, including runtime
+                           on credit
+``cpu.stat`` nr_periods,   always 0 under PFS: tasks wait for a slot instead
+nr_throttled,              of being throttled; see `Statistics`_
+throttled_usec
+``cpu.uclamp.min/max``     not applied to frequency selection (no per-task
+                           utilisation under PFS)
+cgroup v1 ``cpu.shares``,  the same as their cgroup v2 counterparts
+``cpu.cfs_quota_us``,
+``cpu.cfs_period_us``
+========================== ===================================================
+
+Examples, with the default 10 ms window:
+
+- ``cpu.max`` "150000 100000" (1.5 CPUs): one thread runs at any time
+  without accounting, a second one while the group used less than 15 ms of
+  CPU in the current 10 ms window.
+- "25000 100000" (0.25 CPUs): only the budget slot, one thread at a time,
+  2.5 ms of CPU per 10 ms window.
+- A pod limited to 4 CPUs with two containers limited to 2 and 3 CPUs: at
+  most 4 threads of the pod run at once, at most 2 and 3 of each container,
+  and when both containers want more, the pod's 4 slots are shared between
+  them by their ``cpu.weight``.
+
 
 Semantics
 =========
@@ -557,48 +603,165 @@ Under ``/sys/kernel/debug/sched/pfs/``:
    (default 1000).
 
 
+Testing
+=======
+
+Functional checks, run on every change of ``pfs.c``:
+
+- Smoke test in an 8-CPU virtual machine booted with ``sched_pfs=1``: busy
+  threads with and without a limit (``cpu.stat`` shows the limit held and
+  ``nr_throttled`` 0), ``perf bench sched messaging`` with threads and with
+  processes, a fork storm, renice and affinity changes of running threads,
+  and CPUs taken offline and back online under load; ``dmesg`` must stay free
+  of warnings. The same with ``sched_pfs=0``, and on a kernel built with
+  ``CONFIG_SCHED_PFS=n``, which must build without warnings and behave like
+  one without the series.
+- Stress, 60 s, on a debug kernel with ``CONFIG_PROVE_LOCKING``,
+  ``CONFIG_DEBUG_ATOMIC_SLEEP`` and ``CONFIG_PROVE_RCU`` (twice) and on one
+  with ``CONFIG_KASAN``, ``CONFIG_DETECT_HUNG_TASK``,
+  ``CONFIG_SOFTLOCKUP_DETECTOR``, ``CONFIG_DEBUG_LIST``,
+  ``CONFIG_DEBUG_PREEMPT`` and ``CONFIG_DEBUG_OBJECTS``: hackbench in limited
+  and unlimited groups, fork and exit loops in limited groups, a
+  multi-threaded spinner moved between groups every 20 ms, ``cpu.max`` and
+  ``cpu.weight`` rewritten every 2 ms (down to 0.01 CPU), renice and affinity
+  changes, random CPUs taken offline and online, limits nested three levels
+  deep, then a weight-1 thread next to two groups of weight 10000. Pass: no
+  lockdep, ``WARNING``, ``BUG``, RCU stall, hung task or KASAN report, and the
+  weight-1 thread never waits more than about a second (250-810 ms on the
+  debug kernels).
+- A hierarchy test (nested limits and weights, usage per group from
+  ``cpu.stat``) and fractional limits (0.5 and 1.5 CPUs with 8 threads,
+  traced).
+
+Comparisons with CFS bandwidth control use ``tools/sched_ext/pfs-test``: on
+a ``sched_pfs=1`` boot its ``cfs`` variant measures PFS, so the same scripts
+run on plain cgroups, systemd units, Docker and Podman. Comparisons within
+one boot can switch individual changes with the ``features`` bits.
+
+
 Measurements
 ============
 
-On an 8-CPU virtual machine (non-debug kernel, 5 s per case, median of
-three runs), comparing CFS bandwidth control, its width mode, the sched_ext
-scheduler with the same policy, and PFS, with busy threads in a group with
-``cpu.max`` and optionally an unlimited neighbour with one busy thread per
-CPU:
+8-CPU virtual machine
+---------------------
 
-- PFS keeps the group at its limit: 2.00 and 4.00 CPUs on average with 8
-  threads at limits 2 and 4, busy all the time, against 2.0-4.0 CPUs with
-  CFS bandwidth control but busy only 29-53% of the time (bursts, then
-  throttling for the rest of the period).
-- Throughput of the group is 20-45% above CFS bandwidth control without a
-  neighbour and within 7% of it with the neighbour (limit 2, 8 threads:
-  1.49 vs 1.18 M iterations/s alone, 1.23 vs 1.25 next to the neighbour;
-  the width mode of CFS bandwidth control reaches 0.96 there).
-- The worst stall of a thread is several times shorter than with CFS
-  bandwidth control (limit 2, 64 threads: 108 ms vs 304 ms alone).
-- Request latency (4 threads doing 1 ms of work every 20 ms next to two
-  busy threads of the same group), median/p99: 3.9/6.0 ms at limit 1
-  (CFS bandwidth control 13.9/61.4, width mode 5.9/24.1, sched_ext 7.0/9.3)
-  and 5.0/10.0 ms at limit 0.5 (42.3/83.2, 11.8/50.5, 16.9/38.1).
-- Tasks without limits (median of nine runs in alternating boots of the
-  same kernel with and without ``sched_pfs=1``, on an otherwise quiet host):
-  busy loops as with the fair class; hackbench with processes 0.53, 0.83 and
-  1.10 of the fair class' time with 4, 8 and 16 groups, with threads 0.76,
-  0.82 and 1.02; a pipe ping-pong 5% slower; schbench (two message threads
-  waking 8 or 16 workers) wakeup latency p99 0.31 and 1.01 of the fair
-  class at 1.07 and 1.00 of its request rate; wakeup latency of a periodic
-  task next to 8 busy threads p99 1.06, next to 16 busy threads 0.96;
-  request latency next to 8 busy threads 0.89 at the median and 1.13 at
-  p99, within the run-to-run spread.
-- Lock probes in a group limited to 2 and 4 CPUs: threads handing a lock
-  over with ``sched_yield()``, threads spinning on a flag set by a thread
-  that waits for a slot, and a spin-then-futex barrier all keep the group
-  at its limit. Sixteen threads which yield 100 times while holding one of
-  four mutexes run 5.6 and 5.9 times as fast as under CFS bandwidth control
-  at limits 2 and 4. Sixteen threads passing flags in pairs while spinning
-  run at 0.53 and 0.88 of its rate at limits 2 and 4: they take turns on the
-  slots, and some runs at limit 2 collapse to a hand-off per rotation. A barrier with more threads than slots runs at 0.35-0.56
-  of the fair class' rate, as its threads take turns on the slots.
+8 vCPUs on an 8-CPU host, non-debug kernel (``CONFIG_HZ=1000``), the same
+kernel image booted alternately with and without ``sched_pfs=1``, one variant
+per boot, host load below 3 before each boot. Limited tests: median of 5
+boots; tests without limits: median of 9. Groups are two-level (a pod and a
+container, both with the limit), ratios are PFS / CFS bandwidth control.
+
+- The group stays at its limit, busy all the time, where CFS bandwidth
+  control runs it on 6.5 CPUs at once on average and then throttles it
+  (limit 1, 8 threads): 1.00 CPUs at once, ``nr_throttled`` 0.
+- Throughput of busy threads 1.21-1.27 times that of CFS bandwidth control
+  without a neighbour (limit 2 with 8 and 64 threads, limit 4 with 64
+  threads; 3.94 of 4 CPUs used), 0.98 next to an unlimited neighbour with
+  one busy thread per CPU.
+- Request latency (4 threads doing 1 ms of work every 20 ms) next to 8 busy
+  threads of the same group, limit 1: p50/p99 3.0/5.0 ms vs 349/1036 ms. At
+  limit 0.5 with 2 busy threads, through the test kit on plain cgroups,
+  systemd and Docker: p99 13-27 ms vs 82-84 ms. (This item and the previous
+  one were measured on an earlier commit of this series, in a run that
+  also compared the width mode of CFS bandwidth control and scx_pfs, see
+  ``tools/sched_ext/pfs-test/README.md``.)
+- 16 threads which call ``sched_yield()`` 100 times while holding one of 4
+  mutexes: 5.1 and 6.3 times the rate of CFS at limits 2 and 4. A model of a
+  parallel garbage collector at limit 2: pause p99 8.5 vs 50 ms. A thread of
+  weight 1 next to 16 busy threads of weight 5000: worst wait 493 ms vs 9.7 s.
+  Two groups with weights 1:3 and limits 4 and 6 on 8 CPUs: 2.88 (CFS 2.94).
+- Tasks without limits: schbench (2 message threads, 4 workers) wakeup p99
+  0.27 and request rate 1.14 times CFS; with 8 workers wakeup p99 1.02;
+  hackbench with processes 0.78-0.99, with threads 0.61-1.15 (host noise in
+  the 16-group cell); pipe ping-pong 1.01; spin-then-futex barrier 1.08;
+  request latency next to 8 busy threads p99 0.67.
+- PostgreSQL 16 (pgbench TPC-B and select-only, 32 clients over TCP from
+  outside the group, scale 20, data in memory) in a group limited to 2 and
+  1.5 CPUs: 1.95-2.00 and 1.50 CPUs, as CFS bandwidth control (1.98-2.00 and
+  1.49-1.50).
+
+16-CPU virtual machine with Kubernetes pods
+-------------------------------------------
+
+16 vCPUs, Kubernetes, limited pods with requests equal to limits, clients in
+separate pods on the same machine, one workload at a time, 3 runs per cell
+unless noted, kernel 7.3 with and without ``sched_pfs=1``; the reference is
+a 4-vCPU virtual machine without limit. These numbers come from a build
+before the change that pays back runtime on credit (see `Admission and
+waiting`_): its database pods used 2-13% more than their limit (4.18-4.19
+CPUs at limit 4, 2.05-2.08 at 2, 1.64-1.70 at 1.5). The fix brings the
+average to the limit and costs about the extra CPU time in throughput
+(expected about -5% at limit 4 and -11% at limit 1.5). A measurement of the
+fixed build is in progress.
+
+- PostgreSQL pgbench TPC-B, 32 clients, limit 4: 7319 transactions/s with
+  p99 9.0 ms (CFS bandwidth control 9119 with 35.7 ms, the 4-vCPU reference
+  6673 with 14.1 ms); select-only 52.7k with 1.56 ms (63.8k with 6.45 ms).
+  Limit 2: TPC-B 4356 with 14.0 ms (4673 with 79.9 ms).
+- MariaDB sysbench read-write, 32 threads, limit 4: 1884 transactions/s with
+  p99 26.7 ms (2297 with 45.8 ms).
+- JVM with ParallelGC at a fixed request rate, limit 4: worst GC pause
+  23.3 ms (24.2 ms), full GC 21.6 ms (22.5 ms).
+- Redis with 4 I/O threads, limit 4: 210k SET/s with p99 0.62 ms (the same
+  210k with 0.60 ms).
+- Micro-benchmarks in a pod limited to 4 CPUs: hackbench with processes
+  2.12 s (2.87 s), sysbench cpu p99 9.2 ms (64 ms), 16 threads holding a
+  mutex across 100 ``sched_yield()`` calls 46.1k events/s (12.7k).
+- 100 small pods (limits 0.25-1, busy, 30% busy and idle): all Ready after
+  31 s (45 s on kernel 7.0 with CFS).
+- A pod killed and recreated in a loop (26 times 10 pods with spinners and
+  300 fork/exec each) during a PostgreSQL run: no failed transaction and no
+  kernel warning.
+
+
+Disadvantages and when CFS is better
+====================================
+
+- **Bursts.** CFS bandwidth control lets a limited group run on every CPU
+  for part of a period; PFS never runs more than the limit at once. A short
+  parallel burst therefore takes longer, and requests in an otherwise idle
+  limited group wait for a slot: four request threads at limits 1 and 2
+  have a median latency 1.8-2.7 times that of CFS (3.11 vs 1.15 ms at
+  limit 1). Groups that are idle most of the time and need many CPUs for a
+  few milliseconds are better served by CFS bandwidth control. A burst
+  width (more slots for a short time, paid back from the window) would
+  address this and is not implemented.
+- **Spinning above the limit.** Threads which busy-poll for each other
+  collapse when there are more of them than slots: every hand-off waits for
+  a rotation. Redis with 4 I/O threads at limit 2 serves 5.35k SET/s vs
+  85.8k under CFS bandwidth control; 4 threads passing work through spinning
+  at limit 2 make 167 vs 10770 rounds/s; 8 pairs of threads passing a flag
+  at limit 2 run at 0.18 of CFS, with some runs collapsing to a hand-off per
+  rotation (the rate varies from 12.6k to 3.3M per second between boots).
+  Keep busy-polling threads at or below the limit.
+- **Database throughput.** At the same limit, databases get fewer
+  transactions than under CFS bandwidth control, which runs them on all 16
+  CPUs for part of each period: PostgreSQL -20% (TPC-B) and -17%
+  (select-only) at limit 4, -7% at limit 2, MariaDB -18 to -21% at limit 4,
+  and -19% beside an unlimited CPU hog. Their p99 latencies are 1.7-6
+  times lower.
+- **Unlimited neighbours.** A pod without a limit next to busy limited pods
+  has a worse wakeup tail than under CFS: schbench wakeup p99 2.8 ms vs
+  0.9 ms, 17% fewer requests/s (16-vCPU machine). A 1 ms sleeper outside the
+  pods overshoots by 2.7-2.9 ms at p99 with 50-100 pods vs 1.0-2.4 ms.
+- **Web tails at fractional limits with heavy neighbours.** A web server
+  (500 us of CPU per request) at a fixed rate, next to two unlimited
+  16-thread spinners and 20 limited pods: p99 145 ms at limit 0.25 (CFS
+  bandwidth control on the same kernel 48 ms), 91 ms at limit 0.5 (27 ms),
+  242 ms at limit 1 with 256 threads (37 ms) and 139 ms at limit 2 with 64
+  threads (30 ms).
+- **Throttling statistics.** ``nr_throttled`` and ``throttled_usec`` in
+  ``cpu.stat`` are always 0, so dashboards and alerts built on them see
+  nothing; waiting is in ``park_*`` of ``stats`` and in ``groups``.
+- **Short windows.** Tasks that wake up without a free slot finish their
+  system call on credit, so the number of threads of a group on CPUs can
+  exceed the limit for a moment, and windows shorter than about 100 ms can
+  show the limit plus a few percent. Runs of seconds stay at the limit.
+- **cpu.max.burst** is not honoured.
+- Overcommitted limits (2.6 times the machine) give groups with a small
+  weight more than their weighted share: 1.35 instead of 1.22 CPUs.
+- Kernel threads in limited groups run on credit until they block, and a
+  switch between PFS and the fair class needs a reboot.
 
 
 Limits of this implementation
@@ -631,3 +794,13 @@ Limits of this implementation
   tick so that the group's slots can rotate.
 - Group hierarchies deeper than 63 levels are only limited on their top 63
   levels.
+
+Possible future work:
+
+- A burst width: let a group exceed its slots for a short time, paid back
+  from its window like runtime on credit, for groups that are mostly idle
+  and need many CPUs for a few milliseconds.
+- Give the slot of a holder that stays preempted for more than a slice to a
+  waiting task, which would shorten the stalls next to busy neighbours.
+- Per-task utilisation signals, for util_est, uclamp and energy aware
+  placement.
