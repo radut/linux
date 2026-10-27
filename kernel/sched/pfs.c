@@ -1147,22 +1147,31 @@ static bool pfs_waiting_at(struct rq *rq, struct task_struct *p,
 #define PFS_WAITER_SCAN		16
 
 /*
- * The slot service of the child of @lg on @p's path, or of @lg's own tasks,
- * floored to a bit less than the service of the last child admitted at @lg:
- * a child coming back after a pause gets a bounded head start.
+ * The slot service of the child of @lg on the path of the group @g, or of
+ * @lg's own tasks if @g is @lg.
  */
-static u64 pfs_waiter_vtime(struct pfs_group *lg, struct task_struct *p)
+static u64 pfs_child_vtime(struct pfs_group *lg, struct pfs_group *g)
 {
-	struct pfs_group *g = task_pfs_group(p), *child = NULL;
-	u64 vtime, floor;
+	struct pfs_group *child = NULL;
 
 	for (; g && g != lg; g = pfs_parent(g))
 		child = g;
 
 	if (!g)
 		return 0;
-	vtime = child ? atomic64_read(&child->slot_vtime) :
-			atomic64_read(&lg->own_slot_vtime);
+	return child ? atomic64_read(&child->slot_vtime) :
+		       atomic64_read(&lg->own_slot_vtime);
+}
+
+/*
+ * The slot service of the child of @lg on @p's path, or of @lg's own tasks,
+ * floored to a bit less than the service of the last child admitted at @lg:
+ * a child coming back after a pause gets a bounded head start.
+ */
+static u64 pfs_waiter_vtime(struct pfs_group *lg, struct task_struct *p)
+{
+	u64 vtime = pfs_child_vtime(lg, task_pfs_group(p)), floor;
+
 	floor = READ_ONCE(lg->slot_vmin) - 2 * sysctl_sched_base_slice;
 	return (s64)(vtime - floor) < 0 ? floor : vtime;
 }
@@ -1179,10 +1188,15 @@ static u64 pfs_waiter_vtime(struct pfs_group *lg, struct task_struct *p)
  * they slept, while the others just used up a slice. Within the chosen list,
  * among the first PFS_WAITER_SCAN tasks, the first one of the child (or own
  * tasks) of @lg which received the least slot service for its weight; within
- * a child the order is FIFO. Waiting tasks are freed after a grace period,
- * the caller is in an RCU read-side section.
+ * a child the order is FIFO. Its slot service is returned in *@vtp.
+ *
+ * With @take the task is about to be admitted, which counts towards the
+ * streak and the floor of pfs_waiter_vtime(); without, the queue is only
+ * looked at. Waiting tasks are freed after a grace period, the caller is in
+ * an RCU read-side section.
  */
-static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
+static struct task_struct *__pfs_next_waiter(struct pfs_group *lg, bool take,
+					     u64 *vtp)
 {
 	struct task_struct *best = NULL;
 	struct sched_pfs_entity *pe;
@@ -1196,10 +1210,12 @@ static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
 	if (list_empty(list) ||
 	    (lg->woken_streak >= PFS_WOKEN_STREAK && !list_empty(&lg->waiters)))
 		list = &lg->waiters;
-	if (list == &lg->wake_waiters)
-		lg->woken_streak++;
-	else
-		lg->woken_streak = 0;
+	if (take) {
+		if (list == &lg->wake_waiters)
+			lg->woken_streak++;
+		else
+			lg->woken_streak = 0;
+	}
 
 	list_for_each_entry(pe, list, wait_node) {
 		struct task_struct *p = pfs_task_of(pe);
@@ -1208,7 +1224,7 @@ static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
 		if (n++ >= PFS_WAITER_SCAN)
 			break;
 		/* one waiting group is the common case */
-		if (n == 1 && list_is_singular(list)) {
+		if (take && n == 1 && list_is_singular(list)) {
 			best = p;
 			break;
 		}
@@ -1218,10 +1234,50 @@ static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
 			best_vt = vt;
 		}
 	}
-	if (best && (s64)(best_vt - READ_ONCE(lg->slot_vmin)) > 0)
+	if (take && best && (s64)(best_vt - READ_ONCE(lg->slot_vmin)) > 0)
 		WRITE_ONCE(lg->slot_vmin, best_vt);
 	raw_spin_unlock_irqrestore(&lg->lock, flags);
+	*vtp = best_vt;
 	return best;
+}
+
+static struct task_struct *pfs_next_waiter(struct pfs_group *lg)
+{
+	u64 vt;
+
+	return __pfs_next_waiter(lg, true, &vt);
+}
+
+/*
+ * The level of @leaf's path at which a hand-off of the slots a task of @leaf
+ * gave back starts. The deepest level with waiting tasks keeps the slots in
+ * the subtree that gave them back, which is right as long as no sibling
+ * subtree waits higher up: if one does, e.g. for the slots of a limited pod
+ * shared by two limited containers, and it received less slot service at
+ * that level than the child on @leaf's side, the slots go there. Otherwise
+ * whichever child holds more slots of the parent keeps them, since its tasks
+ * wait in its own queue, which is below the parent's, and the split between
+ * siblings stays wherever it happened to start. The shallowest such level
+ * wins: the share at the top is decided first.
+ */
+static struct pfs_group *pfs_handoff_level(struct pfs_group *leaf)
+{
+	struct pfs_group *lg, *start = NULL;
+
+	for_each_pfs_level(lg, leaf) {
+		u64 vt;
+
+		if (!READ_ONCE(lg->nr_waiting))
+			continue;
+		if (!start) {
+			start = lg;
+			continue;
+		}
+		if (__pfs_next_waiter(lg, false, &vt) &&
+		    (s64)(vt - pfs_child_vtime(lg, leaf)) < 0)
+			start = lg;
+	}
+	return start;
 }
 
 /* A limited level of @g's path has woken tasks waiting. */
@@ -3157,7 +3213,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 	lockdep_assert_rq_held(rq);
 	rq->pfs.handoff = NULL;
 
-	for_each_pfs_level(lg, leaf) {
+	for (lg = pfs_handoff_level(leaf); lg && lg->depth > 0; lg = pfs_parent(lg)) {
 		while (!got && READ_ONCE(lg->nr_waiting) &&
 		       tries++ < PFS_HANDOFF_TRIES) {
 			struct task_struct *p;

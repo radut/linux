@@ -274,12 +274,15 @@ Same-CPU hand-off
 
 When a task gives its slots back on CPU *C* because it blocks or rotates, the
 scheduler on *C* is about to pick the next task. Before it does, it takes the
-first waiting task of the deepest level that has waiting tasks, admits it, and
+next waiting task of the deepest level that has waiting tasks, admits it, and
 migrates it to *C* (double run queue lock, as the RT class pulls tasks), so
 that the next thread of the group runs on the CPU that just became free,
-without a timer or an IPI. A waiting task which can't run on *C* (affinity,
-migration disabled, *C* going offline) is admitted where it is instead, and
-an allowed idle CPU, if any, is kicked so that it pulls the task.
+without a timer or an IPI. If a level higher up has waiting tasks of a
+sibling subtree which received less slot service there (see `Weights inside
+a limited group`_), the hand-off starts at that level instead. A waiting
+task which can't run on *C* (affinity, migration disabled, *C* going
+offline) is admitted where it is instead, and an allowed idle CPU, if any,
+is kicked so that it pulls the task.
 
 Slots freed elsewhere (a task leaving the group, a raised limit, a new budget
 window) are handed out by a *retry*: the first waiting tasks are admitted on
@@ -340,6 +343,24 @@ least slot service, among the first 16 waiting tasks. Within one child the
 order is FIFO. A child that comes back after a pause starts at most two slices
 behind the last admitted one. Two children of a group limited to 3 CPUs with
 ``cpu.weight`` 100 and 300, each with 8 busy threads, get 0.77 and 2.27 CPUs.
+
+When the children are limited themselves, the tasks of a child that holds as
+many slots as its own limit wait in the child's queue, below the parent's,
+while those of a child below its limit wait in the parent's queue. A slot
+given back by a task of the first child would then always go to its own
+waiting tasks, the deepest ones, and the split of the parent's slots between
+the children would stay wherever it happened to start: with a parent limited
+to 4 CPUs and two busy children limited to 3, one child got 1.3 to 2.3 CPUs
+depending on the run, and with children limited to 4 and weights 100 and
+300, the lighter one got anywhere from 0 to 2.5 CPUs over half a second. So
+a hand-off first compares the slot service of the children of each higher
+level that has waiting tasks: if a sibling subtree waiting there received
+less service for its weight than the child that gave the slot back, the
+slot goes to the sibling. The tasks of the first child then find their own level free and the
+parent full, and wait in the parent's queue too. The children above now get
+2.0 CPUs each (1.7-2.3 in any half second), and 1.0 and 3.0 CPUs with
+weights 100 and 300 (0.7-1.3 for the lighter one), from the first half
+second on.
 
 
 Scheduling
