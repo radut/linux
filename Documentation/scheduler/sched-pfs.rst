@@ -102,9 +102,12 @@ How the cgroup files map
 ``cpu.idle``               ignored; the weight applies as set
 ``cpu.stat`` usage_usec    CPU time of the group's tasks, including runtime
                            on credit
-``cpu.stat`` nr_periods,   always 0 under PFS: tasks wait for a slot instead
-nr_throttled,              of being throttled; see `Statistics`_
-throttled_usec
+``cpu.stat`` nr_periods,   periods of ``cpu.max`` in which the group was
+nr_throttled,              active, those in which it held runnable tasks
+throttled_usec             back, and for how long; see `Throttling
+                           statistics`_
+``cpu.stat`` nr_bursts,    always 0: ``cpu.max.burst`` is ignored
+burst_usec
 ``cpu.uclamp.min/max``     not applied to frequency selection (no per-task
                            utilisation under PFS)
 cgroup v1 ``cpu.shares``,  the same as their cgroup v2 counterparts
@@ -148,12 +151,50 @@ kept in milli-CPUs (rounded up).
 - The period P only matters through the ratio Q / P.
 - ``cpu.max.burst`` is accepted and ignored: a parallelism cap has no
   accumulated budget to burst from.
-- ``cpu.stat`` keeps reporting CFS bandwidth fields, which stay at zero under
-  PFS; waiting is reported in the PFS statistics instead.
+- ``cpu.stat`` reports the time tasks wait for the group's slots or budget
+  in the CFS bandwidth fields, see `Throttling statistics`_.
 
 Limits are hierarchical: a thread needs a slot in its own group and in every
 limited ancestor. Each limited group counts the slots taken by threads of its
 whole subtree.
+
+Throttling statistics
+---------------------
+
+A limited group *throttles* while it holds back runnable work: while at
+least one task waits in its queue, for a free slot or for the budget of its
+budget slot (see `Admission and waiting`_). ``cpu.stat`` reports this in the
+fields of CFS bandwidth control, with the meaning
+Documentation/admin-guide/cgroup-v2.rst gives them, so that monitoring built
+on them (e.g. ``container_cpu_cfs_throttled_periods_total``) keeps working:
+
+``nr_periods``
+   The periods of ``cpu.max`` (P, 100 ms by default) in which the group was
+   active: a task of its subtree ran or waited for one of its slots. As with
+   CFS, periods in which the group was idle are not counted.
+``nr_throttled``
+   The periods among those in which at least one task waited at the group.
+``throttled_usec``
+   The wall time during which at least one task waited at the group,
+   measured from the first waiting task to the last one leaving the queue.
+
+Differences from CFS bandwidth control:
+
+- A group with more busy threads than its limit throttles all the time (its
+  extra threads always wait), while CFS throttles it for the part of each
+  period after the quota ran out: with 8 busy threads at limit 2 both count
+  every period, but ``throttled_usec`` grows with wall time under PFS and,
+  as CFS sums the throttled time of each CPU's run queue, by up to the
+  number of CPUs times the throttled part of the period under CFS.
+- A group with no more busy threads than its limit never throttles, while
+  CFS throttles it whenever its threads used the quota of a period on more
+  CPUs at once.
+- As with CFS, the statistics are not hierarchical: a task waiting at a
+  limited ancestor counts for the ancestor only. Tasks running on credit
+  (see `Admission and waiting`_) are not waiting and don't count, and
+  ``cpu.stat.local`` reports nothing under PFS.
+- ``nr_bursts`` and ``burst_usec`` stay 0, since ``cpu.max.burst`` is
+  ignored.
 
 Admission and waiting
 ---------------------
@@ -693,8 +734,8 @@ Functional checks, run on every change of ``pfs.c``:
   and without sched_ext, with ``CONFIG_SCHED_CORE``, with
   ``CONFIG_PREEMPT_RT`` and with ``CONFIG_SCHED_PFS=n``.
 - Smoke test in an 8-CPU virtual machine booted with ``sched_pfs=1``: busy
-  threads with and without a limit (``cpu.stat`` shows the limit held and
-  ``nr_throttled`` 0), ``perf bench sched messaging`` with threads and with
+  threads with and without a limit (``cpu.stat`` shows the limit held),
+  ``perf bench sched messaging`` with threads and with
   processes, a fork storm, renice and affinity changes of running threads,
   and CPUs taken offline and back online under load; ``dmesg`` must stay free
   of warnings. The same with ``sched_pfs=0``, and on a kernel built with
@@ -745,7 +786,7 @@ CPUs used
   Group usage from ``cpu.stat`` over the run, or the number of CPUs running
   the group at once from a ``sched_switch`` trace.
 ``nr_throttled``
-  Throttled periods, from ``cpu.stat``; 0 under PFS.
+  Throttled periods, from ``cpu.stat``.
 transactions/s
   pgbench TPC-B-like: 5 statements per transaction; select-only: one
   ``SELECT``; sysbench ``oltp_read_write``: 18 queries.
@@ -764,7 +805,7 @@ container, both with the limit), ratios are PFS / CFS bandwidth control.
 
 - The group stays at its limit, busy all the time, where CFS bandwidth
   control runs it on 6.5 CPUs at once on average and then throttles it
-  (limit 1, 8 threads): 1.00 CPUs at once, ``nr_throttled`` 0.
+  (limit 1, 8 threads): 1.00 CPUs at once.
 - Throughput of busy threads 1.21-1.27 times that of CFS bandwidth control
   without a neighbour (limit 2 with 8 and 64 threads, limit 4 with 64
   threads; 3.94 of 4 CPUs used), 0.98 next to an unlimited neighbour with
@@ -862,8 +903,9 @@ Disadvantages and when CFS is better
   242 ms at limit 1 with 256 threads (37 ms) and 139 ms at limit 2 with 64
   threads (30 ms).
 - **Throttling statistics.** ``nr_throttled`` and ``throttled_usec`` in
-  ``cpu.stat`` are always 0, so dashboards and alerts built on them see
-  nothing; waiting is in ``park_*`` of ``stats`` and in ``groups``.
+  ``cpu.stat`` count the time tasks wait for slots, which is not the same as
+  CFS throttling (see `Throttling statistics`_): alerts tuned to CFS values
+  may need new thresholds.
 - **Short windows.** Tasks that wake up without a free slot finish their
   system call on credit, so the number of threads of a group on CPUs can
   exceed the limit for a moment, and windows shorter than about 100 ms can

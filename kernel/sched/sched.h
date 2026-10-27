@@ -488,6 +488,14 @@ struct cfs_bandwidth {
 };
 
 /* Task group related information */
+
+/* cpu.stat throttling statistics under PFS, see pfs_group_throttle_stat() */
+struct pfs_throttle_stat {
+	int			nr_periods;
+	int			nr_throttled;
+	u64			throttled_ns;
+};
+
 #ifdef CONFIG_SCHED_PFS
 /*
  * Parallel Fair Scheduler, see Documentation/scheduler/sched-pfs.rst.
@@ -542,6 +550,16 @@ struct pfs_group {
 	atomic64_t		own_slot_vtime;
 	/* slot service of the last task admitted from the queue */
 	u64			slot_vmin;
+
+	/* cpu.stat throttling statistics, see pfs_stat_period() */
+	u64			stat_period_ns;
+	atomic64_t		stat_next;
+	atomic64_t		stat_thr;
+	atomic_t		nr_periods;
+	atomic_t		nr_throttled;
+	/* under ->lock: since when tasks wait here (0: none), and the sum */
+	u64			throttle_start;
+	u64			throttled_ns;
 };
 
 /* Per CPU state. */
@@ -2028,6 +2046,8 @@ extern void pfs_free_group(struct task_group *tg);
 extern void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 				    u64 quota_us, u64 burst_us);
 extern void pfs_group_set_weight(struct task_group *tg);
+extern bool pfs_group_throttle_stat(struct task_group *tg,
+				    struct pfs_throttle_stat *st);
 extern struct task_struct *pfs_get_dying_waiter(struct rq *rq);
 extern void pfs_kick_waiter(struct task_struct *p);
 extern void pfs_task_change_group(struct task_struct *p);
@@ -2047,6 +2067,11 @@ static inline void pfs_free_group(struct task_group *tg) { }
 static inline void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 					   u64 quota_us, u64 burst_us) { }
 static inline void pfs_group_set_weight(struct task_group *tg) { }
+static inline bool pfs_group_throttle_stat(struct task_group *tg,
+					   struct pfs_throttle_stat *st)
+{
+	return false;
+}
 static inline void pfs_kick_waiter(struct task_struct *p) { }
 static inline void pfs_task_change_group(struct task_struct *p) { }
 static inline bool pfs_can_stop_tick(struct rq *rq) { return true; }

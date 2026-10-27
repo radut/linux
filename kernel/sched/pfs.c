@@ -892,6 +892,70 @@ static bool pfs_should_rotate(struct task_struct *p)
 }
 
 /*
+ * cpu.stat throttling statistics, with the meaning CFS bandwidth control
+ * gives them: nr_periods counts the periods of cpu.max in which a limited
+ * level was active, nr_throttled those in which it held back runnable work,
+ * i.e. had tasks waiting for one of its slots or for its budget, and
+ * throttled_ns the wall time during which it had such tasks. Periods are
+ * counted when runtime is charged and when a task starts waiting, so no
+ * timer is needed; periods in which nothing ran and nothing waited are
+ * idle and not counted, as CFS stops its period timer then.
+ */
+static void pfs_stat_throttled(struct pfs_group *lg, s64 end, int n)
+{
+	s64 old = atomic64_read(&lg->stat_thr);
+
+	if (old != end && atomic64_try_cmpxchg(&lg->stat_thr, &old, end))
+		atomic_add(n, &lg->nr_throttled);
+}
+
+static void pfs_stat_period(struct pfs_group *lg, u64 now)
+{
+	s64 next = atomic64_read(&lg->stat_next);
+	u64 p = READ_ONCE(lg->stat_period_ns), start, n;
+	bool waiting;
+
+	if ((s64)(now - (u64)next) < 0) {
+		if (READ_ONCE(lg->nr_waiting))
+			pfs_stat_throttled(lg, next, 1);
+		return;
+	}
+
+	start = pfs_window_start(now, p);
+	if (!atomic64_try_cmpxchg(&lg->stat_next, &next, start + p))
+		return;
+	/* periods that passed while tasks waited were active and throttled */
+	waiting = READ_ONCE(lg->nr_waiting);
+	n = waiting && next ? div64_u64(start - (u64)next, p) + 1 : 1;
+	atomic_add(n, &lg->nr_periods);
+	if (waiting)
+		pfs_stat_throttled(lg, start + p, n);
+}
+
+/* Fill in @tg's cpu.stat throttling statistics if PFS is active. */
+bool pfs_group_throttle_stat(struct task_group *tg, struct pfs_throttle_stat *st)
+{
+	struct pfs_group *g = &tg->pfs;
+	unsigned long flags;
+
+	if (!pfs_enabled())
+		return false;
+
+	raw_spin_lock_irqsave(&g->lock, flags);
+	st->throttled_ns = g->throttled_ns;
+	if (g->throttle_start) {
+		u64 now = pfs_now();
+
+		if (now > g->throttle_start)
+			st->throttled_ns += now - g->throttle_start;
+	}
+	raw_spin_unlock_irqrestore(&g->lock, flags);
+	st->nr_periods = atomic_read(&g->nr_periods);
+	st->nr_throttled = atomic_read(&g->nr_throttled);
+	return true;
+}
+
+/*
  * Charge @delta of runtime of a task of @g, with or without slots, to the
  * limited levels of its path: to the window of the level, see
  * pfs_window_left() and pfs_over_limit(), and to the slot service of the
@@ -912,6 +976,7 @@ static bool pfs_charge(struct pfs_group *g, u64 delta)
 			now = pfs_now();
 		pfs_window_left(lg, now);
 		atomic64_add(delta, &lg->window_used);
+		pfs_stat_period(lg, now);
 
 		if (child)
 			atomic64_add(div64_ul(delta * scale_load_down(NICE_0_LOAD),
@@ -1041,7 +1106,13 @@ static void pfs_kick_cpu(int cpu)
 
 static void __pfs_link_waiter(struct sched_pfs_entity *pe, struct pfs_group *lg)
 {
+	u64 now = pfs_now();
+	bool first;
+
 	raw_spin_lock(&lg->lock);
+	first = !lg->nr_waiting;
+	if (first)
+		lg->throttle_start = now ?: 1;
 	pe->wake_list = pe->woken;
 	if (pe->wake_list) {
 		list_add_tail(&pe->wait_node, &lg->wake_waiters);
@@ -1052,6 +1123,10 @@ static void __pfs_link_waiter(struct sched_pfs_entity *pe, struct pfs_group *lg)
 	WRITE_ONCE(lg->nr_waiting, lg->nr_waiting + 1);
 	raw_spin_unlock(&lg->lock);
 	pe->wait_grp = lg;
+
+	/* the level starts holding back runnable work */
+	if (first)
+		pfs_stat_period(lg, now);
 }
 
 static void __pfs_unlink_waiter(struct sched_pfs_entity *pe)
@@ -1064,6 +1139,13 @@ static void __pfs_unlink_waiter(struct sched_pfs_entity *pe)
 		WRITE_ONCE(lg->nr_woken, lg->nr_woken - 1);
 	pe->wake_list = 0;
 	WRITE_ONCE(lg->nr_waiting, lg->nr_waiting - 1);
+	if (!lg->nr_waiting && lg->throttle_start) {
+		u64 now = pfs_now();
+
+		if (now > lg->throttle_start)
+			lg->throttled_ns += now - lg->throttle_start;
+		lg->throttle_start = 0;
+	}
 	raw_spin_unlock(&lg->lock);
 	pe->wait_grp = NULL;
 }
@@ -3370,6 +3452,7 @@ void pfs_init_group(struct task_group *tg, struct task_group *parent)
 	INIT_LIST_HEAD(&g->wake_waiters);
 	g->depth = parent ? parent->pfs.depth + 1 : 0;
 	g->weight = NICE_0_LOAD;
+	g->stat_period_ns = 100 * NSEC_PER_MSEC;
 	hrtimer_setup(&g->window_timer, pfs_window_timer_fn, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_ABS_PINNED_HARD);
 	g->retry_work = IRQ_WORK_INIT_HARD(pfs_retry_workfn);
@@ -3430,6 +3513,8 @@ void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 			limit = 0;
 	}
 
+	if (period_us)
+		WRITE_ONCE(g->stat_period_ns, period_us * NSEC_PER_USEC);
 	old = xchg(&g->limit, (unsigned int)limit);
 	if (!old && limit)
 		atomic_inc(&pfs_nr_limited);

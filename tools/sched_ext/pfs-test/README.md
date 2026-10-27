@@ -518,8 +518,8 @@ kwidth:
 
 kPFS:
 
-- `nr_throttled` is always 0; waiting is shown in
-  `/sys/kernel/debug/sched/pfs/stats` and `groups`.
+- `nr_throttled` and `throttled_usec` count the time tasks wait for a slot or
+  budget (see sched-pfs.rst), not CFS throttling.
 - Runtime in the kernel on credit can push short windows (below 100 ms) a
   few percent over the limit; runs of seconds stay at the limit with the fix.
 - An unlimited pod next to busy limited pods has a worse wakeup tail (C20:

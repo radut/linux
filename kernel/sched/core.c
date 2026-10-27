@@ -10089,10 +10089,17 @@ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
 {
 	struct task_group *tg = css_tg(seq_css(sf));
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+	struct pfs_throttle_stat st = {
+		.nr_periods = cfs_b->nr_periods,
+		.nr_throttled = cfs_b->nr_throttled,
+		.throttled_ns = cfs_b->throttled_time,
+	};
 
-	seq_printf(sf, "nr_periods %d\n", cfs_b->nr_periods);
-	seq_printf(sf, "nr_throttled %d\n", cfs_b->nr_throttled);
-	seq_printf(sf, "throttled_time %llu\n", cfs_b->throttled_time);
+	/* PFS holds tasks back by its own limits, see sched-pfs.rst */
+	pfs_group_throttle_stat(tg, &st);
+	seq_printf(sf, "nr_periods %d\n", st.nr_periods);
+	seq_printf(sf, "nr_throttled %d\n", st.nr_throttled);
+	seq_printf(sf, "throttled_time %llu\n", st.throttled_ns);
 
 	if (schedstat_enabled() && tg != &root_task_group) {
 		struct sched_statistics *stats;
@@ -10432,9 +10439,16 @@ static int cpu_extra_stat_show(struct seq_file *sf,
 	{
 		struct task_group *tg = css_tg(css);
 		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+		struct pfs_throttle_stat st = {
+			.nr_periods = cfs_b->nr_periods,
+			.nr_throttled = cfs_b->nr_throttled,
+			.throttled_ns = cfs_b->throttled_time,
+		};
 		u64 throttled_usec, burst_usec;
 
-		throttled_usec = cfs_b->throttled_time;
+		/* PFS holds tasks back by its own limits, see sched-pfs.rst */
+		pfs_group_throttle_stat(tg, &st);
+		throttled_usec = st.throttled_ns;
 		do_div(throttled_usec, NSEC_PER_USEC);
 		burst_usec = cfs_b->burst_time;
 		do_div(burst_usec, NSEC_PER_USEC);
@@ -10444,7 +10458,7 @@ static int cpu_extra_stat_show(struct seq_file *sf,
 			   "throttled_usec %llu\n"
 			   "nr_bursts %d\n"
 			   "burst_usec %llu\n",
-			   cfs_b->nr_periods, cfs_b->nr_throttled,
+			   st.nr_periods, st.nr_throttled,
 			   throttled_usec, cfs_b->nr_burst, burst_usec);
 	}
 #endif /* CONFIG_CFS_BANDWIDTH */
