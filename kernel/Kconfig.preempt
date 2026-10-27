@@ -210,7 +210,9 @@ config SCHED_PFS
 	  as soon as another thread of the group gives it up.
 
 	  PFS is only used when the kernel is booted with sched_pfs=1.
-	  Otherwise the fair class is used and PFS adds no overhead.
+	  Otherwise the fair class is used and PFS costs a few static
+	  branches and its memory: about 250 bytes per task, a hrtimer and
+	  an irq_work per task group and a run queue per CPU.
 
 	  See Documentation/scheduler/sched-pfs.rst.
 

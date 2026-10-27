@@ -72,7 +72,8 @@ and the counters described under `Statistics`_.
 
 With ``sched_pfs`` absent or 0, a static key keeps every hook in the core
 scheduler disabled, the class is skipped by the class iterators, and the
-kernel behaves as one built without ``CONFIG_SCHED_PFS``.
+kernel behaves as one built without ``CONFIG_SCHED_PFS``; what remains is the
+memory of the PFS state in every task, task group and run queue.
 
 sched_ext cannot be enabled while PFS is active (``scx_enable`` fails with
 ``-EBUSY``); both would want to own the normal class.
@@ -647,6 +648,9 @@ Testing
 
 Functional checks, run on every change of ``pfs.c``:
 
+- Builds with ``W=1`` of ``kernel/sched/`` with PFS and sched_ext, with PFS
+  and without sched_ext, with ``CONFIG_SCHED_CORE``, with
+  ``CONFIG_PREEMPT_RT`` and with ``CONFIG_SCHED_PFS=n``.
 - Smoke test in an 8-CPU virtual machine booted with ``sched_pfs=1``: busy
   threads with and without a limit (``cpu.stat`` shows the limit held and
   ``nr_throttled`` 0), ``perf bench sched messaging`` with threads and with
@@ -836,6 +840,11 @@ Limits of this implementation
 - CPU utilisation for schedutil is a per-CPU signal; there is no per-task
   utilisation, so util_est, uclamp of individual tasks on frequency selection
   and energy aware placement don't apply to PFS tasks.
+- Waiting tasks stay queued from the core's point of view, so the uclamp
+  bucket of their CPU and PSI still count them as runnable there: a waiting
+  task with a high ``uclamp.min`` keeps its CPU's clamp up.
+- No ``yield_to()``: directed yield (KVM pause loop exiting) does nothing for
+  PFS tasks.
 - NUMA balancing is not run for PFS tasks.
 - Core scheduling (``CONFIG_SCHED_CORE``) orders PFS tasks of SMT siblings
   by their virtual runtimes relative to each CPU's average, without the
