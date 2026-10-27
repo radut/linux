@@ -691,6 +691,33 @@ one boot can switch individual changes with the ``features`` bits.
 Measurements
 ============
 
+Terms used below:
+
+CFS bandwidth control
+  The fair class (EEVDF) with ``cpu.max`` as a time quota per period
+  (100 ms unless noted); the baseline of every comparison.
+PFS
+  The same kernel booted with ``sched_pfs=1``.
+limit N
+  ``cpu.max`` quota / period = N CPUs: floor(N) full slots, plus a budget
+  slot for a fractional part (see `Limits`_).
+ratio
+  PFS value / CFS value: below 1 is better for times and latencies, above 1
+  for rates.
+p50, p99
+  Latency percentiles.
+CPUs used
+  Group usage from ``cpu.stat`` over the run, or the number of CPUs running
+  the group at once from a ``sched_switch`` trace.
+``nr_throttled``
+  Throttled periods, from ``cpu.stat``; 0 under PFS.
+transactions/s
+  pgbench TPC-B-like: 5 statements per transaction; select-only: one
+  ``SELECT``; sysbench ``oltp_read_write``: 18 queries.
+reference
+  A 4-vCPU virtual machine running the same workload without a limit under
+  CFS.
+
 8-CPU virtual machine
 ---------------------
 
