@@ -228,6 +228,9 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-w WINDOW_US] [-i SECS] [-v]
 | `-w` | 10000 | Accounting window for fractional limits (minimum 1000). |
 | `-i` | 1 | Interval of the counter report, in seconds. |
 
+`-s` takes 100 to 1000000 us, `-c` and `-r` at most 1000000 us, `-w` 1000
+to 1000000 us and `-i` 1 to 86400 s; scx_pfs refuses other values.
+
 ### Counters
 
 Printed every `-i` seconds: `park_full` (a thread waited for a slot),
@@ -244,9 +247,10 @@ of waiting, see below), and internal ones (`direct`, `shared`, `repark`,
 ### Running it
 
 Start it as root and stop it with Ctrl-C (the kernel scheduler takes over
-again), or install `pfs-test/scx_pfs.service` as a systemd unit, or run it in
-a privileged container with `--pid=host` (`pfs-test/scx-container.sh`), which
-is the shape of a Kubernetes DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
+again), or install `pfs-test/scx_pfs.service` as a sandboxed systemd unit,
+or run it in a container with `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON`
+only (`pfs-test/scx-container.sh`), which is the shape of a Kubernetes
+DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
 following run-time changes of `cpu.max` needs the `cgroup_set_bandwidth`
 operation (6.17 or later). `pfs-test/` compares it with CFS bandwidth control
 on plain cgroups, systemd units, Docker and Podman; its README has the
