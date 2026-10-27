@@ -499,7 +499,13 @@ static u64 window_left(struct pfs_cgrp_ctx *cgc, u64 now)
 
 	budget = cgc->limit * window_ns / FRAC_ONE;
 
-	if (old_id != id &&
+	/*
+	 * Callers sample @now before they get here, so another CPU may have
+	 * started the next window already. Never go back to an older window:
+	 * that throws the newer window's usage away, and coming back to it
+	 * starts it over with nothing used.
+	 */
+	if (id > old_id &&
 	    __sync_val_compare_and_swap(&cgc->window_id, old_id, id) == old_id) {
 		used = cgc->window_used;
 		if (id == old_id + 1 && used > budget)
