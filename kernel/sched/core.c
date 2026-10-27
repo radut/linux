@@ -8991,6 +8991,7 @@ void __init sched_init(void)
 	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
 	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
 #endif
+	pfs_boot_enable();
 
 	wait_bit_init();
 

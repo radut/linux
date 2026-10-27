@@ -40,17 +40,39 @@
 
 DEFINE_STATIC_KEY_FALSE(__pfs_enabled);
 
+static bool pfs_boot_on __initdata;
+
+/*
+ * Some architectures (arm, mips) parse early parameters before
+ * jump_label_init(), so the static key is only switched in sched_init(),
+ * see pfs_boot_enable().
+ */
 static int __init setup_sched_pfs(char *str)
 {
 	bool on = true;
 
 	if (str && kstrtobool(str, &on))
 		return -EINVAL;
-	if (on)
-		static_branch_enable(&__pfs_enabled);
+	pfs_boot_on = on;
 	return 0;
 }
 early_param("sched_pfs", setup_sched_pfs);
+
+/* Called at the start of sched_init(), before any task or run queue exists. */
+void __init pfs_boot_enable(void)
+{
+	if (!pfs_boot_on)
+		return;
+	/* the class iterators skip fair for PFS, see next_active_class() */
+	if (WARN_ON(!sched_class_above(&fair_sched_class, &pfs_sched_class) ||
+		    !sched_class_above(&pfs_sched_class, &idle_sched_class)))
+		return;
+#ifdef CONFIG_SCHED_CLASS_EXT
+	if (WARN_ON(!sched_class_above(&pfs_sched_class, &ext_sched_class)))
+		return;
+#endif
+	static_branch_enable(&__pfs_enabled);
+}
 
 /*
  * Behaviour switches, /sys/kernel/debug/sched/pfs/features, for comparing

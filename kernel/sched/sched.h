@@ -2017,6 +2017,7 @@ extern const struct sched_class pfs_sched_class;
 DECLARE_STATIC_KEY_FALSE(__pfs_enabled);	/* booted with sched_pfs=1 */
 #define pfs_enabled()		static_branch_unlikely(&__pfs_enabled)
 
+extern void pfs_boot_enable(void);
 extern bool pfs_init_rq(struct rq *rq);
 extern void pfs_init_entity(struct task_struct *p);
 extern void pfs_init_group(struct task_group *tg, struct task_group *parent);
@@ -2035,6 +2036,7 @@ extern void pfs_balance_trigger(struct rq *rq);
 extern void pfs_balance_softirq(void);
 #else /* !CONFIG_SCHED_PFS */
 #define pfs_enabled()		false
+static inline void pfs_boot_enable(void) { }
 static inline bool pfs_init_rq(struct rq *rq) { return false; }
 static inline void pfs_init_entity(struct task_struct *p) { }
 static inline void pfs_init_group(struct task_group *tg, struct task_group *parent) { }
