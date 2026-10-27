@@ -3579,6 +3579,10 @@ void kick_process(struct task_struct *p)
 	guard(preempt)();
 	int cpu = task_cpu(p);
 
+	/* a task waiting for a PFS slot is TASK_RUNNING, not woken up */
+	if (pfs_enabled())
+		pfs_kick_waiter(p);
+
 	if ((cpu != smp_processor_id()) && task_curr(p))
 		smp_send_reschedule(cpu);
 }

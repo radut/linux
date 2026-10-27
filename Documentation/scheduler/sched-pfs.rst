@@ -177,6 +177,15 @@ returns to user space. This is the same model as the task based throttling
 of CFS bandwidth control. Kernel threads, which never return to user space,
 keep running on credit until they block.
 
+Some tasks never wait for a slot and run on credit wherever they would park:
+a task with a fatal signal pending or chosen by the OOM killer (it must exit
+to free its memory), and a task that holds a PI lock (an rt_mutex or a PI
+futex) with waiters, or is boosted by one. A waiting task that receives
+``SIGKILL`` is admitted on credit at once (the signal code kicks it, and an
+``irq_work`` on its CPU admits it), as is a waiting task whose priority a PI
+waiter boosts. A PI waiter of the same priority as the holder does not boost
+it, so a holder that is already waiting is then only admitted in turn.
+
 Runtime on credit is beyond the slots, so it is paid back. Every limited
 level counts the CPU time of all tasks of its subtree, with or without slots,
 in the windows of the budget slot. If the usage in the current window,

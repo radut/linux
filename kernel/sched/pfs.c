@@ -28,6 +28,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/task_work.h>
+#include <linux/oom.h>
 #include <asm/irq_regs.h>
 
 #include <uapi/linux/sched/types.h>
@@ -1572,13 +1573,52 @@ static void pfs_request_user_park(struct task_struct *p)
 }
 
 /*
+ * @p must not wait for a slot: it is being killed (SIGKILL, or chosen by the
+ * OOM killer, which needs it to exit and free its memory), or it holds a PI
+ * lock (an rt_mutex or a PI futex) that others wait for, or is boosted by
+ * one. Such a task runs on credit; its runtime is charged to its group as
+ * any runtime on credit.
+ */
+static inline bool pfs_must_run(struct task_struct *p)
+{
+	if (fatal_signal_pending(p) || tsk_is_oom_victim(p))
+		return true;
+#ifdef CONFIG_RT_MUTEXES
+	if (p->prio != p->normal_prio ||
+	    !RB_EMPTY_ROOT(&p->pi_waiters.rb_root))
+		return true;
+#endif
+	return false;
+}
+
+/* Queue @p on @rq without slots, see pfs_admit_or_park(). */
+static void pfs_admit_credit(struct rq *rq, struct task_struct *p, int flags)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+
+	lockdep_assert_rq_held(rq);
+
+	pfs_stat(PFS_STAT_CREDIT);
+	pe->grp = task_pfs_group(p);
+	pe->unslotted = 1;
+	pe->woken = !!(flags & ENQUEUE_WAKEUP);
+	if (pe->woken)
+		pe->fresh_rounds = 0;
+	pe->run_start = p->se.sum_exec_runtime;
+	pe->run_limit = 0;
+	pfs_queue_task(rq, p, flags);
+	pfs_request_user_park(p);
+}
+
+/*
  * Admit @p on @rq if it gets its slots. Otherwise it waits, but only where it
  * holds nothing that others may wait for: a task is parked only when it is
  * preempted on its way back to user space (@can_park). Anywhere else (a
  * wakeup, fork, a cgroup move) the task may hold kernel locks or be inside an
  * RCU read-side section, so it runs on credit, without slots, and parks when
  * it returns to user space. This is what CFS bandwidth control does with its
- * throttling since the task based throttle model.
+ * throttling since the task based throttle model. A task which must not wait,
+ * see pfs_must_run(), runs on credit too.
  */
 static void pfs_admit_or_park(struct rq *rq, struct task_struct *p, int flags,
 			      bool can_park)
@@ -1586,6 +1626,8 @@ static void pfs_admit_or_park(struct rq *rq, struct task_struct *p, int flags,
 	struct pfs_group *g = task_pfs_group(p), *fail = NULL;
 	struct sched_pfs_entity *pe = &p->pfs;
 	enum pfs_reserve ret;
+
+	lockdep_assert_rq_held(rq);
 
 	ret = pfs_reserve(p, g, true, &fail);
 	if (ret == PFS_RES_OK) {
@@ -1596,21 +1638,57 @@ static void pfs_admit_or_park(struct rq *rq, struct task_struct *p, int flags,
 		return;
 	}
 
-	if (can_park) {
+	if (can_park && !pfs_must_run(p)) {
 		pfs_park(rq, p, fail, ret);
 		return;
 	}
 
-	pfs_stat(PFS_STAT_CREDIT);
-	pe->grp = g;
-	pe->unslotted = 1;
-	pe->woken = !!(flags & ENQUEUE_WAKEUP);
-	if (pe->woken)
-		pe->fresh_rounds = 0;
-	pe->run_start = p->se.sum_exec_runtime;
-	pe->run_limit = 0;
-	pfs_queue_task(rq, p, flags);
-	pfs_request_user_park(p);
+	pfs_admit_credit(rq, p, flags);
+}
+
+/* The waiting task @p must not wait anymore: run it on credit. */
+static void pfs_unpark_credit(struct rq *rq, struct task_struct *p)
+{
+	pfs_unpark(rq, p);
+	pfs_admit_credit(rq, p, 0);
+	wakeup_preempt(rq, p, 0);
+}
+
+/*
+ * A waiting task got a fatal signal: the signal code found it running (a
+ * waiting task is TASK_RUNNING) and kicks it, see kick_process(). Admit the
+ * waiting tasks of this CPU which must not wait.
+ */
+static void pfs_fatal_workfn(struct irq_work *work)
+{
+	struct rq *rq = this_rq();
+	struct sched_pfs_entity *pe, *tmp;
+	struct rq_flags rf;
+
+	rq_lock(rq, &rf);
+	update_rq_clock(rq);
+	list_for_each_entry_safe(pe, tmp, &rq->pfs.waiters, rq_wait_node) {
+		struct task_struct *p = pfs_task_of(pe);
+
+		if (pe->state == PFS_WAITING && pfs_must_run(p))
+			pfs_unpark_credit(rq, p);
+	}
+	rq_unlock(rq, &rf);
+}
+
+static DEFINE_PER_CPU(struct irq_work, pfs_fatal_work) =
+	IRQ_WORK_INIT_HARD(pfs_fatal_workfn);
+
+/* Called by kick_process() with interrupts disabled. */
+void pfs_kick_waiter(struct task_struct *p)
+{
+	int cpu;
+
+	if (READ_ONCE(p->pfs.state) != PFS_WAITING || !pfs_must_run(p))
+		return;
+	cpu = task_cpu(p);
+	if (cpu_active(cpu))
+		irq_work_queue_on(&per_cpu(pfs_fatal_work, cpu), cpu);
 }
 
 /* Is the tick handling an interrupt from user space? */
@@ -1657,6 +1735,8 @@ static void pfs_user_workfn(struct callback_head *work)
 	} else if (!pfs_should_rotate(p)) {
 		goto unlock;
 	}
+	if (pfs_must_run(p))
+		goto unlock;
 
 	pfs_stat(PFS_STAT_USER_PARK);
 	pe->rotate = 1;
@@ -2163,7 +2243,9 @@ static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 			 * Only park a task preempted on its way to user space,
 			 * see pfs_admit_or_park().
 			 */
-			if (pfs_tick_from_user()) {
+			if (pfs_must_run(curr)) {
+				/* keeps running, see pfs_must_run() */
+			} else if (pfs_tick_from_user()) {
 				pe->rotate = 1;
 				resched_curr(rq);
 			} else {
@@ -2186,6 +2268,13 @@ static void prio_changed_pfs(struct rq *rq, struct task_struct *p, u64 oldprio)
 {
 	if (!task_on_rq_queued(p) || p->prio == oldprio)
 		return;
+
+	/* boosted by a PI waiter: don't keep it waiting for a slot */
+	if (p->pfs.state == PFS_WAITING) {
+		if (pfs_must_run(p))
+			pfs_unpark_credit(rq, p);
+		return;
+	}
 
 	if (task_current_donor(rq, p)) {
 		if (p->prio > oldprio)

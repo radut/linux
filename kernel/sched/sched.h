@@ -2018,6 +2018,7 @@ extern void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 				    u64 quota_us, u64 burst_us);
 extern void pfs_group_set_weight(struct task_group *tg);
 extern struct task_struct *pfs_get_dying_waiter(struct rq *rq);
+extern void pfs_kick_waiter(struct task_struct *p);
 extern bool pfs_can_stop_tick(struct rq *rq);
 extern bool sched_task_cpu_allowed(struct task_struct *p, int cpu);
 extern void pfs_debugfs_init(struct dentry *parent);
@@ -2032,6 +2033,7 @@ static inline void pfs_free_group(struct task_group *tg) { }
 static inline void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 					   u64 quota_us, u64 burst_us) { }
 static inline void pfs_group_set_weight(struct task_group *tg) { }
+static inline void pfs_kick_waiter(struct task_struct *p) { }
 static inline bool pfs_can_stop_tick(struct rq *rq) { return true; }
 static inline void pfs_balance_trigger(struct rq *rq) { }
 static inline void pfs_balance_softirq(void) { }
