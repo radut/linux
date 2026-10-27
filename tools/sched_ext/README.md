@@ -236,7 +236,8 @@ thread waited), `admit` (waiting threads let in), `retry`, `cut` (slots
 taken back for a woken thread), `yield_keep`/`yield_rotate` (what
 `sched_yield()` did), `too_deep` (threads of cgroups deeper than 31 levels,
 not limited), `rescue` and `lost_path` (retries the timer had to make, should
-stay 0 or close to it), and internal ones (`direct`, `shared`, `repark`,
+stay 0 or close to it), `credit` (threads that ran without a slot instead
+of waiting, see below), and internal ones (`direct`, `shared`, `repark`,
 `overflow`, `race`, `activate`, `hweight`, `keep`). CFS's `nr_throttled` stays
 0: waiting threads are queued by scx_pfs, not throttled.
 
@@ -291,6 +292,14 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
 - Waiting for a slot costs latency even in an otherwise idle cgroup: four
   request threads at limit 1 have a median of 3.1 ms vs 1.15 ms under CFS.
 - `cpu.max.burst` is ignored, and so are cgroups deeper than 31 levels.
+- A thread waiting for a slot while it holds a kernel lock stalls every
+  thread waiting for that lock, in any cgroup. Threads that woke up (and
+  io_uring workers) therefore run without a slot while their cgroups have
+  budget left in the current window, and exiting threads, kernel threads and
+  threads being killed never wait. A cgroup's usage stays at its limit over a
+  window, but its concurrency can exceed the limit meanwhile. A thread
+  preempted or rotated in the kernel with a sleeping lock held can still wait:
+  sched_ext doesn't tell whether a thread is returning to user space.
 
 
 # Troubleshooting

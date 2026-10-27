@@ -31,6 +31,21 @@
  * holding its slots since its own wakeup is not cut short. ops.tick()
  * checks this, so the cuts are rounded up to a tick.
  *
+ * A task can hold kernel locks wherever it is enqueued, and one which waits
+ * for a slot with a lock held stalls every task waiting for that lock, in any
+ * cgroup. Tasks which woke up are in the kernel and may have been woken as the
+ * new owner of a lock, so they don't wait while every limited cgroup on their
+ * path has budget left in the current window: they run without slots, on
+ * credit, and their runtime is charged to the windows, which bounds the
+ * cgroup's usage to its limit over a window but lets its concurrency exceed
+ * the width meanwhile. A task whose credit ran out waits with the woken tasks.
+ * io_uring workers, which never return to user space, are treated as woken.
+ * Exiting tasks, kernel threads and tasks with SIGKILL pending never wait, as
+ * they are about to give up what they hold. Other tasks wait for a slot when
+ * their slice ends, when they are preempted and when they yield, also if that
+ * happens in the kernel with a sleeping lock held: sched_ext doesn't tell
+ * whether a task is returning to user space when it is enqueued.
+ *
  * sched_yield() doesn't give the slots away, unless the task has held them for
  * cut_ns and others wait for them: a thread which yields with a lock held
  * would otherwise wait a whole turn per yield, while the threads woken for the
@@ -148,6 +163,7 @@ enum {
 #define SLOT_LEVELS_MASK	0xffffffffLLU
 #define SLOT_SEQ_SHIFT		32
 #define MIN_BUDGET_NS		(100 * 1000LLU)
+#define PFS_SIGKILL		9
 #define HWEIGHT_REFRESH_NS	(1000 * 1000LLU)
 /* a waiting cgroup not walked by any retry for this long is retried */
 #define RESCUE_NS		(50 * 1000 * 1000LLU)
@@ -224,6 +240,7 @@ struct pfs_task_ctx {
 	u64		run_weight;	/* weight @p is counted with */
 	u64		admitted_at;	/* when the slots were taken */
 	u32		rotated;	/* admitted after a rotation, not a wakeup */
+	u32		credit;		/* runs on credit since a wakeup */
 	/*
 	 * IDs of the cgroups on cgid's path by level, set with ->cgid. Slots
 	 * are given back through them: the cgroup of an exiting task can be
@@ -467,17 +484,36 @@ static u64 window_left(struct pfs_cgrp_ctx *cgc, u64 now)
 }
 
 /*
+ * Return whether @cgc has budget left in the current window and clip *@slicep
+ * to it. Less than MIN_BUDGET_NS left counts as none to avoid tiny slices,
+ * unless the whole budget of a window is smaller than that.
+ */
+static bool budget_left(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
+{
+	u64 left, min_left;
+
+	left = window_left(cgc, now);
+	min_left = cgc->limit * window_ns / FRAC_ONE;
+	if (min_left > MIN_BUDGET_NS)
+		min_left = MIN_BUDGET_NS;
+	if (!left || left < min_left)
+		return false;
+	if (left < *slicep)
+		*slicep = left;
+	return true;
+}
+
+/*
  * Take a slot in a single limited cgroup. The first floor(limit) slots are
- * free. The last slot of a fractional limit needs budget left in the window and
- * clips *@slicep to it. Less than MIN_BUDGET_NS left counts as none to avoid
- * tiny slices, unless the whole budget of a window is smaller than that.
+ * free. The last slot of a fractional limit needs budget left in the window,
+ * see budget_left().
  */
 static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 				     u64 *slicep)
 {
 	u64 width = div_round_up(cgc->limit, FRAC_ONE);
 	u64 full = cgc->limit / FRAC_ONE;
-	u64 taken, left, min_left;
+	u64 taken;
 
 	taken = __sync_fetch_and_add(&cgc->nr_slots, 1);
 	if (taken >= width) {
@@ -485,17 +521,9 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 		return RESERVE_FULL;
 	}
 
-	if (taken >= full) {
-		left = window_left(cgc, now);
-		min_left = cgc->limit * window_ns / FRAC_ONE;
-		if (min_left > MIN_BUDGET_NS)
-			min_left = MIN_BUDGET_NS;
-		if (!left || left < min_left) {
-			__sync_fetch_and_sub(&cgc->nr_slots, 1);
-			return RESERVE_BUDGET;
-		}
-		if (left < *slicep)
-			*slicep = left;
+	if (taken >= full && !budget_left(cgc, now, slicep)) {
+		__sync_fetch_and_sub(&cgc->nr_slots, 1);
+		return RESERVE_BUDGET;
 	}
 
 	return RESERVE_OK;
@@ -700,6 +728,46 @@ static bool unpublish_slots(struct pfs_task_ctx *taskc, u64 val)
 }
 
 /*
+ * Tasks which never wait for a slot: exiting tasks, kernel threads and tasks
+ * with SIGKILL pending are about to give up the locks and resources they hold,
+ * which tasks of other cgroups may wait for.
+ */
+static bool must_not_park(struct task_struct *p)
+{
+	if (p->flags & (PF_EXITING | PF_KTHREAD))
+		return true;
+	return p->pending.signal.sig[0] & (1LLU << (PFS_SIGKILL - 1));
+}
+
+/*
+ * Whether a task of @cgrp which found no free slot may run on credit, without
+ * slots: every limited cgroup on the path has budget left in the current
+ * window, the smallest of which clips *@slicep. The runtime is charged to the
+ * windows, so credit stops once a cgroup used its limit's worth of the window.
+ */
+static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
+{
+	struct pfs_cgrp_ctx *cgc;
+	u64 cgid;
+	int level;
+
+	if (too_deep(cgrp))
+		return true;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (level > cgrp->level)
+			break;
+
+		cgc = find_ancestor_ctx(cgrp, level, &cgid);
+		if (!cgc)
+			return false;
+		if (cgc->limit && !budget_left(cgc, now, slicep))
+			return false;
+	}
+	return true;
+}
+
+/*
  * Give back the slots @p holds. The xchg makes sure that the slots are put
  * once when several paths try to release them concurrently.
  */
@@ -719,6 +787,7 @@ static void set_admitted(struct pfs_task_ctx *taskc, u64 now, bool rotated)
 {
 	taskc->admitted_at = now;
 	taskc->rotated = rotated;
+	taskc->credit = 0;
 }
 
 /*
@@ -850,6 +919,17 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 		if (!taskc) {
 			res = WK_MORE;
 			break;
+		}
+
+		/* e.g. SIGKILL arrived while @p waited, let it run on credit */
+		if (must_not_park(p)) {
+			set_admitted(taskc, window_now(), !woken_dsq);
+			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
+						   SHARED_DSQ, 0)) {
+				stat_inc(PFS_STAT_CREDIT);
+				kick_idle_cpu(p);
+			}
+			continue;
 		}
 
 		/* the slots are put through @task_cgrp, keep it until done */
@@ -1259,7 +1339,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	enum reserve_result ret;
 	u64 slice = slice_ns, mask, val, fail_cgid = 0;
 	u64 vtime;
-	bool woken;
+	bool woken, credit = false;
 
 	/*
 	 * Per-cpu kthreads can't be queued behind anything else, run them
@@ -1284,7 +1364,11 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	cgrp = scx_bpf_task_cgroup(p);
 	set_task_cgrp(taskc, cgrp);
 	vtime = clamp_vtime(p, cgrp);
-	woken = enq_flags & SCX_ENQ_WAKEUP;
+	/*
+	 * A task whose credit ran out still serves its wakeup: it waits with
+	 * the woken tasks, not behind the rotated ones.
+	 */
+	woken = (enq_flags & SCX_ENQ_WAKEUP) || taskc->credit;
 
 	ret = reserve_slots(cgrp, true, &slice, &mask, &fail_cgid);
 	if (ret == RESERVE_OK && !publish_slots(taskc, mask, &val)) {
@@ -1299,9 +1383,26 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 		fail_cgid = taskc->cgid;
 	}
 
+	/*
+	 * Don't let a task wait which may hold a lock others wait for, see
+	 * the top of the file. Woken tasks run on credit while the budget
+	 * lasts, as do io_uring workers, which never return to user space.
+	 */
+	if (ret != RESERVE_OK) {
+		slice = slice_ns;
+		if (must_not_park(p) ||
+		    (((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
+		     credit_left(cgrp, window_now(), &slice))) {
+			stat_inc(PFS_STAT_CREDIT);
+			ret = RESERVE_OK;
+			credit = true;
+		}
+	}
+
 	if (ret == RESERVE_OK) {
 		stat_inc(PFS_STAT_SHARED);
 		set_admitted(taskc, window_now(), !woken);
+		taskc->credit = credit;
 		/*
 		 * SCX_ENQ_LAST: @p's slice expired and nothing else is queued
 		 * for the CPU. Keep it running, the CPU would idle otherwise.
@@ -1741,6 +1842,7 @@ s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 		return -ENOMEM;
 
 	taskc->slot_mask = 0;
+	taskc->credit = 0;
 	taskc->run_cgid = 0;
 	taskc->cgid = 0;
 

@@ -26,6 +26,7 @@ enum pfs_stat_idx {
 	PFS_STAT_YIELD_ROTATE,	/* yields that gave the slots to a waiter */
 	PFS_STAT_RESCUE,		/* waiting cgroups retried by the timer sweep */
 	PFS_STAT_LOST_PATH,		/* slots of a removed cgroup not given back */
+	PFS_STAT_CREDIT,		/* ran without slots instead of waiting */
 
 	PFS_NR_STATS,
 };
