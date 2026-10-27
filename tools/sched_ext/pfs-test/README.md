@@ -74,7 +74,7 @@ and `$PATH`.
 | `docker-run.sh`    | One case in a container (Docker or Podman). |
 | `compare.sh`       | The whole matrix or chosen cells, repeated if asked; CSV and a summary table. |
 | `summary.py`       | Summary of a results.csv: median (min-max) per case and variant. |
-| `scx_pfs.service`  | Example systemd unit for running scx_pfs on a host. |
+| `scx_pfs.service`  | Example systemd unit for running scx_pfs on a host, sandboxed down to `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON` and a read-only file system. |
 | `docker-image.sh`  | Builds a local FROM-scratch image with the static binaries (`docker import`, no registry). |
 | `scx-container.sh` | Runs scx_pfs in a container with `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON` only, the Docker shape of a DaemonSet. |
 

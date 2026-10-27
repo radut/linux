@@ -239,11 +239,17 @@ Printed every `-i` seconds: `park_full` (a thread waited for a slot),
 thread waited), `admit` (waiting threads let in), `retry`, `cut` (slots
 taken back for a woken thread), `yield_keep`/`yield_rotate` (what
 `sched_yield()` did), `too_deep` (threads of cgroups deeper than 31 levels,
-not limited), `rescue` and `lost_path` (retries the timer had to make, should
-stay 0 or close to it), `credit` (threads that ran without a slot instead
-of waiting, see below), and internal ones (`direct`, `shared`, `repark`,
-`overflow`, `race`, `activate`, `hweight`, `keep`). CFS's `nr_throttled` stays
-0: waiting threads are queued by scx_pfs, not throttled.
+not limited), `rescue` (waiting cgroups the timer retried because no retry
+walked them for 50 ms; it grows when admitted threads wait long for a CPU),
+`lost_path` (threads whose cgroup was removed under them), `credit` (threads
+that ran without a slot instead of waiting, see below), `overflow` (cgroups
+that didn't fit in the queues, see `-q`), `drain` (threads still waiting
+when their cgroup was removed, moved/kept; should stay 0/0), `no_dsq`
+(cgroups not limited because their queue couldn't be allocated),
+`park_race` (retries repeated for a thread about to start waiting), and
+internal ones (`direct`, `shared`, `repark`, `race`, `activate`, `hweight`,
+`keep`). CFS's `nr_throttled` stays 0: waiting threads are queued by
+scx_pfs, not throttled.
 
 ### Running it
 
@@ -303,8 +309,9 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
   budget left in the current window, and exiting threads, kernel threads and
   threads being killed never wait. A cgroup's usage stays at its limit over a
   window, but its concurrency can exceed the limit meanwhile. A thread
-  preempted or rotated in the kernel with a sleeping lock held can still wait:
-  sched_ext doesn't tell whether a thread is returning to user space.
+  preempted, rotated or yielding (also through the in-kernel `yield()`) in
+  the kernel with a sleeping lock held can still wait: sched_ext doesn't tell
+  whether a thread is returning to user space.
 
 
 # Troubleshooting
