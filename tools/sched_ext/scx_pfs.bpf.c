@@ -209,6 +209,7 @@ struct pfs_cgrp_ctx {
 	u32		budget_queued;
 	u32		woken_streak;	/* woken tasks admitted in a row */
 	u32		in_waitset;	/* listed in waitset */
+	u32		no_dsq;		/* wait DSQs not created, never limited */
 	u64		retry_at;	/* when a retry last walked the DSQs */
 	u64		window_id;
 	u64		window_used;	/* runtime charged in window_id */
@@ -1884,6 +1885,10 @@ void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 
 static void set_limit(struct pfs_cgrp_ctx *cgc, u64 limit)
 {
+	/* without wait DSQs the cgroup's tasks can't wait for slots */
+	if (cgc->no_dsq)
+		limit = 0;
+
 	if (!cgc->limit && limit)
 		__sync_fetch_and_add(&nr_limited, 1);
 	else if (cgc->limit && !limit)
@@ -1905,23 +1910,30 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 	 * unlikely case that it breaks.
 	 */
 	ret = scx_bpf_create_dsq(cgid, -1);
-	if (ret) {
-		scx_bpf_error("scx_bpf_create_dsq failed (%d)", ret);
-		return ret;
-	}
-	ret = scx_bpf_create_dsq(cgid | WOKEN_DSQ, -1);
-	if (ret) {
-		scx_bpf_destroy_dsq(cgid);
-		scx_bpf_error("scx_bpf_create_dsq failed (%d)", ret);
-		return ret;
+	if (!ret) {
+		ret = scx_bpf_create_dsq(cgid | WOKEN_DSQ, -1);
+		if (ret)
+			scx_bpf_destroy_dsq(cgid);
 	}
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0,
 				   BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!cgc) {
-		scx_bpf_destroy_dsq(cgid);
-		scx_bpf_destroy_dsq(cgid | WOKEN_DSQ);
+		if (!ret) {
+			scx_bpf_destroy_dsq(cgid);
+			scx_bpf_destroy_dsq(cgid | WOKEN_DSQ);
+		}
 		return -ENOMEM;
+	}
+
+	/*
+	 * Failing the scheduler for one cgroup, which allocation failures
+	 * would allow anyone who may create cgroups to do, is worse than not
+	 * limiting that cgroup. Its limit is ignored, counted in no_dsq.
+	 */
+	if (ret) {
+		stat_inc(PFS_STAT_NO_DSQ);
+		cgc->no_dsq = 1;
 	}
 
 	cgc->weight = args->weight;
@@ -1969,8 +1981,10 @@ void BPF_STRUCT_OPS(pfs_cgroup_exit, struct cgroup *cgrp)
 	if (cgc)
 		set_limit(cgc, 0);
 
-	drain_destroy_dsq(cgid);
-	drain_destroy_dsq(cgid | WOKEN_DSQ);
+	if (!cgc || !cgc->no_dsq) {
+		drain_destroy_dsq(cgid);
+		drain_destroy_dsq(cgid | WOKEN_DSQ);
+	}
 	bpf_map_delete_elem(&waitset, &cgid);
 }
 

@@ -29,6 +29,7 @@ enum pfs_stat_idx {
 	PFS_STAT_CREDIT,		/* ran without slots instead of waiting */
 	PFS_STAT_DRAIN,		/* waiting tasks let run as their cgroup went */
 	PFS_STAT_DRAIN_FAIL,		/* wait DSQ not empty after the drain, kept */
+	PFS_STAT_NO_DSQ,		/* cgroups not limited, DSQ creation failed */
 
 	PFS_NR_STATS,
 };
