@@ -10,6 +10,7 @@
 # Environment:
 #   SCX        path to the scx_pfs binary (default: search, see find_scx)
 #   SCX_ARGS   extra scx_pfs options, e.g. "-s 2500 -w 10000"
+#   SCX_LOG    file for scx_pfs's output (default: a new mktemp file)
 #   WT_CG      cgroup directory name under /sys/fs/cgroup (default pfs-test)
 #   WT_TRACE   0 disables the sched_switch trace (no concurrency columns)
 
@@ -30,6 +31,41 @@ TRACE_ON=0
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 die() { echo "error: $*" >&2; exit 1; }
+
+# check_num NAME VALUE: VALUE is a plain non-negative number (e.g. 1, 0.5)
+check_num() {
+	[[ $2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$1 must be a non-negative number, not '$2'"
+}
+
+# check_int NAME VALUE: VALUE is a positive integer
+check_int() {
+	[[ $2 =~ ^[1-9][0-9]{0,8}$ ]] || die "$1 must be a positive integer, not '$2'"
+}
+
+# check_case LIMIT THREADS SECS: the arguments of one test case
+check_case() {
+	[ "$1" = max ] || check_num LIMIT "$1"
+	[[ $2 =~ ^[0-9]{1,4}$ ]] || die "THREADS must be a number of threads, not '$2'"
+	check_int SECS "$3"
+}
+
+# scx_args: SCX_ARGS split into the array SCX_ARGV, options and numbers only,
+# so that the variable can't smuggle other words onto a command line
+scx_args() {
+	local a
+	read -r -a SCX_ARGV <<< "${SCX_ARGS:-}"
+	for a in "${SCX_ARGV[@]}"; do
+		[[ $a =~ ^-?[A-Za-z0-9.]+$ ]] || die "SCX_ARGS: unexpected word '$a'"
+	done
+}
+
+# scx_log: the file scx_pfs writes to; a private new file unless SCX_LOG is set
+scx_log() {
+	if [ -z "${SCX_LOG:-}" ]; then
+		SCX_LOG=$(mktemp "${TMPDIR:-/tmp}/scx_pfs.XXXXXXXX") || die "mktemp failed"
+	fi
+	echo "$SCX_LOG"
+}
 
 need_root() {
 	[ "$(id -u)" = 0 ] || die "run as root (cgroup, tracefs and sched_ext need it)"
@@ -101,10 +137,12 @@ scx_start() {
 	case ${SCX_MODE:-host} in
 	host)
 		bin=$(find_scx) || die "scx_pfs binary not found (set SCX=/path/to/scx_pfs)"
-		# shellcheck disable=SC2086
-		"$bin" ${SCX_ARGS:-} -i 3600 > "${SCX_LOG:-/tmp/scx_pfs.log}" 2>&1 &
+		scx_args
+		scx_log > /dev/null
+		"$bin" "${SCX_ARGV[@]}" -i 3600 > "$SCX_LOG" 2>&1 &
 		SCX_PID=$!
-		wait_scx_enabled || { cat "${SCX_LOG:-/tmp/scx_pfs.log}" >&2; die "scx_pfs did not enable"; }
+		wait_scx_enabled || { cat "$SCX_LOG" >&2; die "scx_pfs did not enable"; }
+		log "scx_pfs output in $SCX_LOG"
 		;;
 	service)
 		systemctl start "${SCX_UNIT:-scx_pfs.service}"
@@ -137,8 +175,9 @@ scx_stop() {
 	wait "$SCX_PID" 2>/dev/null || true
 	SCX_PID=
 	# the kernel ejects a scheduler that stalls tasks (watchdog); report it
-	if grep -q 'SCX_EXIT_ERROR\|runnable task stall\|watchdog' "${SCX_LOG:-/tmp/scx_pfs.log}" 2>/dev/null; then
-		log "scx_pfs log reports an error exit, see ${SCX_LOG:-/tmp/scx_pfs.log}"
+	if [ -n "${SCX_LOG:-}" ] &&
+	   grep -q 'SCX_EXIT_ERROR\|runnable task stall\|watchdog' "$SCX_LOG" 2>/dev/null; then
+		log "scx_pfs log reports an error exit, see $SCX_LOG"
 	fi
 }
 
@@ -345,9 +384,9 @@ limited_cgroup() {
 scx_container_start() {
 	local i
 	[ "$(cat $SCX_STATE 2>/dev/null)" = disabled ] || die "sched_ext missing or a scheduler is already loaded"
-	# shellcheck disable=SC2086
+	scx_args
 	$DOCKER run -d --name "$SCX_CTR" --privileged --pid=host --network none \
-		"$IMAGE" /scx_pfs ${SCX_ARGS:-} -i 3600 > /dev/null
+		"$IMAGE" /scx_pfs "${SCX_ARGV[@]}" -i 3600 > /dev/null
 	for i in $(seq 50); do
 		[ "$(cat $SCX_STATE)" = enabled ] && break
 		sleep 0.1

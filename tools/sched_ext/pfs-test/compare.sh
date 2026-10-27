@@ -62,9 +62,19 @@ compare_main() {
 		*) usage >&2; exit 2 ;;
 		esac
 	done
+	# the lists are split on commas below, so they may only hold the
+	# characters of numbers and names
+	[[ $limits$threads$cells =~ ^[0-9.,:]*$ ]] || die "-l, -t and -C take numbers"
+	[[ $lat =~ ^([0-9.,]*|none)$ ]] || die "-L takes CPU limits or none"
+	[[ $variants$neighs =~ ^[a-z,]*$ ]] || die "-v and -n take names"
+	check_int REPS "$reps"
+	check_int SECS "$secs"
+	case $SYSTEMD_MODE in scope|service) ;; *) die "mode must be scope or service" ;; esac
 	need_root
 	check_cgroup2
-	[ -x "$KIT/bin/spin" ] && [ -x "$KIT/bin/reqlat" ] || die "build first: make -C $KIT"
+	if [ ! -x "$KIT/bin/spin" ] || [ ! -x "$KIT/bin/reqlat" ]; then
+		die "build first: make -C $KIT"
+	fi
 	case $path in
 	cgroup) ;;
 	docker) docker_check ;;
@@ -97,6 +107,7 @@ compare_main() {
 		for r in $(seq "$reps"); do
 			for c in ${cells//,/ }; do
 				l=${c%%:*} t=${c##*:}
+				check_case "$l" "$t" "$secs"
 				if awk -v l="$l" -v c="$ncpu" 'BEGIN { exit !(l >= c) }'; then
 					[ "$r" != 1 ] || log "skip limit $l: not below the $ncpu CPUs"
 					continue

@@ -103,9 +103,9 @@ neighbour with one busy thread per CPU), `-H` (CSV header).
 | `WT_TRACE` | 1 | 0 skips the `sched_switch` trace (no concurrency columns) |
 | `WT_CG`, `WT_SLICE` | `pfs-test`, `pfstest.slice` | cgroup and systemd slice used |
 | `SCX` | search | path of the `scx_pfs` binary |
-| `SCX_ARGS` | empty | extra scx_pfs options, e.g. `-s 2500 -c 500` |
+| `SCX_ARGS` | empty | extra scx_pfs options, e.g. `-s 2500 -c 500` (options and numbers only) |
 | `SCX_MODE` | `host` | `host` (started by the script), `service` (`systemctl start $SCX_UNIT`), `container` (`scx-container.sh`) |
-| `SCX_LOG`, `SCX_UNIT`, `SCX_CTR` | `/tmp/scx_pfs.log`, `scx_pfs.service`, `scx-pfs` | log, unit and container names |
+| `SCX_LOG`, `SCX_UNIT`, `SCX_CTR` | a new `mktemp` file, `scx_pfs.service`, `scx-pfs` | log, unit and container names |
 | `DOCKER`, `IMAGE` | `docker`, `pfs-test:local` | runtime command (Podman, rootless Podman) and image |
 
 scx_pfs itself takes `-s SLICE_US` (2500), `-c CUT_US` (500), `-r ROT_US`

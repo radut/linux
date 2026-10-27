@@ -43,17 +43,17 @@ EOF
 # run_docker_case VARIANT LIMIT THREADS SECS WORKLOAD NEIGHBOUR PERIOD SHARES
 run_docker_case() {
 	local variant=$1 limit=$2 threads=$3 secs=$4 wl=$5 neigh=$6 period=$7 shares=$8
-	local name noisy cpuopt cg out st conc tmp c
+	local name noisy cg out st conc tmp c cpuopt=()
 	# fresh names per case: Podman frees a name only once removal completes
 	WT_SEQ=$((${WT_SEQ:-0} + 1))
 	name=wt-ctr-$$-$WT_SEQ noisy=wt-noisy-$$-$WT_SEQ
 	tmp=$(mktemp -d)
 	if [ -n "$period" ]; then
-		cpuopt="--cpu-period=$period --cpu-quota=$(awk -v l="$limit" -v p="$period" 'BEGIN { printf "%d", l * p }')"
+		cpuopt=(--cpu-period="$period" --cpu-quota="$(awk -v l="$limit" -v p="$period" 'BEGIN { printf "%d", l * p }')")
 	else
-		cpuopt="--cpus=$limit"
+		cpuopt=(--cpus="$limit")
 	fi
-	[ -z "$shares" ] || cpuopt="$cpuopt --cpu-shares=$shares"
+	[ -z "$shares" ] || cpuopt+=(--cpu-shares="$shares")
 	if [ "$neigh" = noisy ]; then
 		WT_CTRS+=("$noisy")
 		$DOCKER run -d --name "$noisy" --network none "$IMAGE" \
@@ -63,12 +63,10 @@ run_docker_case() {
 	WT_CTRS+=("$name")
 	trace_start
 	if [ "$wl" = reqlat ]; then
-		# shellcheck disable=SC2086
-		$DOCKER run -d --name "$name" --network none $cpuopt "$IMAGE" /reqlat \
+		$DOCKER run -d --name "$name" --network none "${cpuopt[@]}" "$IMAGE" /reqlat \
 			"${REQ_THREADS:-4}" "${REQ_WORK_US:-1000}" "${REQ_PERIOD_US:-20000}" "$secs" "$threads" > /dev/null
 	else
-		# shellcheck disable=SC2086
-		$DOCKER run -d --name "$name" --network none $cpuopt "$IMAGE" /spin "$threads" "$secs" > /dev/null
+		$DOCKER run -d --name "$name" --network none "${cpuopt[@]}" "$IMAGE" /spin "$threads" "$secs" > /dev/null
 	fi
 	cg=$(container_cgroup "$name")
 	log "container cgroup: ${cg#"$CG_FS"} cpu.max=\"$(cat "$cg/cpu.max")\" cpu.weight=$(cat "$cg/cpu.weight")"
@@ -105,6 +103,9 @@ docker_main() {
 	done
 	shift $((OPTIND - 1))
 	[ $# -eq 3 ] || { usage >&2; exit 2; }
+	check_case "$2" "$3" "$secs"
+	[ -z "$period" ] || check_int PERIOD_US "$period"
+	[ -z "$shares" ] || check_int SHARES "$shares"
 	docker_check
 	need_root
 	check_cgroup2

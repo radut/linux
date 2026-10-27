@@ -147,6 +147,9 @@ systemd_main() {
 	done
 	shift $((OPTIND - 1))
 	[ $# -eq 3 ] || { usage >&2; exit 2; }
+	check_case "$2" "$3" "$secs"
+	[ -z "$period" ] || check_int PERIOD_US "$period"
+	check_int WEIGHT "$weight"
 	case $mode in scope|service) ;; *) die "mode must be scope or service" ;; esac
 	command -v systemd-run > /dev/null || die "systemd-run not found"
 	[ -d /run/systemd/system ] || die "systemd is not the init system"
