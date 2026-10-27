@@ -143,6 +143,15 @@ after running the group's tasks for the slice per task, so that the CPUs
 take turns. Limits apply at every level of the hierarchy. cpu.cfs_burst_us
 is ignored in width mode, and nr_periods and nr_throttled count windows.
 
+A throttled task keeps running until it returns to user space, so a slot
+alone doesn't bound the time a group spends in the kernel, e.g. in long reads
+of /dev/urandom or in pipe writes. Width mode therefore charges all runtime
+of the group, with or without a slot, and carries the usage beyond L over as
+debt, up to what L allows in one second. While the debt is above a margin of
+one window's budget plus a tick per slot, no slot is handed out, so that the
+group pays it back by running below its limit. Such loads average at the
+limit, as with bandwidth control, but in throttled stretches.
+
 Width mode is meant for multi-threaded groups (request handlers, databases,
 garbage-collected runtimes) whose threads would otherwise run on many CPUs
 for part of a period and then all wait for the next one. It needs

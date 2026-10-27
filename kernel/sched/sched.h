@@ -477,6 +477,12 @@ struct cfs_bandwidth {
 	int			width_active;
 	u64			width_budget;
 	ktime_t			width_window;
+	/* runtime beyond the limit, paid back before slots are handed out */
+	atomic64_t		width_runtime;	/* charged since width_settled */
+	u64			width_settled;
+	u64			width_debt;
+	u64			width_debt_max;
+	u64			width_margin;
 
 	/* Statistics: */
 	int			nr_periods;
@@ -786,6 +792,7 @@ struct cfs_rq {
 	u8			width_slot;
 	u8			width_woken;
 	u64			width_used;
+	u64			width_charge;	/* not yet in cfs_b->width_runtime */
 	int			throttle_count;
 	struct list_head	throttled_list;
 	struct list_head	throttled_csd_list;
