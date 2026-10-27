@@ -519,7 +519,9 @@ struct pfs_group {
 	/* admits waiting tasks when slots were freed without a hand-off */
 	struct irq_work		retry_work;
 
-	/* cpu.weight, protected by pfs_weight_lock */
+	/* protects the children's ->weight and ->nr_active and ->child_weight_sum */
+	raw_spinlock_t		weight_lock;
+	/* cpu.weight, protected by the parent's weight_lock */
 	unsigned long		weight;
 	/* active children plus one for own admitted tasks */
 	int			nr_active;
@@ -530,7 +532,6 @@ struct pfs_group {
 	atomic_long_t		own_weight;
 	/* cached hierarchical weight, see pfs_hweight() */
 	unsigned long		hweight;
-	unsigned long		hweight_gen;
 	u64			hweight_at;
 
 	/* runtime under the parent's slots, scaled by weight */

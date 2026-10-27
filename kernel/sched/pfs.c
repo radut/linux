@@ -1288,11 +1288,6 @@ static void pfs_group_retry(struct pfs_group *lg)
  * admitted tasks of a group share its weight, however many wait.
  */
 
-/* protects pfs_group::weight, ::nr_active and ::child_weight_sum */
-static DEFINE_RAW_SPINLOCK(pfs_weight_lock);
-/* bumped when the active groups or a weight change, expires hweights */
-static atomic_long_t pfs_hweight_gen = ATOMIC_LONG_INIT(1);
-
 #define PFS_HWEIGHT_REFRESH_NS	NSEC_PER_MSEC
 
 /*
@@ -1300,7 +1295,8 @@ static atomic_long_t pfs_hweight_gen = ATOMIC_LONG_INIT(1);
  * the parents' states change. Increments and decrements commute, so the
  * races of a group's tasks going in and out from several CPUs leave the sums
  * consistent: a group's weight is in its parent's sum exactly while its
- * nr_active is positive.
+ * nr_active is positive. Each level takes its parent's weight_lock, which
+ * serialises only siblings, never two of them at once.
  */
 static void pfs_update_active(struct pfs_group *g, bool active)
 {
@@ -1311,7 +1307,7 @@ static void pfs_update_active(struct pfs_group *g, bool active)
 		parent = pfs_parent(g);
 		propagate = false;
 
-		raw_spin_lock(&pfs_weight_lock);
+		raw_spin_lock(&parent->weight_lock);
 		if (active) {
 			if (!g->nr_active++) {
 				/* autogroup nice changes don't go through the hook */
@@ -1326,12 +1322,11 @@ static void pfs_update_active(struct pfs_group *g, bool active)
 				propagate = true;
 			}
 		}
-		raw_spin_unlock(&pfs_weight_lock);
+		raw_spin_unlock(&parent->weight_lock);
 
 		if (!propagate)
 			break;
 	}
-	atomic_long_inc(&pfs_hweight_gen);
 }
 
 static inline unsigned long pfs_group_load(struct pfs_group *g)
@@ -1340,18 +1335,17 @@ static inline unsigned long pfs_group_load(struct pfs_group *g)
 }
 
 /*
- * @g's hierarchical weight, recomputed when the generation changed but at
- * most once per PFS_HWEIGHT_REFRESH_NS: on a busy host groups go idle and
- * busy all the time. The inputs are read without the lock, the result is
+ * @g's hierarchical weight, recomputed at most once per
+ * PFS_HWEIGHT_REFRESH_NS: on a busy host groups go idle and busy all the
+ * time, and a global generation of the active set would be a cache line
+ * written by every CPU. The inputs are read without the locks, the result is
  * approximate by nature.
  */
-static unsigned long pfs_hweight(struct pfs_group *g, unsigned long gen, u64 now)
+static unsigned long pfs_hweight(struct pfs_group *g, u64 now)
 {
 	struct pfs_group *parent = pfs_parent(g);
 	unsigned long h, d;
 
-	if (READ_ONCE(g->hweight_gen) == gen)
-		return READ_ONCE(g->hweight);
 	if (READ_ONCE(g->hweight) &&
 	    now - READ_ONCE(g->hweight_at) < PFS_HWEIGHT_REFRESH_NS)
 		return READ_ONCE(g->hweight);
@@ -1360,13 +1354,12 @@ static unsigned long pfs_hweight(struct pfs_group *g, unsigned long gen, u64 now
 	if (parent->depth > 0 && g->depth <= PFS_MAX_DEPTH) {
 		d = pfs_group_load(parent);
 		if (d)
-			h = mul_u64_u64_div_u64(pfs_hweight(parent, gen, now), h, d);
+			h = mul_u64_u64_div_u64(pfs_hweight(parent, now), h, d);
 	}
 	h = max(h, scale_load(MIN_SHARES));
 
 	WRITE_ONCE(g->hweight, h);
 	WRITE_ONCE(g->hweight_at, now);
-	WRITE_ONCE(g->hweight_gen, gen);
 	return h;
 }
 
@@ -1424,8 +1417,7 @@ static unsigned long pfs_effective_weight(struct task_struct *p,
 
 	d = pfs_group_load(g);
 	if (d)
-		w = mul_u64_u64_div_u64(pfs_hweight(g, atomic_long_read(&pfs_hweight_gen),
-						    pfs_now()), w, d);
+		w = mul_u64_u64_div_u64(pfs_hweight(g, pfs_now()), w, d);
 
 	floor = mul_u64_u64_div_u64(load, pfs_task_slice(p), PFS_WAIT_MAX_NS);
 	if (!task_has_idle_policy(p) && w < floor)
@@ -3207,6 +3199,7 @@ void pfs_init_group(struct task_group *tg, struct task_group *parent)
 	struct pfs_group *g = &tg->pfs;
 
 	raw_spin_lock_init(&g->lock);
+	raw_spin_lock_init(&g->weight_lock);
 	INIT_LIST_HEAD(&g->waiters);
 	INIT_LIST_HEAD(&g->wake_waiters);
 	g->depth = parent ? parent->pfs.depth + 1 : 0;
@@ -3294,13 +3287,11 @@ void pfs_group_set_weight(struct task_group *tg)
 	parent = pfs_parent(g);
 	w = max(READ_ONCE(tg->shares), scale_load(MIN_SHARES));
 
-	raw_spin_lock_irqsave(&pfs_weight_lock, flags);
+	raw_spin_lock_irqsave(&parent->weight_lock, flags);
 	if (g->nr_active > 0)
 		parent->child_weight_sum += w - g->weight;
 	g->weight = w;
-	raw_spin_unlock_irqrestore(&pfs_weight_lock, flags);
-
-	atomic_long_inc(&pfs_hweight_gen);
+	raw_spin_unlock_irqrestore(&parent->weight_lock, flags);
 }
 
 /**************************************************************

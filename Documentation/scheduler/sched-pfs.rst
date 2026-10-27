@@ -310,9 +310,9 @@ share of the group's weight over time.
 
 Effective weights are computed when a task is admitted and refreshed on every
 tick for the running task, with its lag and deadline rescaled. Hierarchical
-weights are cached per group and recomputed at most once per millisecond when
-the set of active groups or a weight has changed (a global generation
-counter). w_eff is clamped to ``[scale_load(MIN_SHARES),
+weights are cached per group and recomputed at most once per millisecond
+(there is no global generation counter, which every CPU would write on every
+change of the active set). w_eff is clamped to ``[scale_load(MIN_SHARES),
 scale_load(MAX_SHARES)]``.
 
 Starvation floor: w_eff of a task of a non-root group is at least the load of
@@ -432,7 +432,7 @@ Lock order::
    p->pi_lock
      rq->__lock (two run queues: double_rq_lock() order)
        pfs_group::lock (wait queue; never two at once)
-         pfs_weight_lock (active sums, hierarchical weights)
+       pfs_group::weight_lock of the parent (active sums; never two at once)
 
 - Slot counts are atomics, taken with increment-and-check and given back with
   a decrement. A task's slot mask, state and group are protected by its run
@@ -807,8 +807,9 @@ Limits of this implementation
 
 - The balancer scans CPU masks linearly; it is meant for machines up to a few
   hundred CPUs, not for large NUMA systems.
-- Active-set changes of groups take one global spin lock (only on 0 <-> 1
-  transitions of a group's admitted count).
+- Active-set changes of a group (0 <-> 1 transitions of its admitted count)
+  take the parent's weight lock, so sibling groups share a lock and a cache
+  line: all pods of a Kubernetes QoS class have the same parent.
 - The budget slot is accounted per tick; a group can overrun its budget by up
   to a tick per running thread per window, which is carried over (as debt of
   up to one second's worth of the limit, so that limits much smaller than a
