@@ -255,8 +255,13 @@ static inline bool prio_less(const struct task_struct *a,
 		return !dl_time_before(a_dl->deadline, b_dl->deadline);
 	}
 
-	if (pa == MAX_RT_PRIO + MAX_NICE)	/* fair */
+	if (pa == MAX_RT_PRIO + MAX_NICE) {	/* fair */
+#ifdef CONFIG_SCHED_PFS
+		if (pfs_enabled())
+			return pfs_prio_less(a, b, in_fi);
+#endif
 		return cfs_prio_less(a, b, in_fi);
+	}
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 	if (pa == MAX_RT_PRIO + MAX_NICE + 1)	/* ext */

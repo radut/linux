@@ -3500,6 +3500,29 @@ void pfs_debugfs_init(struct dentry *parent)
 	debugfs_create_u32("wakeup_gran_us", 0644, d, &pfs_wakeup_gran_us);
 }
 
+#ifdef CONFIG_SCHED_CORE
+/*
+ * Core scheduling: order two PFS tasks of SMT siblings by their virtual
+ * runtimes, each relative to the zero_vruntime of its CPU (the fair class
+ * uses a snapshot taken at forced idle, see cfs_prio_less()). Returns true
+ * if @a has less right to run than @b.
+ */
+bool pfs_prio_less(const struct task_struct *a, const struct task_struct *b,
+		   bool in_fi)
+{
+	s64 va = (s64)(a->pfs.vruntime - task_rq(a)->pfs.zero_vruntime);
+	s64 vb = (s64)(b->pfs.vruntime - task_rq(b)->pfs.zero_vruntime);
+
+	return va > vb;
+}
+
+/* A task waiting for a slot is in the core tree, but must not be picked. */
+static int task_is_throttled_pfs(struct task_struct *p, int cpu)
+{
+	return p->pfs.state == PFS_WAITING || p->pfs.state == PFS_PARKING;
+}
+#endif
+
 bool pfs_can_stop_tick(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
@@ -3535,6 +3558,10 @@ DEFINE_SCHED_CLASS(pfs) = {
 	.get_rr_interval	= get_rr_interval_pfs,
 
 	.update_curr		= update_curr_pfs,
+
+#ifdef CONFIG_SCHED_CORE
+	.task_is_throttled	= task_is_throttled_pfs,
+#endif
 
 #ifdef CONFIG_UCLAMP_TASK
 	.uclamp_enabled		= 1,

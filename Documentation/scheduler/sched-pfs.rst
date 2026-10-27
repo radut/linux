@@ -829,6 +829,11 @@ Limits of this implementation
   utilisation, so util_est, uclamp of individual tasks on frequency selection
   and energy aware placement don't apply to PFS tasks.
 - NUMA balancing is not run for PFS tasks.
+- Core scheduling (``CONFIG_SCHED_CORE``) orders PFS tasks of SMT siblings
+  by their virtual runtimes relative to each CPU's average, without the
+  snapshot the fair class takes at forced idle, so the fairness between
+  cookies across siblings is approximate. Tasks waiting for a slot are
+  never picked through the core tree.
 - With ``nohz_full``, a CPU running a single task of a limited group keeps its
   tick so that the group's slots can rotate.
 - Group hierarchies deeper than 63 levels are only limited on their top 63

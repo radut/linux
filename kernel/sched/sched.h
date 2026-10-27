@@ -1635,6 +1635,10 @@ static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
 
 extern bool
 cfs_prio_less(const struct task_struct *a, const struct task_struct *b, bool fi);
+#ifdef CONFIG_SCHED_PFS
+extern bool
+pfs_prio_less(const struct task_struct *a, const struct task_struct *b, bool fi);
+#endif
 
 extern void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi);
 
