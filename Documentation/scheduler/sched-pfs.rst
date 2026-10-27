@@ -600,7 +600,8 @@ throttling, the fair load balancer, task PELT.
 Statistics
 ==========
 
-Under ``/sys/kernel/debug/sched/pfs/``:
+Under ``/sys/kernel/debug/sched/pfs/`` (readable by root only: ``groups``
+shows every limited cgroup's path and activity):
 
 ``stats``
    sums of per-CPU counters: ``admit`` (slots taken), ``park_full``,
@@ -621,7 +622,7 @@ Under ``/sys/kernel/debug/sched/pfs/``:
 
 ``waiters``
    the waiting tasks of each CPU with their state and the state of the level
-   they wait at (root only).
+   they wait at.
 
 ``window_us``
    length of the budget window, 1000 to 1000000 (default 10000).

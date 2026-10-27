@@ -887,7 +887,7 @@ static bool pfs_charge(struct pfs_group *g, u64 delta)
 		else
 			atomic64_add(delta, &lg->own_slot_vtime);
 	}
-	return now;
+	return now != 0;
 }
 
 /**************************************************************
@@ -1048,6 +1048,8 @@ static void pfs_park(struct rq *rq, struct task_struct *p, struct pfs_group *lg,
 {
 	struct sched_pfs_entity *pe = &p->pfs;
 
+	lockdep_assert_rq_held(rq);
+
 	pe->state = PFS_WAITING;
 	__pfs_link_waiter(pe, lg);
 	list_add_tail(&pe->rq_wait_node, &rq->pfs.waiters);
@@ -1058,6 +1060,8 @@ static void pfs_park(struct rq *rq, struct task_struct *p, struct pfs_group *lg,
 static void pfs_unpark(struct rq *rq, struct task_struct *p)
 {
 	struct sched_pfs_entity *pe = &p->pfs;
+
+	lockdep_assert_rq_held(rq);
 
 	__pfs_unlink_waiter(pe);
 	list_del_init(&pe->rq_wait_node);
@@ -1534,6 +1538,7 @@ static void pfs_queue_task(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_pfs_entity *pe = &p->pfs;
 	unsigned long w;
 
+	lockdep_assert_rq_held(rq);
 	pfs_account(p);
 	w = pfs_effective_weight(p, prq->load);
 	pfs_set_weight(pe, w);
@@ -1563,6 +1568,7 @@ static void pfs_unqueue_task(struct rq *rq, struct task_struct *p, int flags)
 	struct pfs_rq *prq = &rq->pfs;
 	struct sched_pfs_entity *pe = &p->pfs;
 
+	lockdep_assert_rq_held(rq);
 	pfs_update_entity_lag(prq, pe);
 	if (!(flags & DEQUEUE_SLEEP)) {
 		pe->deadline -= pe->vruntime;
@@ -1614,6 +1620,7 @@ static void pfs_release_slots(struct rq *rq, struct task_struct *p, bool handoff
 	struct sched_pfs_entity *pe = &p->pfs;
 	u64 mask = pe->slot_mask;
 
+	lockdep_assert_rq_held(rq);
 	pe->slot_mask = 0;
 	pe->granted = 0;
 	if (!mask || !pfs_put_slots(pe->grp, mask, !handoff) || !handoff)
@@ -3076,6 +3083,7 @@ static void pfs_rotate_out(struct rq *rq, struct task_struct *prev)
 {
 	struct sched_pfs_entity *pe = &prev->pfs;
 
+	lockdep_assert_rq_held(rq);
 	pe->rotate = 0;
 	if (pe->state != PFS_QUEUED || !task_on_rq_queued(prev))
 		return;
@@ -3113,6 +3121,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 	int this_cpu = cpu_of(rq), tries = 0, got = 0;
 	bool unpinned = false;
 
+	lockdep_assert_rq_held(rq);
 	rq->pfs.handoff = NULL;
 
 	for_each_pfs_level(lg, leaf) {
@@ -3503,8 +3512,8 @@ void pfs_debugfs_init(struct dentry *parent)
 		return;
 
 	d = debugfs_create_dir("pfs", parent);
-	debugfs_create_file("stats", 0444, d, NULL, &pfs_stats_fops);
-	debugfs_create_file("groups", 0444, d, NULL, &pfs_groups_fops);
+	debugfs_create_file("stats", 0400, d, NULL, &pfs_stats_fops);
+	debugfs_create_file("groups", 0400, d, NULL, &pfs_groups_fops);
 	debugfs_create_file("waiters", 0400, d, NULL, &pfs_waiters_fops);
 	debugfs_create_file_unsafe("window_us", 0644, d, NULL, &pfs_window_us_fops);
 	debugfs_create_u32("features", 0644, d, &pfs_features);
