@@ -143,6 +143,61 @@ after running the group's tasks for the slice per task, so that the CPUs
 take turns. Limits apply at every level of the hierarchy. cpu.cfs_burst_us
 is ignored in width mode, and nr_periods and nr_throttled count windows.
 
+Width mode is meant for multi-threaded groups (request handlers, databases,
+garbage-collected runtimes) whose threads would otherwise run on many CPUs
+for part of a period and then all wait for the next one. It needs
+CONFIG_CFS_BANDWIDTH and has no effect on groups without a limit.
+
+Measurements, against bandwidth control without width mode at the same
+limit (median of the runs; "worst stall" is the longest gap between two
+iterations of one busy thread):
+
+- 8-vCPU local VM, median of 5 boots, groups of busy threads: limit 1 with 8
+  threads 0.81 vs 0.61 million iterations/s, worst stall 45 vs 93 ms; limit 2
+  with 64 threads 1.61 vs 1.22, 204 vs 296 ms. Four request threads doing
+  1 ms of work every 20 ms next to 8 busy threads of the same group, limit 1:
+  latency p50/p99 22/56 ms vs 349/1036 ms. A model of a parallel garbage
+  collector at limit 2: pause p99 7.6 vs 45.8 ms.
+- 16-vCPU VM running pods of a container orchestrator, kernel 7.3 with and
+  without width mode, 3 runs: PostgreSQL pgbench TPC-B with 32 clients at
+  limit 2 gives 5002 vs 4673 transactions/s with p99 53 vs 80 ms; at limit 4
+  8261 vs 9119 transactions/s with p99 22 vs 36 ms. 16 threads which call
+  sched_yield() 100 times while holding one of 4 mutexes, limit 4: 37.2k vs
+  12.7k events/s.
+
+Disadvantages of width mode, measured on the same machines:
+
+- A slot is a CPU's cfs_rq of the group, not a thread. Threads waiting for a
+  slot stay on their CPU's queue, a freed slot reaches another CPU through a
+  timer or an IPI, and on the slot's CPU the group competes with other tasks
+  by the weight of its group entity. Next to an unlimited busy neighbour a
+  group limited to 2 CPUs gets 1.54-1.82 CPUs and 0.74-0.94 of the throughput
+  of bandwidth control without width mode (8-vCPU VM).
+- Limits interact badly with weights: two groups with cpu.weight in the
+  ratio 1:3 and limits 4 and 6 on 8 CPUs split the machine 2.04:1 instead of
+  2.96:1 (8-vCPU VM). With limits overcommitted 2.6-3 times on the 16-vCPU VM
+  the shares are off the weighted ideal by up to 16%, and two busy groups
+  limited to 4 and 8 CPUs reach only 3.50 and 6.35 CPUs while 4 CPUs of the
+  machine are idle.
+- Fractional limits are still enforced as time, over a 10ms window, and
+  nr_throttled grows by about 100 per second per group. Database tails are
+  better than without width mode but still 22-87 ms at p99 (PostgreSQL,
+  16-vCPU VM).
+- More busy-polling threads than slots collapse: 4 threads passing work
+  through spinning at limit 2 run 86 rounds/s vs 10770 without width mode,
+  and Redis with 4 I/O threads at limit 2 did not finish 1 million requests
+  in 600 s (86k requests/s without width mode). 16 threads handing a mutex
+  over with sched_yield() at limit 4 ran at 5.2k vs 13.2k events/s, using
+  0.75 of 4 CPUs (16-vCPU VM).
+- Many limited groups slow down the control plane: with 100 pods on the
+  16-vCPU VM, kubectl exec took 500 ms vs 216 ms at the median, the kubelet
+  health check 197 ms vs 73 ms, and a 1 ms sleeper outside the pods overshot
+  by up to 6.9 ms at p99 vs 1.0-2.4 ms.
+- Beside an unlimited 16-thread CPU hog, PostgreSQL at limit 2 lost 31% of
+  its throughput with no gain in p99 (65 ms vs 73 ms). A web server at limit 1
+  with 8 threads next to heavy neighbours served 1012 vs 1427 requests/s at
+  most, and 6.5 s p99 at a fixed rate.
+
 Statistics
 ----------
 A group's bandwidth statistics are exported via 5 fields in cpu.stat.
