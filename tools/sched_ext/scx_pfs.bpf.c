@@ -1708,6 +1708,16 @@ void BPF_STRUCT_OPS(pfs_dispatch, s32 cpu, struct task_struct *prev)
 	/* an admitted task which wasn't kicked for may be left over */
 	if (!nr_nokick && scx_bpf_dsq_nr_queued(SHARED_DSQ) > 0)
 		kick_leftover(nokick_pid);
+
+	/*
+	 * A @prev which blocked was charged up to ops.stopping(), which runs
+	 * when it is dequeued, before this. It is still the CPU's current task
+	 * while the retries above run, and with tasks which block often, e.g.
+	 * pipes, that time added up to a quarter of the cgroup's usage, which
+	 * nobody charged. Charge it to @prev.
+	 */
+	if (taskc && nr_limited && !(prev->scx.flags & SCX_TASK_QUEUED))
+		charge_prev(prev, taskc);
 }
 
 void BPF_STRUCT_OPS(pfs_running, struct task_struct *p)
