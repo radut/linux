@@ -217,7 +217,7 @@ latency although the average usage is below the limit.
 ### Options
 
 ```
-scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-v]
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-S FILE] [-v]
 ```
 
 | Option | Default | Meaning |
@@ -228,7 +228,8 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-q 
 | `-k` | 1000 | A thread that woke up and found no free slot runs without one for up to this long, if its cgroup has budget its slot holders can't use (see below); 0 makes it wait. |
 | `-w` | 10000 | Accounting window for fractional limits, credit and debt (minimum 1000). |
 | `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
-| `-i` | 1 | Interval of the counter report, in seconds. |
+| `-i` | 1 | Interval of the counter report, in seconds, which includes the throttling counters of each cgroup. |
+| `-S` | off | Also write the throttling counters to FILE every second (replaced atomically). |
 
 `-s` takes 100 to 1000000 us, `-c`, `-r` and `-k` at most 1000000 us, `-w` 1000
 to 1000000 us and `-i` 1 to 86400 s; scx_pfs refuses other values.
@@ -252,6 +253,33 @@ when their cgroup was removed, moved/kept; should stay 0/0), `no_dsq`
 internal ones (`direct`, `shared`, `repark`, `race`, `activate`, `hweight`,
 `keep`). CFS's `nr_throttled` stays 0: waiting threads are queued by
 scx_pfs, not throttled.
+
+### Throttling counters
+
+scx_pfs can't write `cpu.stat`, so it keeps `cpu.stat`-like counters per
+cgroup in BPF. Each report (every `-i` seconds and at exit) ends with one line
+per cgroup that was limited and ran or waited, in key=value form:
+
+```
+cgroup path=/kubepods/burstable/pod1234 nr_periods=1005 nr_throttled=1000 throttled_usec=10000420
+```
+
+- `path`: the cgroup's path below `/sys/fs/cgroup`.
+- `nr_periods`: windows (`-w`, 10 ms) in which the cgroup ran or had a
+  waiting thread.
+- `nr_throttled`: windows in which at least one runnable thread of the cgroup
+  waited, for a slot or for the fractional budget.
+- `throttled_usec`: wall time during which at least one thread of the cgroup
+  waited, from the first waiter's start to the last waiter's end, including
+  a wait still in progress. Unlike CFS's, which adds up the throttled time of
+  each CPU, it can't exceed the elapsed time.
+
+A thread waits in the cgroup whose limit refused it; that cgroup and every
+limited ancestor whose slots are all taken at that moment count it, as
+`cpu.stat` counts a throttled parent. Counters start at zero when the cgroup
+is created or scx_pfs is loaded. `-S FILE` writes the same lines without the
+`cgroup` prefix and with `key value` pairs, as in `cpu.stat`:
+`/kubepods/burstable/pod1234 nr_periods 1005 nr_throttled 1000 throttled_usec 10000420`.
 
 ### Running it
 

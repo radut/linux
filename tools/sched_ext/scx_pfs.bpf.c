@@ -231,6 +231,8 @@ private(PFS_WEIGHT) struct bpf_spin_lock weight_lock;
 UEI_DEFINE(uei);
 
 struct pfs_cgrp_ctx {
+	/* first, user space reads it, see scx_pfs.h */
+	struct pfs_cgrp_stat stat;
 	u64		limit;		/* milli-CPUs from cpu.max, 0 if none */
 	u32		nr_slots;	/* slots taken by tasks of the subtree */
 	u32		retry_queued;
@@ -276,6 +278,7 @@ struct pfs_task_ctx {
 	u32		rotated;	/* admitted after a rotation, not a wakeup */
 	u32		credit;		/* runs on credit since a wakeup */
 	u64		parking_cgid;	/* parked there, not yet seen by a walk */
+	u64		wait_mask;	/* levels counted as waiting, see wait_begin() */
 	/*
 	 * IDs of the cgroups on cgid's path by level, set with ->cgid. Slots
 	 * are given back through them: the cgroup of an exiting task can be
@@ -577,6 +580,95 @@ static bool budget_left(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
 	if (left < *slicep)
 		*slicep = left;
 	return true;
+}
+
+/*
+ * Count the window of @now in @cgc's nr_periods, and in nr_throttled if
+ * @throttled, once per window each.
+ */
+static void count_window(struct pfs_cgrp_ctx *cgc, u64 now, bool throttled)
+{
+	u64 id = now / window_ns, old;
+
+	old = cgc->stat.period_id;
+	if (old < id &&
+	    __sync_val_compare_and_swap(&cgc->stat.period_id, old, id) == old)
+		__sync_fetch_and_add(&cgc->stat.nr_periods, 1);
+	if (!throttled)
+		return;
+	old = cgc->stat.throttled_id;
+	if (old < id &&
+	    __sync_val_compare_and_swap(&cgc->stat.throttled_id, old, id) == old)
+		__sync_fetch_and_add(&cgc->stat.nr_throttled, 1);
+}
+
+/*
+ * @taskc starts waiting in a DSQ of @wait_cgrp, which refused it a slot. The
+ * cgroup is throttled from its first waiter's start to its last waiter's end,
+ * and so is each limited ancestor whose slots are all taken too, as CFS's
+ * cpu.stat counts a throttled parent: the task is held back by its limit as
+ * well. The levels counted are remembered in ->wait_mask, by the cgroup IDs
+ * of the task's path.
+ */
+static void wait_begin(struct pfs_task_ctx *taskc, struct cgroup *wait_cgrp,
+		       u64 now)
+{
+	struct pfs_cgrp_ctx *cgc;
+	u64 mask = 0, cgid;
+	int level;
+
+	if (taskc->wait_mask || too_deep(wait_cgrp))
+		return;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (level > wait_cgrp->level)
+			break;
+		cgc = find_ancestor_ctx(wait_cgrp, level, &cgid);
+		if (!cgc)
+			return;
+		if (!cgc->limit || cgid != taskc->path_cgid[level])
+			continue;
+		if (level < wait_cgrp->level &&
+		    cgc->nr_slots < div_round_up(cgc->limit, FRAC_ONE))
+			continue;
+		mask |= 1LLU << level;
+		if (!__sync_fetch_and_add(&cgc->stat.nr_waiting, 1))
+			cgc->stat.wait_since = now;
+		count_window(cgc, now, true);
+	}
+	taskc->wait_mask = mask;
+}
+
+/* @taskc no longer waits, if it did, see wait_begin() */
+static void wait_end(struct pfs_task_ctx *taskc, u64 now)
+{
+	struct pfs_cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+	u64 mask, since;
+	int level;
+
+	if (!taskc->wait_mask)
+		return;
+	mask = __sync_lock_test_and_set(&taskc->wait_mask, 0);
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (!(mask >> level))
+			break;
+		if (!(mask & (1LLU << level)))
+			continue;
+		cgrp = bpf_cgroup_from_id(taskc->path_cgid[level]);
+		if (!cgrp)
+			continue;
+		cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
+		if (cgc) {
+			since = cgc->stat.wait_since;
+			if (__sync_sub_and_fetch(&cgc->stat.nr_waiting, 1) <= 0 &&
+			    since && now > since)
+				__sync_fetch_and_add(&cgc->stat.throttled_ns,
+						     now - since);
+		}
+		bpf_cgroup_release(cgrp);
+	}
 }
 
 /*
@@ -1004,6 +1096,7 @@ static void park(struct task_struct *p, struct pfs_task_ctx *taskc, u64 cgid,
 
 	cgc = find_cgrp_ctx(wait_cgrp);
 	if (cgc) {
+		wait_begin(taskc, wait_cgrp, window_now());
 		taskc->parking_cgid = cgid;
 		cgc->park_at = window_now();
 		__sync_fetch_and_add(&cgc->nr_parking, 1);
@@ -1119,6 +1212,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			set_admitted(taskc, window_now(), !woken_dsq);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
+				wait_end(taskc, window_now());
 				stat_inc(PFS_STAT_CREDIT);
 				kick_idle_cpu(p);
 			}
@@ -1136,6 +1230,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			set_admitted(taskc, window_now(), !woken_dsq);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
+				wait_end(taskc, window_now());
 				stat_inc(PFS_STAT_LOST_PATH);
 				kick_idle_cpu(p);
 			}
@@ -1168,6 +1263,7 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			scx_bpf_dsq_move_set_slice(BPF_FOR_EACH_ITER, slice);
 			if (scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER, p,
 						   SHARED_DSQ, 0)) {
+				wait_end(taskc, window_now());
 				stat_inc(PFS_STAT_ADMIT);
 				if (*nr_nokick &&
 				    bpf_cpumask_test_cpu(bpf_get_smp_processor_id(),
@@ -1222,11 +1318,13 @@ __noinline int walk_waiters(u64 dsq_id, u32 *nr_nokick, s32 *nokick_pid)
 			struct cgroup *fail_cgrp;
 
 			stat_inc(PFS_STAT_REPARK);
+			wait_end(taskc, window_now());
 			fail_cgrp = bpf_cgroup_from_id(fail_cgid);
 			if (!fail_cgrp)
 				continue;
 			fail_cgc = bpf_cgrp_storage_get(&cgrp_ctx, fail_cgrp, 0, 0);
 			if (fail_cgc) {
+				wait_begin(taskc, fail_cgrp, window_now());
 				waitset_add(fail_cgc, fail_cgid);
 				if (ret == RESERVE_BUDGET)
 					queue_budget(fail_cgc, fail_cgid);
@@ -1559,6 +1657,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 */
 	release_slots(taskc);
 	park_cancel(taskc);
+	wait_end(taskc, window_now());
 
 	/* release_slots() and retries find the slots through ->cgid */
 	cgrp = scx_bpf_task_cgroup(p);
@@ -1644,6 +1743,7 @@ static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
 
 		window_left(cgc, now);
 		__sync_fetch_and_add(&cgc->window_used, delta);
+		count_window(cgc, now, cgc->stat.nr_waiting > 0);
 	}
 }
 
@@ -1828,8 +1928,11 @@ void BPF_STRUCT_OPS(pfs_running, struct task_struct *p)
 	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
-	if (taskc)
+	if (taskc) {
 		taskc->started_at = window_now();
+		/* moved out of a wait DSQ without a walk, e.g. by a drain */
+		wait_end(taskc, taskc->started_at);
+	}
 
 	/*
 	 * Global vtime always progresses forward as tasks start executing. The
@@ -2035,8 +2138,10 @@ void BPF_STRUCT_OPS(pfs_quiescent, struct task_struct *p, u64 deq_flags)
 	struct pfs_task_ctx *taskc;
 
 	taskc = find_task_ctx(p);
-	if (taskc)
+	if (taskc) {
+		wait_end(taskc, window_now());
 		put_runnable(taskc);
+	}
 }
 
 void BPF_STRUCT_OPS(pfs_enable, struct task_struct *p)
@@ -2052,6 +2157,7 @@ void BPF_STRUCT_OPS(pfs_disable, struct task_struct *p)
 	if (taskc) {
 		release_slots(taskc);
 		park_cancel(taskc);
+		wait_end(taskc, window_now());
 		put_runnable(taskc);
 	}
 }
@@ -2070,6 +2176,7 @@ s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 	taskc->slot_mask = 0;
 	taskc->credit = 0;
 	taskc->parking_cgid = 0;
+	taskc->wait_mask = 0;
 	taskc->run_cgid = 0;
 	taskc->cgid = 0;
 
@@ -2095,8 +2202,9 @@ void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 	if (!taskc)
 		return;
 
-	/* the slots are on @from's path */
+	/* the slots and the waits are on @from's path */
 	release_slots(taskc);
+	wait_end(taskc, window_now());
 	set_task_cgrp(taskc, to);
 }
 
@@ -2279,11 +2387,15 @@ static long rescue_cb(struct bpf_map *map, u64 *key, u8 *val, u64 *now)
 		/* a task may have parked after the test, list it again */
 		if (nr_waiting(cgid))
 			waitset_add(cgc, cgid);
-	} else if ((s64)(*now - cgc->retry_at) > (s64)RESCUE_NS &&
-		   !cgc->retry_running) {
-		stat_inc(PFS_STAT_RESCUE);
-		cgc->retry_queued = 0;
-		queue_retry(cgc, cgid);
+	} else {
+		/* a cgroup whose tasks only wait doesn't charge runtime */
+		count_window(cgc, *now, cgc->stat.nr_waiting > 0);
+		if ((s64)(*now - cgc->retry_at) > (s64)RESCUE_NS &&
+		    !cgc->retry_running) {
+			stat_inc(PFS_STAT_RESCUE);
+			cgc->retry_queued = 0;
+			queue_retry(cgc, cgid);
+		}
 	}
 
 	bpf_cgroup_release(cgrp);

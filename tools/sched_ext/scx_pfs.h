@@ -8,6 +8,23 @@
 /* default size of the per-cgroup queues, see -q */
 #define NR_CGRP_Q		65536
 
+/*
+ * Throttling counters of a limited cgroup, the first member of its BPF
+ * context. User space reads them with -S, see scx_pfs.c. A cgroup is
+ * throttled while at least one of its runnable tasks waits in its DSQs, for
+ * a slot or for budget. Windows are -w long.
+ */
+struct pfs_cgrp_stat {
+	__u64 nr_periods;	/* windows in which the cgroup ran or waited */
+	__u64 nr_throttled;	/* windows in which a task of it waited */
+	__u64 throttled_ns;	/* time with a waiting task, ended waits */
+	__u64 wait_since;	/* start of the current wait, if nr_waiting */
+	__u64 period_id;	/* last window counted in nr_periods */
+	__u64 throttled_id;	/* last window counted in nr_throttled */
+	__s32 nr_waiting;	/* tasks waiting in the DSQs of the cgroup */
+	__u32 pad;
+};
+
 enum pfs_stat_idx {
 	PFS_STAT_DIRECT,		/* dispatched straight to an idle CPU */
 	PFS_STAT_SHARED,		/* admitted to the shared DSQ on enqueue */

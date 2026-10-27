@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+#define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <ftw.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +22,7 @@ const char help_fmt[] =
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
 "Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US]\n"
-"       [-q NR] [-i INTERVAL] [-v]\n"
+"       [-q NR] [-i INTERVAL] [-S FILE] [-v]\n"
 "\n"
 "  -s SLICE_US   Slice duration (default: 2500, 100 to 1000000)\n"
 "  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
@@ -34,7 +38,10 @@ const char help_fmt[] =
 "  -q NR         Size of the queues of cgroups with waiting tasks; more\n"
 "                such cgroups are found by a slower sweep (default: 65536,\n"
 "                16 to 16777216)\n"
-"  -i INTERVAL   Report interval in seconds (default: 1, at most 86400)\n"
+"  -i INTERVAL   Report interval in seconds, with a line of throttling counters\n"
+"                per limited cgroup (default: 1, at most 86400)\n"
+"  -S FILE       Write the throttling counters of the limited cgroups to FILE\n"
+"                every second, see the README for the format\n"
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
 
@@ -45,6 +52,8 @@ const char help_fmt[] =
 #define MAX_INTERVAL	(24 * 3600)
 #define MIN_CGRP_Q	16
 #define MAX_CGRP_Q	(1 << 24)
+
+#define CGROUP_FS	"/sys/fs/cgroup"
 
 static bool verbose;
 static volatile int exit_req;
@@ -137,11 +146,92 @@ static void print_stats(struct scx_pfs *skel)
 	fflush(stdout);
 }
 
+/* state of a dump_cgrp_stats() walk, nftw() callbacks take no argument */
+static struct {
+	FILE	*f;
+	bool	kv;		/* key=value lines for the report */
+	int	map_fd;
+	void	*val;
+	__u64	now;
+} dump;
+
+static int dump_one(const char *path, const struct stat *sb, int type,
+		    struct FTW *ftw)
+{
+	const struct pfs_cgrp_stat *st = dump.val;
+	__u64 throttled;
+	int fd, ret;
+
+	if (type != FTW_D)
+		return 0;
+	fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	ret = bpf_map_lookup_elem(dump.map_fd, &fd, dump.val);
+	close(fd);
+	if (ret || (!st->nr_periods && !st->nr_throttled))
+		return 0;
+
+	throttled = st->throttled_ns;
+	if (st->nr_waiting > 0 && st->wait_since && dump.now > st->wait_since)
+		throttled += dump.now - st->wait_since;
+	path += strlen(CGROUP_FS);
+	fprintf(dump.f, dump.kv ?
+		"cgroup path=%s nr_periods=%llu nr_throttled=%llu throttled_usec=%llu\n" :
+		"%s nr_periods %llu nr_throttled %llu throttled_usec %llu\n",
+		*path ? path : "/", (unsigned long long)st->nr_periods,
+		(unsigned long long)st->nr_throttled,
+		(unsigned long long)throttled / 1000);
+	return 0;
+}
+
+/*
+ * Print the throttling counters of every cgroup that was limited and active
+ * to @f, as key=value lines if @kv.
+ */
+static void print_cgrp_stats(struct scx_pfs *skel, FILE *f, bool kv)
+{
+	struct timespec ts;
+
+	if (!dump.val) {
+		dump.val = calloc(1, bpf_map__value_size(skel->maps.cgrp_ctx));
+		assert(dump.val);
+	}
+	dump.f = f;
+	dump.kv = kv;
+	dump.map_fd = bpf_map__fd(skel->maps.cgrp_ctx);
+	/* the BPF side's clock, bpf_ktime_get_ns() */
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	dump.now = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	nftw(CGROUP_FS, dump_one, 32, FTW_PHYS | FTW_MOUNT);
+}
+
+/*
+ * Write the counters to @file, through a temporary file renamed over it so
+ * that readers never see a partial dump.
+ */
+static void dump_cgrp_stats(struct scx_pfs *skel, const char *file)
+{
+	static char tmp[4096];
+	FILE *f;
+
+	snprintf(tmp, sizeof(tmp), "%s.tmp", file);
+	f = fopen(tmp, "we");
+	if (!f) {
+		fprintf(stderr, "-S: can't write %s: %s\n", tmp, strerror(errno));
+		return;
+	}
+	print_cgrp_stats(skel, f, false);
+	if (fclose(f) || rename(tmp, file))
+		fprintf(stderr, "-S: can't write %s: %s\n", file, strerror(errno));
+}
+
 int main(int argc, char **argv)
 {
 	struct scx_pfs *skel;
 	struct bpf_link *link;
-	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q;
+	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q, secs;
+	const char *stats_file = NULL;
 	long nr_cpus;
 	__s32 opt;
 	__u64 ecode;
@@ -160,7 +250,7 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:c:r:k:w:q:i:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:k:w:q:i:S:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = 1000 *
@@ -188,6 +278,9 @@ restart:
 			break;
 		case 'i':
 			intv = parse_opt(opt, optarg, 1, MAX_INTERVAL);
+			break;
+		case 'S':
+			stats_file = optarg;
 			break;
 		case 'v':
 			verbose = true;
@@ -226,11 +319,21 @@ restart:
 	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);
 	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
 
-	while (!exit_req && !UEI_EXITED(skel, uei)) {
-		print_stats(skel);
-		sleep(intv);
+	for (secs = 0; !exit_req && !UEI_EXITED(skel, uei); secs++) {
+		if (!(secs % intv)) {
+			print_stats(skel);
+			print_cgrp_stats(skel, stdout, true);
+			fflush(stdout);
+		}
+		if (stats_file)
+			dump_cgrp_stats(skel, stats_file);
+		sleep(1);
 	}
 	print_stats(skel);
+	print_cgrp_stats(skel, stdout, true);
+	fflush(stdout);
+	if (stats_file)
+		dump_cgrp_stats(skel, stats_file);
 
 	bpf_link__destroy(link);
 	ecode = UEI_REPORT(skel, uei);
