@@ -1,5 +1,5 @@
-# shellcheck shell=bash disable=SC2034
 # SPDX-License-Identifier: GPL-2.0
+# shellcheck shell=bash disable=SC2034
 # Shared helpers for the PFS test kit. Sourced, not executed.
 #
 # Variants:

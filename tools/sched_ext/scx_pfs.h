@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __SCX_EXAMPLE_PFS_H
 #define __SCX_EXAMPLE_PFS_H
 
@@ -19,6 +20,12 @@ enum pfs_stat_idx {
 	PFS_STAT_ACTIVATE,		/* cgroup (de)activations changing weights */
 	PFS_STAT_HWEIGHT,		/* hweight recomputations */
 	PFS_STAT_KEEP,		/* expired task kept running by dispatch */
+	PFS_STAT_PARK_WOKEN,		/* parks of tasks that woke up (of the above) */
+	PFS_STAT_CUT,		/* rotated holders cut short for a woken waiter */
+	PFS_STAT_YIELD_KEEP,		/* yields that kept the slots */
+	PFS_STAT_YIELD_ROTATE,	/* yields that gave the slots to a waiter */
+	PFS_STAT_RESCUE,		/* waiting cgroups retried by the timer sweep */
+	PFS_STAT_LOST_PATH,		/* slots of a removed cgroup not given back */
 
 	PFS_NR_STATS,
 };

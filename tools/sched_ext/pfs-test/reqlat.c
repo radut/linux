@@ -111,7 +111,9 @@ int main(int argc, char **argv)
 	size_t total = 0;
 
 	if (argc < 5) {
-		fprintf(stderr, "usage: %s THREADS WORK_US PERIOD_US SECS [BURN_THREADS]\n", argv[0]);
+		fprintf(stderr,
+			"usage: %s THREADS WORK_US PERIOD_US SECS [BURN_THREADS]\n",
+			argv[0]);
 		return 2;
 	}
 	nreq = atoi(argv[1]);
