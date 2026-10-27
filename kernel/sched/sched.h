@@ -512,7 +512,7 @@ struct pfs_group {
 	int			depth;
 
 	/* budget of the fractional slot */
-	atomic64_t		window_id;
+	atomic64_t		window_start;
 	atomic64_t		window_used;
 	struct hrtimer		window_timer;
 	atomic_t		timer_armed;

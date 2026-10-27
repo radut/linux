@@ -543,9 +543,24 @@ static inline u64 pfs_now(void)
 	return ktime_get_mono_fast_ns();
 }
 
-static inline u64 pfs_budget(unsigned int limit)
+/* the window length, read once per use: debugfs may change it */
+static inline u64 pfs_window(void)
 {
-	return div_u64((u64)limit * pfs_window_ns, 1000);
+	return READ_ONCE(pfs_window_ns);
+}
+
+/* the start of the window of length @w that @now is in */
+static inline u64 pfs_window_start(u64 now, u64 w)
+{
+	u64 rem;
+
+	div64_u64_rem(now, w, &rem);
+	return now - rem;
+}
+
+static inline u64 pfs_budget(unsigned int limit, u64 w)
+{
+	return div_u64((u64)limit * w, 1000);
 }
 
 /* windows over which an overrun of the budget is paid back at most */
@@ -562,14 +577,22 @@ static inline u64 pfs_budget(unsigned int limit)
  */
 static u64 pfs_window_left(struct pfs_group *lg, u64 now)
 {
-	u64 id = div64_u64(now, pfs_window_ns);
-	s64 old = atomic64_read(&lg->window_id);
-	u64 budget = pfs_budget(READ_ONCE(lg->limit));
+	u64 w = pfs_window(), start = pfs_window_start(now, w);
+	s64 old = atomic64_read(&lg->window_start);
+	u64 budget = pfs_budget(READ_ONCE(lg->limit), w);
 	u64 used, elapsed, debt_max;
 
-	if ((u64)old != id && atomic64_try_cmpxchg(&lg->window_id, &old, id)) {
+	if ((u64)old != start &&
+	    atomic64_try_cmpxchg(&lg->window_start, &old, start)) {
 		used = atomic64_read(&lg->window_used);
-		elapsed = id - (u64)old;
+		/*
+		 * Windows are tracked by their start time, so that a change
+		 * of the window length doesn't wipe the usage: after the
+		 * window was made longer, the new window may start before the
+		 * old one, and nothing has elapsed.
+		 */
+		elapsed = (s64)(start - (u64)old) > 0 ?
+			  div64_u64(start - (u64)old, w) : 0;
 		debt_max = max_t(u64, PFS_MAX_DEBT_WINDOWS * budget, 2 * TICK_NSEC);
 		if (elapsed <= PFS_MAX_DEBT_WINDOWS + 1 && used > elapsed * budget)
 			used = min(used - elapsed * budget, debt_max);
@@ -600,11 +623,11 @@ static u64 pfs_window_left(struct pfs_group *lg, u64 now)
 static u64 pfs_over_limit(struct pfs_group *lg, u64 now)
 {
 	unsigned int limit = READ_ONCE(lg->limit);
-	u64 full = limit / 1000, allowed, elapsed, used;
+	u64 full = limit / 1000, allowed, elapsed, used, w = pfs_window();
 
 	pfs_window_left(lg, now);
-	elapsed = now - div64_u64(now, pfs_window_ns) * pfs_window_ns;
-	allowed = full * elapsed + 2 * pfs_budget(limit) - full * pfs_window_ns +
+	elapsed = now - pfs_window_start(now, w);
+	allowed = full * elapsed + 2 * pfs_budget(limit, w) - full * w +
 		  pfs_width(limit) * TICK_NSEC;
 	used = atomic64_read(&lg->window_used);
 	return used > allowed ? used - allowed : 0;
@@ -649,7 +672,8 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 
 	if (taken >= limit / 1000) {
 		left = pfs_window_left(lg, now);
-		min_left = min_t(u64, pfs_budget(limit), PFS_MIN_BUDGET_NS);
+		min_left = min_t(u64, pfs_budget(limit, pfs_window()),
+				 PFS_MIN_BUDGET_NS);
 		if (!left || left < min_left) {
 			/* the window timer retries, see pfs_arm_window_timer() */
 			atomic_dec(&lg->nr_slots);
@@ -874,11 +898,11 @@ static void pfs_group_retry(struct pfs_group *g);
  */
 static void pfs_arm_window_timer(struct pfs_group *lg, u64 now, u64 delay)
 {
-	u64 next;
+	u64 next, w = pfs_window();
 
 	if (!now)
 		now = pfs_now();
-	next = (div64_u64(now, pfs_window_ns) + 1) * pfs_window_ns;
+	next = pfs_window_start(now, w) + w;
 	if (delay)
 		next = min(next, now + max_t(u64, delay, PFS_MIN_BUDGET_NS));
 
