@@ -128,7 +128,7 @@ wait_scx_enabled() {
 # scx_start: load scx_pfs. SCX_MODE picks how:
 #   host       run the binary from this script (default)
 #   service    systemctl start $SCX_UNIT (default scx_pfs.service)
-#   container  privileged container, see scx_container_start
+#   container  container with the capabilities to load it, see scx_container_start
 scx_start() {
 	local bin
 	have_scx_kernel || die "kernel has no sched_ext ($SCX_STATE missing; needs CONFIG_SCHED_CLASS_EXT)"
@@ -379,13 +379,20 @@ limited_cgroup() {
 	echo "$cg"
 }
 
-# scx_container_start: scx_pfs as a privileged container sharing the host
-# PID namespace, the same shape as a Kubernetes DaemonSet
+# Capabilities and options of the scheduler's container: loading a sched_ext
+# scheduler is bpf() with CAP_BPF and CAP_PERFMON, plus CAP_SYS_ADMIN for
+# struct_ops; libbpf reads the kernel's BTF from /sys/kernel/btf. No host PID
+# namespace, devices, writable mounts or network are needed.
+SCX_CTR_OPTS=(--cap-drop ALL --cap-add SYS_ADMIN --cap-add BPF --cap-add PERFMON
+	      --security-opt no-new-privileges --read-only --network none)
+
+# scx_container_start: scx_pfs in a container, the same shape as a
+# Kubernetes DaemonSet
 scx_container_start() {
 	local i
 	[ "$(cat $SCX_STATE 2>/dev/null)" = disabled ] || die "sched_ext missing or a scheduler is already loaded"
 	scx_args
-	$DOCKER run -d --name "$SCX_CTR" --privileged --pid=host --network none \
+	$DOCKER run -d --name "$SCX_CTR" "${SCX_CTR_OPTS[@]}" \
 		"$IMAGE" /scx_pfs "${SCX_ARGV[@]}" -i 3600 > /dev/null
 	for i in $(seq 50); do
 		[ "$(cat $SCX_STATE)" = enabled ] && break

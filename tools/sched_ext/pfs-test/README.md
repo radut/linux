@@ -76,7 +76,7 @@ and `$PATH`.
 | `summary.py`       | Summary of a results.csv: median (min-max) per case and variant. |
 | `scx_pfs.service`  | Example systemd unit for running scx_pfs on a host. |
 | `docker-image.sh`  | Builds a local FROM-scratch image with the static binaries (`docker import`, no registry). |
-| `scx-container.sh` | Runs scx_pfs as a privileged container (`--privileged --pid=host`), the Docker shape of a DaemonSet. |
+| `scx-container.sh` | Runs scx_pfs in a container with `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON` only, the Docker shape of a DaemonSet. |
 
 Every script prints its usage with `-h`, runs under `set -euo pipefail`, and on
 exit or Ctrl-C removes its cgroups and containers, stops scx_pfs and restores
@@ -189,8 +189,17 @@ unit, or as a container, which mirrors the Kubernetes DaemonSet:
     sudo ./scx-container.sh stop
 
     # by hand:
-    docker run -d --name scx-pfs --privileged --pid=host --network none \
-        pfs-test:local /scx_pfs -i 10
+    docker run -d --name scx-pfs --cap-drop ALL --cap-add SYS_ADMIN \
+        --cap-add BPF --cap-add PERFMON --security-opt no-new-privileges \
+        --read-only --network none pfs-test:local /scx_pfs -i 10
+
+The container needs no `--privileged` and no `--pid=host`: loading a
+sched_ext scheduler is the `bpf()` system call with `CAP_BPF` and
+`CAP_PERFMON`, plus `CAP_SYS_ADMIN` for the `struct_ops` map, and libbpf
+reads the kernel's BTF from `/sys/kernel/btf`, which the container's
+read-only `/sys` shows. The scheduler finds tasks by their PID in the
+initial namespace inside the kernel, so the container's PID namespace
+doesn't matter.
 
 Cases and the matrix:
 
@@ -244,7 +253,12 @@ scx_pfs runs as a DaemonSet in the shape of `scx-container.sh`:
           - name: scx-pfs
             image: IMAGE_WITH_STATIC_SCX_PFS
             command: ["/scx_pfs", "-i", "10"]
-            securityContext: {privileged: true}
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop: ["ALL"]
+                add: ["SYS_ADMIN", "BPF", "PERFMON"]
             resources:
               requests: {cpu: 10m, memory: 32Mi}
               limits: {memory: 2Gi}     # loading verifies the BPF program
