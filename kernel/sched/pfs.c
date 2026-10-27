@@ -563,17 +563,20 @@ static inline u64 pfs_budget(unsigned int limit, u64 w)
 	return div_u64((u64)limit * w, 1000);
 }
 
-/* windows over which an overrun of the budget is paid back at most */
-#define PFS_MAX_DEBT_WINDOWS	10
+/* time over which runtime beyond the limit is paid back at most */
+#define PFS_MAX_DEBT_NS		NSEC_PER_SEC
 
 /*
  * The part of @lg's budget left in the current window. Windows are aligned
  * to multiples of the window length so that one timer per group finds the
- * budget refilled. Usage beyond the budget (slices end on a tick) is carried
- * over as debt and paid back with the budgets of the following windows, so
- * that the average stays at the limit even when the budget of a window is
- * smaller than a tick. The debt is capped at PFS_MAX_DEBT_WINDOWS budgets, or
- * two ticks, which bounds the wait after an overrun.
+ * budget refilled. Usage beyond the budget (slices end on a tick, tasks run
+ * on credit in the kernel) is carried over as debt and paid back with the
+ * budgets of the following windows, so that the average stays at the limit
+ * even when the budget of a window is smaller than a tick. The debt is
+ * capped at what the limit allows in PFS_MAX_DEBT_NS, or two ticks, which
+ * bounds the wait after an overrun to about PFS_MAX_DEBT_NS; runtime on
+ * credit beyond that is only possible on otherwise idle CPUs, see
+ * pfs_effective_weight().
  */
 static u64 pfs_window_left(struct pfs_group *lg, u64 now)
 {
@@ -593,8 +596,11 @@ static u64 pfs_window_left(struct pfs_group *lg, u64 now)
 		 */
 		elapsed = (s64)(start - (u64)old) > 0 ?
 			  div64_u64(start - (u64)old, w) : 0;
-		debt_max = max_t(u64, PFS_MAX_DEBT_WINDOWS * budget, 2 * TICK_NSEC);
-		if (elapsed <= PFS_MAX_DEBT_WINDOWS + 1 && used > elapsed * budget)
+		debt_max = max_t(u64, div_u64((u64)READ_ONCE(lg->limit) *
+					      PFS_MAX_DEBT_NS, 1000),
+				 2 * TICK_NSEC);
+		/* elapsed * budget <= used, it can't overflow */
+		if (budget && elapsed <= div64_u64(used, budget))
 			used = min(used - elapsed * budget, debt_max);
 		else
 			used = 0;
@@ -1364,6 +1370,26 @@ static unsigned long pfs_hweight(struct pfs_group *g, unsigned long gen, u64 now
 	return h;
 }
 
+/*
+ * A limited level of @g's path ran beyond its limit, see pfs_over_limit():
+ * its tasks on credit then run with the lowest weight.
+ */
+static bool pfs_path_over_limit(struct pfs_group *g)
+{
+	struct pfs_group *lg;
+	u64 now = 0;
+
+	for_each_pfs_level(lg, g) {
+		if (!pfs_level_limited(lg))
+			continue;
+		if (!now)
+			now = pfs_now();
+		if (pfs_over_limit(lg, now))
+			return true;
+	}
+	return false;
+}
+
 /* a task of a group with a tiny share runs at least about this often */
 #define PFS_WAIT_MAX_NS		NSEC_PER_SEC
 
@@ -1383,6 +1409,18 @@ static unsigned long pfs_effective_weight(struct task_struct *p,
 
 	if (!g || !g->depth)
 		return w;
+
+	/*
+	 * A task on credit is beyond its group's slots. While the group is
+	 * over its limit (it doesn't get slots back before it paid back the
+	 * excess), its tasks on credit only get CPU time that nobody else
+	 * wants, as SCHED_IDLE tasks: otherwise a group whose work runs mostly
+	 * in the kernel would run on as many CPUs as it has threads, and
+	 * with debt capped, use more than its limit.
+	 */
+	if (pe->unslotted && !pe->slot_mask && atomic_read(&pfs_nr_limited) &&
+	    pfs_path_over_limit(g))
+		return scale_load(WEIGHT_IDLEPRIO);
 
 	d = pfs_group_load(g);
 	if (d)
@@ -1604,7 +1642,9 @@ static inline bool pfs_has_user_work(struct task_struct *p)
 /*
  * Make @p park, or rotate, when it next returns to user space, see
  * pfs_user_workfn(). Kernel threads and exiting tasks don't go back to user
- * space; they keep running until they block.
+ * space; they keep running until they block. io_uring workers
+ * (PF_IO_WORKER) don't either, but run the task work between work items,
+ * where they hold no locks.
  */
 static void pfs_request_user_park(struct task_struct *p)
 {
@@ -2272,6 +2312,10 @@ static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 	}
 
 	pfs_reweight_curr(rq, curr);
+	/* on credit and over the limit, see pfs_effective_weight() */
+	if (pe->unslotted && !pe->slot_mask && rq->pfs.nr_queued > 1 &&
+	    pe->weight.weight <= scale_load(WEIGHT_IDLEPRIO))
+		resched_curr_lazy(rq);
 
 	/*
 	 * A task of a limited group gives its slots back at the end of its

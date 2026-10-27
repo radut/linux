@@ -139,14 +139,14 @@ kept in milli-CPUs (rounded up).
   the group's CPU time in the current window is below L * window. The window
   is 10 ms by default (``window_us`` in debugfs), aligned to multiples of the
   window on the monotonic clock. Usage above the budget (a slice ends on a
-  tick) is carried over into the next window, at most one budget's worth, so
-  that the long-term average stays at L. A limit below 1 has only the budget
+  tick, tasks run on credit) is carried over into the following windows as
+  debt, at most what the limit allows in one second, so that the long-term
+  average stays at L. A limit below 1 has only the budget
   slot, i.e. it is still a time budget, but over 10 ms instead of the 100 ms
   period of ``cpu.max``.
 - The period P only matters through the ratio Q / P.
 - ``cpu.max.burst`` is accepted and ignored: a parallelism cap has no
-  accumulated budget to burst from. (The carry-over of the budget slot is
-  bounded by one window independently of it.)
+  accumulated budget to burst from.
 - ``cpu.stat`` keeps reporting CFS bandwidth fields, which stay at zero under
   PFS; waiting is reported in the PFS statistics instead.
 
@@ -207,6 +207,18 @@ limit: each wakeup without a free slot costs a few microseconds in the
 kernel (finishing the system call, the task work, two context switches),
 and they add up to a tenth or more of a CPU. CFS bandwidth control charges
 the same time to its quota.
+
+While a level is over its limit in this sense, the tasks of its subtree that
+run on credit are scheduled with the weight of ``SCHED_IDLE`` tasks (and the
+running one is preempted at the next tick if others are queued), so they only
+get CPU time nobody else wants. Without this, a group whose work runs mostly
+in the kernel (long system calls that block and resume, I/O worker threads)
+would run on as many CPUs as it has threads, since such tasks rarely reach
+the return to user space where they would park. The debt is carried over up
+to what the limit allows in one second, which bounds the wait it causes;
+runtime on credit beyond that cap is only possible on CPUs that would
+otherwise be idle. io_uring workers never return to user space but run the
+task work between work items, where they park like user threads.
 
 A task gives its slots back when it
 
@@ -792,14 +804,15 @@ Limits of this implementation
   transitions of a group's admitted count).
 - The budget slot is accounted per tick; a group can overrun its budget by up
   to a tick per running thread per window, which is carried over (as debt of
-  up to ten budgets, so that limits much smaller than a tick per window are
-  still met on average).
+  up to one second's worth of the limit, so that limits much smaller than a
+  tick per window are still met on average).
 - Tasks running in the kernel on credit run beyond the slots for as long as
   they stay in the kernel, so more than L threads of a group can be on a CPU
   at once, as under CFS bandwidth control. Their runtime is paid back
-  afterwards, which keeps the average at the limit, except for runtime
-  beyond the debt cap of ten budgets (e.g. many threads exiting at once),
-  which is forgiven.
+  afterwards, which keeps the average at the limit; once the group is over
+  its limit they only run with the weight of ``SCHED_IDLE`` tasks, and debt
+  beyond one second's worth of the limit is not carried over, so a group
+  can exceed its limit by using CPUs that are idle otherwise.
 - Effective weights of queued, not running tasks are refreshed only when they
   start running or are admitted again.
 - Within a limited group, slots are shared by weight between its children, but
