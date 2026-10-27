@@ -1874,6 +1874,38 @@ static u64 pfs_run_limit(struct task_struct *p)
 /* runtime charged to the group at once, see update_curr_pfs() */
 #define PFS_CHARGE_BATCH_NS	(100 * NSEC_PER_USEC)
 
+/* Charge @p's runtime not charged yet to the group it accrued in. */
+static void pfs_flush_charge(struct task_struct *p)
+{
+	struct sched_pfs_entity *pe = &p->pfs;
+	u64 pending = pe->charge_pending;
+
+	if (!pending)
+		return;
+	pe->charge_pending = 0;
+	if (pe->slot_mask) {
+		pfs_charge(pe->grp, pending);
+		pfs_stat_add(PFS_STAT_SLOT_NS, pending);
+	} else if (atomic_read(&pfs_nr_limited) &&
+		   pfs_charge(task_pfs_group(p), pending)) {
+		/*
+		 * On credit, or switching out after giving its slots back:
+		 * beyond the slots, but it counts all the same.
+		 */
+		pfs_stat_add(PFS_STAT_CREDIT_NS, pending);
+	}
+}
+
+/*
+ * @p moves to another group, with its run queue locked. A queued task was
+ * dequeued with DEQUEUE_MOVE already; this is for a sleeping one.
+ */
+void pfs_task_change_group(struct task_struct *p)
+{
+	lockdep_assert_rq_held(task_rq(p));
+	pfs_flush_charge(p);
+}
+
 static void update_curr_pfs(struct rq *rq)
 {
 	struct pfs_rq *prq = &rq->pfs;
@@ -1899,22 +1931,8 @@ static void update_curr_pfs(struct rq *rq)
 	 * delay.
 	 */
 	pe->charge_pending += delta;
-	if (pe->charge_pending >= PFS_CHARGE_BATCH_NS) {
-		u64 pending = pe->charge_pending;
-
-		pe->charge_pending = 0;
-		if (pe->slot_mask) {
-			pfs_charge(pe->grp, pending);
-			pfs_stat_add(PFS_STAT_SLOT_NS, pending);
-		} else if (atomic_read(&pfs_nr_limited) &&
-			   pfs_charge(task_pfs_group(curr), pending)) {
-			/*
-			 * On credit, or switching out after giving its slots
-			 * back: beyond the slots, but it counts all the same.
-			 */
-			pfs_stat_add(PFS_STAT_CREDIT_NS, pending);
-		}
-	}
+	if (pe->charge_pending >= PFS_CHARGE_BATCH_NS)
+		pfs_flush_charge(curr);
 	if (pe->state != PFS_QUEUED)
 		return;
 
@@ -1973,9 +1991,18 @@ static bool dequeue_task_pfs(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_pfs_entity *pe = &p->pfs;
 
+	if (pe->state == PFS_QUEUED)
+		update_curr_pfs(rq);
+	/*
+	 * Runtime below the batch size is charged later, see
+	 * update_curr_pfs(), but not after the task left its group or died:
+	 * a storm of short-lived tasks would otherwise charge nothing.
+	 */
+	if ((flags & (DEQUEUE_MOVE | DEQUEUE_CLASS)) || (p->flags & PF_EXITING))
+		pfs_flush_charge(p);
+
 	switch (pe->state) {
 	case PFS_QUEUED:
-		update_curr_pfs(rq);
 		pfs_unqueue_task(rq, p, flags);
 		if (pe->slot_mask && pfs_dequeue_keeps(p, flags))
 			pe->granted = 1;
