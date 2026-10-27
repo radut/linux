@@ -101,7 +101,7 @@ enum pfs_stat {
 	PFS_STAT_KICK,		/* idle CPUs kicked */
 	PFS_STAT_CREDIT,	/* admitted without slots, in the kernel */
 	PFS_STAT_USER_PARK,	/* parked or rotated on the way to user space */
-	PFS_STAT_YIELD,		/* gave its slots back in sched_yield() */
+	PFS_STAT_YIELD,		/* yielded: gives its slots back at user return */
 	PFS_STAT_BALANCE,	/* tasks moved by the periodic balancer */
 	PFS_STAT_SLOT_NS,	/* runtime of tasks holding slots, ns */
 	PFS_STAT_CREDIT_NS,	/* runtime of tasks of limited groups on credit, ns */
@@ -1876,12 +1876,17 @@ static void yield_task_pfs(struct rq *rq)
 	update_curr_pfs(rq);
 	rq_clock_skip_update(rq);
 
-	/* it holds no kernel locks here and may wait, pfs_admit_or_park() */
+	/*
+	 * yield() is also called from inside the kernel, with locks held
+	 * (e.g. netlink_broadcast() under RTNL), so don't park the task here:
+	 * it gives its slots back when it returns to user space, as with a
+	 * slice that ends in the kernel. For sched_yield() that is right
+	 * after this schedule().
+	 */
 	if (pe->slot_mask && atomic_read(&pfs_nr_limited) &&
 	    pfs_yield_rotates(curr)) {
-		pe->rotate = 1;
+		pfs_request_user_park(curr);
 		pfs_stat(PFS_STAT_YIELD);
-		return;
 	}
 
 	if (unlikely(rq->nr_running == 1))

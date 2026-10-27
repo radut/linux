@@ -207,7 +207,11 @@ A task gives its slots back when it
   spinning on a lock with ``sched_yield()`` may wait for the lock holder,
   which waits for a slot. A thread which yields while it holds the lock, on
   the other hand, must not hand its slots to the threads woken for that lock,
-  which would find it still taken; the 0.5 ms let it finish first;
+  which would find it still taken; the 0.5 ms let it finish first. The slots
+  are given back on the way back to user space, right after the system call.
+  ``yield()`` called inside the kernel (e.g. by netlink with RTNL held) does
+  not park the task there: it gives its slots back only when it returns to
+  user space, as with a slice that ends in the kernel;
 - reaches the end of its slice (``sched_base_slice``) while one of its levels
   has waiting tasks, has no budget left, or holds more slots than its limit
   allows (after the limit was lowered). If the slice ends while the task runs
