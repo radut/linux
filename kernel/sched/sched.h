@@ -473,6 +473,7 @@ struct cfs_bandwidth {
 	u8			width;
 	u8			width_extra;
 	u8			width_extra_busy;
+	u8			width_throttled; /* a cfs_rq waited in this window */
 	int			width_slots;
 	int			width_active;
 	u64			width_budget;

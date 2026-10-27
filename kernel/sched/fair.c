@@ -7088,6 +7088,8 @@ static bool throttle_cfs_rq_width(struct cfs_rq *cfs_rq, bool rotate)
 			cfs_rq->width_used = 0;
 		}
 		cfs_rq->width_woken = 0;
+		/* count the window as throttled, see do_cfs_width_period_timer() */
+		cfs_b->width_throttled = 1;
 
 		__cfs_width_release(cfs_b, cfs_rq);
 		cfs_width_kick(cfs_b);
@@ -7863,13 +7865,21 @@ static int do_cfs_width_period_timer(struct cfs_bandwidth *cfs_b, int overrun,
 	cfs_b->nr_periods += overrun;
 	cfs_b->runtime = cfs_b->width_budget;
 
+	/*
+	 * A window counts as throttled if a cfs_rq waited for a slot or for
+	 * budget at any time in it, also if it got one before the window
+	 * ended, as CFS counts a period in which the group was throttled.
+	 */
 	if (list_empty(&cfs_b->throttled_cfs_rq)) {
+		cfs_b->nr_throttled += cfs_b->width_throttled;
+		cfs_b->width_throttled = 0;
 		if (cfs_b->idle)
 			return 1;
 		cfs_b->idle = 1;
 		return 0;
 	}
 
+	cfs_b->width_throttled = 0;
 	cfs_b->nr_throttled += overrun;
 	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
 	distribute_cfs_width(cfs_b);
