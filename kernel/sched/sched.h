@@ -529,9 +529,9 @@ struct pfs_group {
 	/* task_group depth, the root is 0 */
 	int			depth;
 
-	/* budget of the fractional slot */
-	atomic64_t		window_start;
-	atomic64_t		window_used;
+	/* token bucket of the limit, see pfs_refill() */
+	atomic64_t		tokens;
+	atomic64_t		refill_at;
 	/* the window timer, started under ->lock, see pfs_arm_window_timer() */
 	struct hrtimer		window_timer;
 	u64			timer_expires;

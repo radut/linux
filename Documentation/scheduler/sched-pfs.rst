@@ -94,7 +94,8 @@ How the cgroup files map
 
 ========================== ===================================================
 ``cpu.max`` "Q P"          limit L = Q / P: floor(L) slots without time
-                           accounting, plus a budget slot for the fraction
+                           accounting, plus a budget slot for the fraction,
+                           whose token bucket holds the fraction of P
 ``cpu.max`` "max P"        no limit at this level
 ``cpu.max.burst``          ignored
 ``cpu.weight``,            the group's weight W, used for the share under
@@ -115,13 +116,19 @@ cgroup v1 ``cpu.shares``,  the same as their cgroup v2 counterparts
 ``cpu.cfs_period_us``
 ========================== ===================================================
 
-Examples, with the default 10 ms window:
+Examples, with the default 10 ms window and depth:
 
 - ``cpu.max`` "150000 100000" (1.5 CPUs): one thread runs at any time
-  without accounting, a second one while the group used less than 15 ms of
-  CPU in the current 10 ms window.
+  without accounting, a second one while the group has tokens. Tokens accrue
+  at 1.5 CPUs and the group's CPU time is taken off; after a pause the
+  second thread can run for up to 50 ms (0.5 of the 100 ms period) beside
+  the first, then for about 5 ms per 10 ms window.
 - "25000 100000" (0.25 CPUs): only the budget slot, one thread at a time,
-  2.5 ms of CPU per 10 ms window.
+  a burst of up to 25 ms after a pause, then about 2.5 ms of CPU per 10 ms
+  window.
+- "10000 100000" (0.1 CPUs): a request of 6 ms every 100 ms runs at once,
+  as under CFS bandwidth control; with "1000 10000" the bucket holds 1 ms
+  and the same request takes six windows.
 - A pod limited to 4 CPUs with two containers limited to 2 and 3 CPUs: at
   most 4 threads of the pod run at once, at most 2 and 3 of each container,
   and when both containers want more, the pod's 4 slots are shared between
@@ -140,17 +147,25 @@ kept in milli-CPUs (rounded up).
 - floor(L) *full slots*: up to floor(L) threads of the group may run at once
   without any time accounting.
 - If L has a fractional part, one *budget slot*: one more thread may run while
-  the group's CPU time in the current window is below L * window. The window
-  is 10 ms by default (``window_us`` in debugfs), aligned to multiples of the
-  window on the monotonic clock. Usage above the budget (a slice ends on a
-  tick, tasks run on credit) is carried over into the following windows as
-  debt, at most what the limit allows in one second, so that the long-term
-  average stays at L. A limit below 1 has only the budget
-  slot, i.e. it is still a time budget, but over 10 ms instead of the 100 ms
-  period of ``cpu.max``.
-- The period P only matters through the ratio Q / P.
-- ``cpu.max.burst`` is accepted and ignored: a parallelism cap has no
-  accumulated budget to burst from.
+  the group has *tokens*. Each limited group has a token bucket: tokens
+  accrue continuously at L CPUs, the CPU time of all tasks of the subtree is
+  taken off, and the bucket holds at most what the fraction L - floor(L)
+  allows in one period P (``burst_pct`` in debugfs, 100% by default), but at
+  least one window's budget, L * window. A group which ran below its limit
+  can thus run a burst of up to that size at once on the budget slot, as
+  CFS bandwidth control runs it from the quota of a period, while the
+  long-term average stays at L. A group which keeps the budget slot busy
+  uses up its tokens and gets the slot back every window (10 ms by default,
+  ``window_us`` in debugfs, aligned to multiples of the window on the
+  monotonic clock) with what accrued meanwhile, about (L - floor(L)) *
+  window, rather than the quota of a period after a long throttled stretch.
+  Usage beyond the tokens (a slice ends on a tick, tasks run on credit)
+  leaves the bucket negative, a debt of at most what the limit allows in
+  one second. A limit below 1 has only the budget slot, i.e. it is still a
+  time budget.
+- The period P sets the depth of the bucket and the period of the
+  throttling statistics; the parallelism only depends on Q / P.
+- ``cpu.max.burst`` is accepted and ignored.
 - ``cpu.stat`` reports the time tasks wait for the group's slots or budget
   in the CFS bandwidth fields, see `Throttling statistics`_.
 
@@ -162,7 +177,7 @@ Throttling statistics
 ---------------------
 
 A limited group *throttles* while it holds back runnable work: while at
-least one task waits in its queue, for a free slot or for the budget of its
+least one task waits in its queue, for a free slot or for the tokens of its
 budget slot (see `Admission and waiting`_). ``cpu.stat`` reports this in the
 fields of CFS bandwidth control, with the meaning
 Documentation/admin-guide/cgroup-v2.rst gives them, so that monitoring built
@@ -230,20 +245,17 @@ it, so a holder that is already waiting is then only admitted in turn.
 
 Runtime on credit is beyond the slots, so it is paid back. Every limited
 level counts the CPU time of all tasks of its subtree, with or without slots,
-in the windows of the budget slot. If the usage in the current window,
-including what was carried over, exceeds what the full slots could have used
-since the window began plus the budget of the budget slot, by more than a
-margin, the level does not hand out its last full slot nor its budget slot,
-and a slot holder whose slice ends while the level holds that many slots
-gives its slots back. A timer retries when the remaining full slots would
-have paid the excess back. Each task charges its runtime to the levels in
+against its token bucket. If the bucket is in debt by more than a margin,
+the level does not hand out its last full slot nor its budget slot, and a
+slot holder whose slice ends while the level holds that many slots gives
+its slots back. A timer retries when the remaining full slots would have
+paid the excess back. Each task charges its runtime to the levels in
 batches of 100 us, so that tasks which switch every few microseconds don't
 bounce the counters between CPUs; what is left of a batch is charged when the
 task exits, moves to another group or leaves the class. The margin, one tick per slot plus one
 window's budget, absorbs runtime charged late (by a tick or a batch, or by
-much more in a virtual machine whose CPU the host preempted), which would
-otherwise look like an excess at the start of a window; it bounds the excess
-only once.
+much more in a virtual machine whose CPU the host preempted); it bounds the
+excess only once.
 Without this, a database with many backends, which wake up for every query
 and run on credit until they return to user space, used 2-20% more than its
 limit: each wakeup without a free slot costs a few microseconds in the
@@ -325,9 +337,10 @@ task which can't run on *C* (affinity, migration disabled, *C* going
 offline) is admitted where it is instead, and an allowed idle CPU, if any,
 is kicked so that it pulls the task.
 
-Slots freed elsewhere (a task leaving the group, a raised limit, a new budget
-window) are handed out by a *retry*: the first waiting tasks are admitted on
-their own CPUs as long as there are free slots, again kicking idle CPUs.
+Slots freed elsewhere (a task leaving the group, a raised limit, tokens for
+the budget slot at the next window) are handed out by a *retry*: the first
+waiting tasks are admitted on their own CPUs as long as there are free
+slots, again kicking idle CPUs.
 
 Weights
 -------
@@ -479,8 +492,8 @@ Data structures
 
 ``struct pfs_group`` (``task_group::pfs``)
    limit in milli-CPUs, slots taken (atomic), the FIFO wait queue and its lock,
-   the window (window id, usage including runtime on credit, hrtimer for the
-   next window or the end of a pay-back), weight,
+   the token bucket (tokens, a debt if negative, and the time of the last
+   refill; hrtimer for the next window or the end of a pay-back), weight,
    active children count and their weight sum, own admitted tasks' count and
    weight, cached hierarchical weight with its generation, depth.
 
@@ -548,10 +561,10 @@ both followed by a pick on *C*:
 ``balance()`` then hands the freed slots to the first waiting task(s) with
 *C* as the target. Finally ``put_prev_task()`` resolves a parking *prev*: it
 tries to admit it again (FIFO, so it only succeeds when nobody waits and
-budget is left) and otherwise appends it to the refusing level's queue.
+tokens are left) and otherwise appends it to the refusing level's queue.
 
 Retries (``pfs_group_retry()``) run from the ``cpu.max`` write, from the
-budget window hrtimer, and from an ``irq_work`` when a release happens in a
+window hrtimer, and from an ``irq_work`` when a release happens in a
 context without a following pick (a waiting or queued task leaving the group,
 a hand-off that found no task for its CPU).
 
@@ -700,7 +713,7 @@ shows every limited cgroup's path and activity):
 
 ``groups``
    limited groups and groups with waiting tasks: limit in milli-CPUs, slots
-   taken, waiting tasks, CPU time used in the current window, weight,
+   taken, waiting tasks, tokens in microseconds (negative: debt), weight,
    hierarchical weight, active count and path.
 
 ``waiters``
@@ -708,7 +721,14 @@ shows every limited cgroup's path and activity):
    they wait at.
 
 ``window_us``
-   length of the budget window, 1000 to 1000000 (default 10000).
+   how often a group out of tokens for its budget slot is retried, also the
+   least depth of its bucket (L * window) and the margin of the debt, 1000 to
+   1000000 (default 10000).
+
+``burst_pct``
+   depth of the token buckets, in percent of what the fraction of a group's
+   limit allows in one ``cpu.max`` period, 0 to 1000 (default 100). 0 leaves
+   the least depth, about the per-window budget of earlier versions.
 
 ``features``
    behaviour switches for comparisons within one boot: 1 the ported fair
@@ -876,8 +896,9 @@ Disadvantages and when CFS is better
   have a median latency 1.8-2.7 times that of CFS (3.11 vs 1.15 ms at
   limit 1). Groups that are idle most of the time and need many CPUs for a
   few milliseconds are better served by CFS bandwidth control. A burst
-  width (more slots for a short time, paid back from the window) would
-  address this and is not implemented.
+  width (more slots for a short time, paid back from the bucket) would
+  address this and is not implemented. A single thread's burst at a
+  fractional limit runs at once out of the bucket, see `Limits`_.
 - **Spinning above the limit.** Threads which busy-poll for each other
   collapse when there are more of them than slots: every hand-off waits for
   a rotation. Redis with 4 I/O threads at limit 2 serves 5.35k SET/s vs
@@ -931,10 +952,10 @@ Limits of this implementation
 - Active-set changes of a group (0 <-> 1 transitions of its admitted count)
   take the parent's weight lock, so sibling groups share a lock and a cache
   line: all pods of a Kubernetes QoS class have the same parent.
-- The budget slot is accounted per tick; a group can overrun its budget by up
-  to a tick per running thread per window, which is carried over (as debt of
-  up to one second's worth of the limit, so that limits much smaller than a
-  tick per window are still met on average).
+- The budget slot is accounted per tick; a group can overrun its tokens by up
+  to a tick per running thread, which is carried over (as debt of up to one
+  second's worth of the limit, so that limits much smaller than a tick per
+  window are still met on average).
 - Tasks running in the kernel on credit run beyond the slots for as long as
   they stay in the kernel, so more than L threads of a group can be on a CPU
   at once, as under CFS bandwidth control. Their runtime is paid back
@@ -971,7 +992,7 @@ Limits of this implementation
 Possible future work:
 
 - A burst width: let a group exceed its slots for a short time, paid back
-  from its window like runtime on credit, for groups that are mostly idle
+  from its token bucket like runtime on credit, for groups that are mostly idle
   and need many CPUs for a few milliseconds.
 - Give the slot of a holder that stays preempted for more than a slice to a
   waiting task, which would shorten the stalls next to busy neighbours.

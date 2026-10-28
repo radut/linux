@@ -511,8 +511,11 @@ static inline void pfs_set_idle_hint(struct pfs_rq *prq, unsigned int idle)
  * Groups and slots.
  */
 
-/* see sched-pfs.rst: window of the budget slot, debugfs window_us */
+/* see sched-pfs.rst: retry interval of the budget slot, debugfs window_us */
 static u64 pfs_window_ns = 10 * NSEC_PER_MSEC;
+/* depth of the token bucket, percent of the fraction per period, debugfs */
+static unsigned int pfs_burst_pct = 100;
+#define PFS_MAX_BURST_PCT	1000
 /* less budget than this left counts as none (unless the budget is smaller) */
 #define PFS_MIN_BUDGET_NS	(100 * NSEC_PER_USEC)
 /* waiting tasks examined per hand-off and per retry */
@@ -595,75 +598,95 @@ static inline u64 pfs_debt_max(unsigned int limit)
 		     2 * TICK_NSEC);
 }
 
+/* a bucket not refilled for this long is full, see pfs_refill() */
+#define PFS_REFILL_MAX_NS	(16 * NSEC_PER_SEC)
+
 /*
- * The part of @lg's budget left in the current window. Windows are aligned
- * to multiples of the window length so that one timer per group finds the
- * budget refilled. Usage beyond the budget (slices end on a tick, tasks run
- * on credit in the kernel) is carried over as debt and paid back with the
- * budgets of the following windows, so that the average stays at the limit
- * even when the budget of a window is smaller than a tick. The debt is
- * capped at what the limit allows in PFS_MAX_DEBT_NS, or two ticks, which
- * bounds the wait after an overrun to about PFS_MAX_DEBT_NS; runtime on
- * credit beyond that is only possible on otherwise idle CPUs, see
- * pfs_effective_weight().
+ * The most tokens @lg saves up: what the fractional part of its limit allows
+ * in pfs_burst_pct percent of its cpu.max period, so that a burst which CFS
+ * runs at once from the quota of a period runs at once too, but at least one
+ * window's budget of the whole limit.
  */
-static u64 pfs_window_left(struct pfs_group *lg, u64 now)
+static s64 pfs_depth(struct pfs_group *lg, unsigned int limit)
 {
-	u64 w = pfs_window(), start = pfs_window_start(now, w);
-	s64 old = atomic64_read(&lg->window_start);
-	u64 budget = pfs_budget(READ_ONCE(lg->limit), w);
-	u64 used, elapsed, debt_max;
+	u64 period = READ_ONCE(lg->stat_period_ns);
+	u64 depth = div_u64((u64)(limit % 1000) * period, 1000);
 
-	if ((u64)old != start &&
-	    atomic64_try_cmpxchg(&lg->window_start, &old, start)) {
-		used = atomic64_read(&lg->window_used);
-		/*
-		 * Windows are tracked by their start time, so that a change
-		 * of the window length doesn't wipe the usage: after the
-		 * window was made longer, the new window may start before the
-		 * old one, and nothing has elapsed.
-		 */
-		elapsed = (s64)(start - (u64)old) > 0 ?
-			  div64_u64(start - (u64)old, w) : 0;
-		debt_max = pfs_debt_max(READ_ONCE(lg->limit));
-		/* elapsed * budget <= used, it can't overflow */
-		if (budget && elapsed <= div64_u64(used, budget))
-			used = min(used - elapsed * budget, debt_max);
-		else
-			used = 0;
-		atomic64_set(&lg->window_used, used);
-	}
-
-	used = atomic64_read(&lg->window_used);
-	return used < budget ? budget - used : 0;
+	depth = div_u64(depth * READ_ONCE(pfs_burst_pct), 100);
+	return max(depth, pfs_budget(limit, pfs_window()));
 }
 
 /*
- * Has @lg's subtree used more CPU time in the current window, including the
- * debt carried over, than its limit allows? Every limited level counts the
- * runtime of all tasks of its subtree, with or without slots: tasks running
- * in the kernel on credit (see pfs_admit_or_park()) are beyond the slots, and
- * with many short wakeups, as in a database, their runtime adds up to a
- * tenth or more of the limit. The full slots may have used floor(limit)
- * CPUs since the window began, the budget slot its whole budget. Runtime is
- * charged late, by a tick or, in a virtual machine whose CPU was preempted,
- * by much more, and usage below the budget is not carried over, so late
- * charges look like an excess at the start of a window: a margin of a tick
- * per slot plus one window's budget absorbs them. While the excess is above
- * the margin, the last full slot and the budget slot are not handed out, so
- * that the group pays it back; the margin only bounds the excess once.
+ * Refill @lg's token bucket for the time since its last refill and return
+ * its tokens, the runtime its limit allows the subtree right now. Tokens
+ * accrue continuously at the limit up to the depth of the bucket, see
+ * pfs_depth(), and all runtime of the subtree, with or without slots, is
+ * taken off, see pfs_charge(). Usage beyond the tokens (slices end on a
+ * tick, tasks run on credit in the kernel) leaves the bucket negative: a
+ * debt that is paid back by running below the limit, so that the average
+ * stays at the limit even when a window's budget is smaller than a tick.
+ * The debt is capped at what the limit allows in PFS_MAX_DEBT_NS, or two
+ * ticks, which bounds the wait after an overrun to about PFS_MAX_DEBT_NS;
+ * runtime on credit beyond that is only possible on otherwise idle CPUs, see
+ * pfs_effective_weight().
+ *
+ * Callers sample @now before they get here, so another CPU may have refilled
+ * up to a later time already; refill_at never goes back. The clamps to the
+ * depth and the debt cap can race against concurrent charges, which loses at
+ * most a few batches of charge.
+ */
+static s64 pfs_refill(struct pfs_group *lg, u64 now)
+{
+	s64 at = atomic64_read(&lg->refill_at), tokens, depth, max;
+	unsigned int limit = READ_ONCE(lg->limit);
+	u64 dt;
+
+	if ((s64)(now - (u64)at) <= 0 ||
+	    !atomic64_try_cmpxchg(&lg->refill_at, &at, now))
+		return atomic64_read(&lg->tokens);
+
+	depth = pfs_depth(lg, limit);
+	dt = now - (u64)at;
+	if (dt >= PFS_REFILL_MAX_NS) {
+		atomic64_set(&lg->tokens, depth);
+		return depth;
+	}
+
+	tokens = atomic64_add_return(div_u64(dt * limit, 1000), &lg->tokens);
+	max = pfs_debt_max(limit);
+	if (tokens > depth)
+		atomic64_cmpxchg(&lg->tokens, tokens, depth);
+	else if (tokens < -max)
+		atomic64_cmpxchg(&lg->tokens, tokens, -max);
+	return atomic64_read(&lg->tokens);
+}
+
+/* The runtime @lg's limit allows right now, see pfs_refill(). */
+static u64 pfs_tokens_left(struct pfs_group *lg, u64 now)
+{
+	return max_t(s64, pfs_refill(lg, now), 0);
+}
+
+/*
+ * Has @lg's subtree run beyond its limit, i.e. is its token bucket in debt,
+ * by more than a margin? Every limited level counts the runtime of all
+ * tasks of its subtree, with or without slots: tasks running in the kernel
+ * on credit (see pfs_admit_or_park()) are beyond the slots, and with many
+ * short wakeups, as in a database, their runtime adds up to a tenth or more
+ * of the limit. Runtime is charged late, by a tick or, in a virtual machine
+ * whose CPU was preempted, by much more: a margin of a tick per slot plus
+ * one window's budget absorbs that. While the debt is above the margin, the
+ * last full slot and the budget slot are not handed out, so that the group
+ * pays it back; the margin only bounds the excess once. Returns the excess.
  */
 static u64 pfs_over_limit(struct pfs_group *lg, u64 now)
 {
 	unsigned int limit = READ_ONCE(lg->limit);
-	u64 full = limit / 1000, allowed, elapsed, used, w = pfs_window();
+	s64 margin = pfs_budget(limit, pfs_window()) +
+		     pfs_width(limit) * TICK_NSEC;
+	s64 tokens = pfs_refill(lg, now);
 
-	pfs_window_left(lg, now);
-	elapsed = now - pfs_window_start(now, w);
-	allowed = full * elapsed + 2 * pfs_budget(limit, w) - full * w +
-		  pfs_width(limit) * TICK_NSEC;
-	used = atomic64_read(&lg->window_used);
-	return used > allowed ? used - allowed : 0;
+	return tokens < -margin ? -margin - tokens : 0;
 }
 
 static void pfs_queue_retry(struct pfs_group *lg);
@@ -686,8 +709,8 @@ static void pfs_untake_slot(struct pfs_group *lg)
 
 /*
  * Take one slot at the limited level @lg. The first floor(limit) slots are
- * free, the last slot of a fractional limit needs budget left in the window,
- * and clips *@run_limit to it. The last full slot and the budget slot also
+ * free, the last slot of a fractional limit needs tokens, see pfs_refill(),
+ * and clips *@run_limit to them. The last full slot and the budget slot also
  * need the group to be within its limit, see pfs_over_limit().
  */
 static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
@@ -704,7 +727,7 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 	}
 
 	if (taken >= limit / 1000) {
-		left = pfs_window_left(lg, now);
+		left = pfs_tokens_left(lg, now);
 		min_left = min_t(u64, pfs_budget(limit, pfs_window()),
 				 PFS_MIN_BUDGET_NS);
 		if (!left || left < min_left) {
@@ -721,7 +744,7 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 	 * went down: more would be forgiven otherwise.
 	 */
 	if (taken + 1 >= limit / 1000 ||
-	    (u64)atomic64_read(&lg->window_used) >= pfs_debt_max(limit)) {
+	    atomic64_read(&lg->tokens) <= -(s64)pfs_debt_max(limit)) {
 		u64 excess = pfs_over_limit(lg, now);
 
 		if (excess) {
@@ -856,7 +879,7 @@ static bool pfs_slot_free(struct pfs_group *lg)
 /*
  * The running task @p has used up its run limit: should it give its slots
  * back? Yes if a level of its path has waiting tasks, holds more slots than
- * its limit allows (the limit went down), is out of budget while its budget
+ * its limit allows (the limit went down), is out of tokens while its budget
  * slot is taken, ran beyond its limit while its last full slot is taken, or
  * became limited after @p took its slots.
  */
@@ -883,7 +906,7 @@ static bool pfs_should_rotate(struct task_struct *p)
 			continue;
 		if (!now)
 			now = pfs_now();
-		if (taken > limit / 1000 && !pfs_window_left(lg, now))
+		if (taken > limit / 1000 && !pfs_tokens_left(lg, now))
 			return true;
 		if (pfs_over_limit(lg, now))
 			return true;
@@ -957,8 +980,8 @@ bool pfs_group_throttle_stat(struct task_group *tg, struct pfs_throttle_stat *st
 
 /*
  * Charge @delta of runtime of a task of @g, with or without slots, to the
- * limited levels of its path: to the window of the level, see
- * pfs_window_left() and pfs_over_limit(), and to the slot service of the
+ * limited levels of its path: to the token bucket of the level, see
+ * pfs_refill() and pfs_over_limit(), and to the slot service of the
  * child of the level the task belongs to, which shares the level's slots
  * between its children by weight, see pfs_next_waiter(). Returns true if a
  * level is limited.
@@ -974,8 +997,8 @@ static bool pfs_charge(struct pfs_group *g, u64 delta)
 
 		if (!now)
 			now = pfs_now();
-		pfs_window_left(lg, now);
-		atomic64_add(delta, &lg->window_used);
+		pfs_refill(lg, now);
+		atomic64_sub(delta, &lg->tokens);
 		pfs_stat_period(lg, now);
 
 		if (child)
@@ -996,7 +1019,7 @@ static enum hrtimer_restart pfs_window_timer_fn(struct hrtimer *timer);
 static void pfs_group_retry(struct pfs_group *g);
 
 /*
- * Start @lg's timer for the next window, for tasks waiting for budget, or
+ * Start @lg's timer for the next window, for tasks waiting for tokens, or
  * after @delay if it is non-zero and earlier (at least PFS_MIN_BUDGET_NS),
  * for tasks waiting for the group to pay back runtime beyond its limit.
  *
@@ -2053,7 +2076,7 @@ static u64 pfs_run_limit(struct task_struct *p)
 			continue;
 		if (!now)
 			now = pfs_now();
-		limit = min(limit, pfs_window_left(lg, now));
+		limit = min(limit, pfs_tokens_left(lg, now));
 	}
 	return max_t(u64, limit, TICK_NSEC);
 }
@@ -3515,6 +3538,15 @@ void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
 
 	if (period_us)
 		WRITE_ONCE(g->stat_period_ns, period_us * NSEC_PER_USEC);
+	/*
+	 * A group which becomes limited starts with a full bucket, as CFS
+	 * starts with the quota of a period; a change of the limit keeps the
+	 * tokens or the debt.
+	 */
+	if (limit && !READ_ONCE(g->limit)) {
+		atomic64_set(&g->tokens, pfs_depth(g, limit));
+		atomic64_set(&g->refill_at, pfs_now());
+	}
 	old = xchg(&g->limit, (unsigned int)limit);
 	if (!old && limit)
 		atomic_inc(&pfs_nr_limited);
@@ -3659,7 +3691,7 @@ static int pfs_groups_show(struct seq_file *m, void *v)
 	if (!path)
 		return -ENOMEM;
 
-	seq_puts(m, "# limit_mcpu slots waiting window_used_us weight hweight active path\n");
+	seq_puts(m, "# limit_mcpu slots waiting tokens_us weight hweight active path\n");
 	rcu_read_lock();
 	list_for_each_entry_rcu(tg, &task_groups, list) {
 		struct pfs_group *g = &tg->pfs;
@@ -3668,9 +3700,9 @@ static int pfs_groups_show(struct seq_file *m, void *v)
 			continue;
 		if (!autogroup_path(tg, path, PATH_MAX))
 			cgroup_path(tg->css.cgroup, path, PATH_MAX);
-		seq_printf(m, "%u %d %u %llu %lu %lu %d %s\n", READ_ONCE(g->limit),
+		seq_printf(m, "%u %d %u %lld %lu %lu %d %s\n", READ_ONCE(g->limit),
 			   atomic_read(&g->nr_slots), READ_ONCE(g->nr_waiting),
-			   (u64)atomic64_read(&g->window_used) / NSEC_PER_USEC,
+			   div_s64(atomic64_read(&g->tokens), NSEC_PER_USEC),
 			   scale_load_down(READ_ONCE(g->weight)),
 			   scale_load_down(READ_ONCE(g->hweight)),
 			   READ_ONCE(g->nr_active), path);
@@ -3726,6 +3758,22 @@ static int pfs_window_us_set(void *data, u64 val)
 DEFINE_DEBUGFS_ATTRIBUTE(pfs_window_us_fops, pfs_window_us_get,
 			 pfs_window_us_set, "%llu\n");
 
+static int pfs_burst_pct_get(void *data, u64 *val)
+{
+	*val = READ_ONCE(pfs_burst_pct);
+	return 0;
+}
+
+static int pfs_burst_pct_set(void *data, u64 val)
+{
+	if (val > PFS_MAX_BURST_PCT)
+		return -EINVAL;
+	WRITE_ONCE(pfs_burst_pct, val);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(pfs_burst_pct_fops, pfs_burst_pct_get,
+			 pfs_burst_pct_set, "%llu\n");
+
 void pfs_debugfs_init(struct dentry *parent)
 {
 	struct dentry *d;
@@ -3738,6 +3786,7 @@ void pfs_debugfs_init(struct dentry *parent)
 	debugfs_create_file("groups", 0400, d, NULL, &pfs_groups_fops);
 	debugfs_create_file("waiters", 0400, d, NULL, &pfs_waiters_fops);
 	debugfs_create_file_unsafe("window_us", 0644, d, NULL, &pfs_window_us_fops);
+	debugfs_create_file_unsafe("burst_pct", 0644, d, NULL, &pfs_burst_pct_fops);
 	debugfs_create_u32("features", 0644, d, &pfs_features);
 	debugfs_create_u32("wakeup_gran_us", 0644, d, &pfs_wakeup_gran_us);
 }
