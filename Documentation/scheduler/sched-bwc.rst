@@ -138,13 +138,19 @@ group with a limit
 of L = quota / period has floor(L) slots without a time limit. A cfs_rq of
 the group takes a slot when its tasks start running on a CPU and gives it
 back when they stop; without a free slot it is throttled until one is given
-back. A fractional limit adds one more slot whose use is limited to
-(L - floor(L)) * window of CPU time every window of min(period, 10ms), so a
-limit below one CPU is still enforced as time, over that shorter window.
-While other CPUs wait for a slot of the group, a CPU holding one gives it up
-after running the group's tasks for the slice per task, so that the CPUs
-take turns. Limits apply at every level of the hierarchy. cpu.cfs_burst_us
-is ignored in width mode, and nr_periods and nr_throttled count windows.
+back. A fractional limit adds one more slot whose CPU time is limited by a
+token bucket: it accrues continuously at L - floor(L) CPUs, up to what that
+fraction allows in one period plus cpu.max.burst, e.g. 10ms for a limit of
+0.1 with a period of 100ms. A group which ran below its limit can thus run a
+burst of up to that size at once, as it can from the quota of a period
+without width mode, while a group which keeps the slot busy gets about
+(L - floor(L)) * window of it every window of min(period, 10ms) rather than
+the quota of a period after a long throttled stretch. A limit below one CPU
+is still enforced as time; a shorter period or cpu.max.burst sets the size
+of the bursts. While other CPUs wait for a slot of the group, a CPU holding
+one gives it up after running the group's tasks for the slice per task, so
+that the CPUs take turns. Limits apply at every level of the hierarchy, and
+nr_periods and nr_throttled count windows.
 
 The sysctl is global and only root of the initial namespaces can change it,
 but whoever may write a group's cpu.max, e.g. the owner of a delegated
@@ -156,10 +162,11 @@ or write the limits of all groups again after changing it.
 A throttled task keeps running until it returns to user space, so a slot
 alone doesn't bound the time a group spends in the kernel, e.g. in long reads
 of /dev/urandom or in pipe writes. Width mode therefore charges all runtime
-of the group, with or without a slot, and carries the usage beyond L over as
-debt, up to what L allows in one second. While the debt is above a margin of
-one window's budget plus a tick per slot, no slot is handed out, so that the
-group pays it back by running below its limit. Such loads average at the
+of the group, with or without a slot, against a second bucket which accrues
+at L and is as deep as the first one: usage beyond L leaves it negative, a
+debt of up to what L allows in one second. While the debt is above a margin
+of one window's budget plus a tick per slot, no slot is handed out, so that
+the group pays it back by running below its limit. Such loads average at the
 limit, as with bandwidth control, but in throttled stretches.
 
 Width mode is meant for multi-threaded groups (request handlers, databases,

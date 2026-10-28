@@ -22,7 +22,7 @@ const char help_fmt[] =
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
 "Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US]\n"
-"       [-q NR] [-i INTERVAL] [-S FILE] [-v]\n"
+"       [-b BURST_PCT] [-q NR] [-i INTERVAL] [-S FILE] [-v]\n"
 "\n"
 "  -s SLICE_US   Slice duration (default: 2500, 100 to 1000000)\n"
 "  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
@@ -31,10 +31,14 @@ const char help_fmt[] =
 "  -r ROT_US     ... and to any waiting task after this, 0 for the end of the\n"
 "                slice (default: 0, at most 1000000)\n"
 "  -k CREDIT_US  A task which woke up and found no free slot runs without one\n"
-"                for up to this long while its cgroup has unused budget, 0\n"
-"                to make it wait (default: 1000, at most 1000000)\n"
-"  -w WINDOW_US  Accounting window for fractional limits (default: 10000,\n"
-"                1000 to 1000000)\n"
+"                for up to this long while its cgroup has saved up CPU time,\n"
+"                0 to make it wait (default: 1000, at most 1000000)\n"
+"  -w WINDOW_US  How often a cgroup out of CPU time for its fractional limit\n"
+"                gets another try, also the window of the throttling counters\n"
+"                (default: 10000, 1000 to 1000000)\n"
+"  -b BURST_PCT  CPU time a fractional limit saves up while it runs below it,\n"
+"                in percent of what its fraction allows per cpu.max period,\n"
+"                at least a window's worth (default: 100, at most 1000)\n"
 "  -q NR         Size of the queues of cgroups with waiting tasks; more\n"
 "                such cgroups are found by a slower sweep (default: 65536,\n"
 "                16 to 16777216)\n"
@@ -45,9 +49,10 @@ const char help_fmt[] =
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
 
-/* bounds the timer frequency, budgets are refilled every window */
+/* bounds the timer frequency, cgroups out of tokens are retried every window */
 #define MIN_WINDOW_US	1000
 #define MAX_US		(1000 * 1000)	/* bounds for -s, -c, -r, -k and -w */
+#define MAX_BURST_PCT	1000
 #define MIN_SLICE_US	100
 #define MAX_INTERVAL	(24 * 3600)
 #define MIN_CGRP_Q	16
@@ -250,7 +255,7 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:c:r:k:w:q:i:S:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:k:w:b:q:i:S:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = 1000 *
@@ -271,6 +276,10 @@ restart:
 		case 'w':
 			skel->rodata->window_ns = 1000 *
 				parse_opt(opt, optarg, MIN_WINDOW_US, MAX_US);
+			break;
+		case 'b':
+			skel->rodata->burst_pct = parse_opt(opt, optarg, 0,
+							    MAX_BURST_PCT);
 			break;
 		case 'q':
 			nr_cgrp_q = parse_opt(opt, optarg, MIN_CGRP_Q,
@@ -304,12 +313,14 @@ restart:
 	skel->rodata->min_share = HWEIGHT_ONE * skel->rodata->slice_ns /
 				  (WAIT_MAX_NS * nr_cpus) ?: 1;
 
-	printf("slice=%lluus cut=%lluus rot=%lluus credit=%lluus window=%lluus queues=%llu\n",
+	printf("slice=%lluus cut=%lluus rot=%lluus credit=%lluus ",
 	       (unsigned long long)skel->rodata->slice_ns / 1000,
 	       (unsigned long long)skel->rodata->cut_ns / 1000,
 	       (unsigned long long)skel->rodata->rot_ns / 1000,
-	       (unsigned long long)skel->rodata->credit_ns / 1000,
+	       (unsigned long long)skel->rodata->credit_ns / 1000);
+	printf("window=%lluus burst=%llu%% queues=%llu\n",
 	       (unsigned long long)skel->rodata->window_ns / 1000,
+	       (unsigned long long)skel->rodata->burst_pct,
 	       (unsigned long long)nr_cgrp_q);
 
 	bpf_map__set_max_entries(skel->maps.retry_q, nr_cgrp_q);

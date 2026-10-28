@@ -36,14 +36,14 @@
  * cgroup. Tasks which woke up are in the kernel and may have been woken as the
  * new owner of a lock, so one which finds no free slot runs without one, on
  * credit, for up to credit_ns (-k, 1ms) if every limited cgroup on its path
- * has budget the tasks holding its slots can't use: the budget left in the
- * window minus what the holders would use until the window ends, see
- * credit_ok(). Credit thus comes out of what the cgroup left unused earlier in
- * the window, e.g. while its threads slept, and lets the concurrency exceed
- * the width meanwhile but not the usage the limit. A cgroup which keeps its
- * slots busy gives no credit; its woken tasks wait for a slot, are admitted
- * before the rotated ones and cut a rotated holder's turn after cut_ns. Credit
- * whenever the window has budget left would bound the wait of a woken lock
+ * has tokens left, see
+ * credit_ok(). Credit thus comes out of the tokens the cgroup saved up while
+ * it ran below its limit, e.g. while its threads slept, and lets the
+ * concurrency exceed the width meanwhile but not the usage the limit. A
+ * cgroup which keeps its slots busy saves no tokens and gives no credit once
+ * they are spent; its woken tasks wait for a slot, are admitted before the
+ * rotated ones and cut a rotated holder's turn after cut_ns. Credit beyond
+ * the tokens, e.g. a budget per window, would bound the wait of a woken lock
  * owner further, but threads which take turns on a contended lock then spend
  * the cgroup's limit on futex wakeups that only block again, which cost them
  * more than 80% of their throughput, and the limit is then only met by
@@ -67,12 +67,17 @@
  * ancestors of its already removed cgroup aren't leaked.
  *
  * A fractional limit such as 1.5 is enforced as floor(1.5) == 1 slot without
- * any time budget plus one extra slot which is rate limited. The cgroup's total
- * usage is accounted in short windows (-w, 10ms by default) and the extra slot
- * can only be taken while the usage in the current window is below
- * limit * window. Limits below one CPU only have the rate limited slot, so
- * they are still throttled, but over a window much shorter than the 100ms
- * default period of cpu.max.
+ * any time budget plus one extra slot which is rate limited by a token bucket
+ * per cgroup, see refill(). Tokens accrue at the limit and all runtime of the
+ * cgroup's tasks is taken off; the extra slot can only be taken while there
+ * are tokens. The bucket holds what the fractional part of the limit allows
+ * in one cpu.max period (-b, 100% by default), so a cgroup limited to 0.1 CPU
+ * with a period of 100ms can run a burst of 10ms at once after it ran below
+ * its limit, as it can under CFS, while its long-run average stays at the
+ * limit. Limits below one CPU only have the rate limited slot. Once a cgroup
+ * used up its tokens, e.g. a task spinning at its limit, its extra slot is
+ * retried every window (-w, 10ms by default) and gets what accrued meanwhile,
+ * limit * window, rather than a period's quota after a long throttled stretch.
  *
  * Limits are hierarchical: a task needs a free slot in every limited cgroup
  * from its own up to the root. If a level is full, the task waits in that
@@ -118,21 +123,20 @@
  * hweights are cached and recomputed when the set of active cgroups or a
  * weight changes. cpu.max.burst is ignored.
  *
- * All runtime of a cgroup's tasks, with or without slots, is charged to the
- * windows of the limited cgroups on their path: on every tick, when a task
- * stops, and for a task which blocked, until ops.dispatch() is done with its
- * CPU. Accounting is still approximate: the slice of a task admitted to the
- * rate limited slot or on credit is clipped to the budget left at admission,
- * but other running tasks of the cgroup consume the same budget concurrently,
- * and the exiting tasks, kernel threads and killed tasks above run anyway.
- * Usage beyond the budget is carried over as debt, up to what the limit
- * allows in DEBT_MAX_NS. While a cgroup is beyond its limit by more than a
- * margin of a window's budget and a tick per slot, see over_limit(), its last
- * full slot and its rate limited slot aren't handed out and it gives no
+ * All runtime of a cgroup's tasks, with or without slots, is taken off the
+ * token buckets of the limited cgroups on their path: on every tick, when a
+ * task stops, and for a task which blocked, until ops.dispatch() is done with
+ * its CPU. Accounting is still approximate: the slice of a task admitted to
+ * the rate limited slot or on credit is clipped to the tokens left at
+ * admission, but other running tasks of the cgroup consume the same tokens
+ * concurrently, and the exiting tasks, kernel threads and killed tasks above
+ * run anyway. Usage beyond the tokens leaves the bucket negative, a debt of
+ * up to what the limit allows in DEBT_MAX_NS. While a cgroup's debt is above
+ * a margin of a window's budget and a tick per slot, see over_limit(), its
+ * last full slot and its rate limited slot aren't handed out and it gives no
  * credit, so that it pays the debt back and its average usage stays at the
- * limit. The budget is reset lazily by the first user in a new window, and a
- * charge racing against the reset can land in the new window, which can delay
- * the rate limited slot by up to one window.
+ * limit. The bucket is refilled lazily by its users; refills and charges race
+ * only in the clamping to the bucket's depth and debt cap.
  *
  * A task which is dequeued and enqueued again while it is running, e.g. on
  * sched_setaffinity(), a nice change or a cgroup move, gives its slots back at
@@ -181,6 +185,8 @@ enum {
 #define MIN_BUDGET_NS		(100 * 1000LLU)
 /* runtime beyond the limit is carried over up to what it allows in this time */
 #define DEBT_MAX_NS		(1000 * 1000 * 1000LLU)
+/* a bucket not refilled for this long is full, see refill() */
+#define REFILL_MAX_NS		(16 * DEBT_MAX_NS)
 /* a tick at HZ=250: how late a slot holder's slice can end, see over_limit() */
 #define TICK_SLACK_NS		(4 * 1000 * 1000LLU)
 #define PFS_SIGKILL		9
@@ -195,11 +201,13 @@ _Static_assert(MAX_LEVELS <= SLOT_SEQ_SHIFT, "level bits overlap the sequence");
 enum reserve_result {
 	RESERVE_OK,
 	RESERVE_FULL,		/* all slots of a level are taken */
-	RESERVE_BUDGET,		/* a level's rate limited slot is out of budget */
+	RESERVE_BUDGET,		/* a level's rate limited slot is out of tokens */
 };
 
 const volatile u64 slice_ns;
 const volatile u64 window_ns;
+/* bucket depth in percent of the fractional quota per period, see refill() */
+const volatile u64 burst_pct = 100;
 /* a rotated holder gives its slots to a woken waiter after this, see tick */
 const volatile u64 cut_ns = 500 * 1000;
 /* and to any waiting task after this, 0 (default) for the end of the slice */
@@ -246,8 +254,10 @@ struct pfs_cgrp_ctx {
 	s32		nr_parking;	/* parks not yet seen by a walk, see park() */
 	u64		park_at;	/* when a task last parked here */
 	u64		retry_at;	/* when a retry last walked the DSQs */
-	u64		window_id;
-	u64		window_used;	/* runtime charged in window_id */
+	/* token bucket of the limit, see refill() */
+	s64		tokens;		/* runtime allowed now, a debt if < 0 */
+	u64		refill_at;	/* when tokens were last refilled */
+	u64		depth;		/* the most tokens saved up */
 
 	/* cpu.weight, see the top of the file */
 	u32		weight;
@@ -317,7 +327,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_QUEUE);
 	__uint(max_entries, NR_CGRP_Q);
 	__type(value, u64);
-} budget_q SEC(".maps");	/* cgroups waiting for the next window's budget */
+} budget_q SEC(".maps");	/* cgroups waiting for tokens, see the timer */
 
 struct pfs_timer {
 	struct bpf_timer	timer;
@@ -506,8 +516,8 @@ static u64 window_now(void)
 	return bpf_ktime_get_ns();
 }
 
-/* the most runtime beyond @cgc's limit that is carried over, see window_left() */
-static u64 debt_max(struct pfs_cgrp_ctx *cgc)
+/* the most runtime beyond @cgc's limit that is carried over, see refill() */
+static s64 debt_max(struct pfs_cgrp_ctx *cgc)
 {
 	u64 budget = cgc->limit * window_ns / FRAC_ONE;
 	u64 max = cgc->limit * DEBT_MAX_NS / FRAC_ONE;
@@ -516,62 +526,80 @@ static u64 debt_max(struct pfs_cgrp_ctx *cgc)
 }
 
 /*
- * Return the part of @cgc's budget left in the current window. Windows are
- * aligned to multiples of window_ns so that the periodic timer finds the
- * budgets of all cgroups refilled when it fires. The reset can race against
- * concurrent charging, which loses at most a few slices worth of charge.
- *
- * window_used counts the runtime of all tasks of the subtree, with or without
- * slots. Usage beyond the budget (slices end on a tick, tasks run on credit)
- * is carried over as debt and paid back with the budgets of the following
- * windows, so that the average stays at the limit, see over_limit(). The debt
- * is capped at what the limit allows in DEBT_MAX_NS, which bounds the wait
- * after an overrun.
+ * The most tokens a cgroup with @limit and a cpu.max period of @period_ns
+ * saves up: what the fractional part of the limit allows in burst_pct percent
+ * of the period, so that a burst which CFS runs at once from the quota of a
+ * period runs at once too, but at least one window's budget of the whole
+ * limit, which is the credit an integer limit can give, see credit_ok().
  */
-static u64 window_left(struct pfs_cgrp_ctx *cgc, u64 now)
+static u64 bucket_depth(u64 limit, u64 period_ns)
 {
-	u64 id = now / window_ns;
-	u64 old_id = cgc->window_id;
-	u64 budget, used, elapsed, max;
+	u64 budget = limit * window_ns / FRAC_ONE;
+	u64 depth = (limit % FRAC_ONE) * period_ns / FRAC_ONE * burst_pct / 100;
 
-	budget = cgc->limit * window_ns / FRAC_ONE;
-
-	/*
-	 * Callers sample @now before they get here, so another CPU may have
-	 * started the next window already. Never go back to an older window:
-	 * that throws the newer window's usage away, and coming back to it
-	 * starts it over with nothing used.
-	 */
-	if (id > old_id &&
-	    __sync_val_compare_and_swap(&cgc->window_id, old_id, id) == old_id) {
-		used = cgc->window_used;
-		elapsed = id - old_id;
-		max = debt_max(cgc);
-		/* elapsed * budget <= used, it can't overflow */
-		if (budget && elapsed <= used / budget) {
-			used -= elapsed * budget;
-			if (used > max)
-				used = max;
-		} else {
-			used = 0;
-		}
-		cgc->window_used = used;
-	}
-
-	used = cgc->window_used;
-	return used < budget ? budget - used : 0;
+	return depth > budget ? depth : budget;
 }
 
 /*
- * Return whether @cgc has budget left in the current window and clip *@slicep
- * to it. Less than MIN_BUDGET_NS left counts as none to avoid tiny slices,
- * unless the whole budget of a window is smaller than that.
+ * Refill @cgc's token bucket for the time since its last refill and return
+ * its tokens, the runtime its limit allows the subtree right now. Tokens
+ * accrue continuously at the limit, limit / FRAC_ONE ns per ns, up to the
+ * depth of the bucket, see bucket_depth(), and all runtime of the subtree,
+ * with or without slots, is taken off, see charge_runtime(). Usage beyond
+ * the tokens (slices end on a tick, tasks run on credit) leaves the bucket
+ * negative: a debt that is paid back by running below the limit, so that the
+ * average stays at the limit, see over_limit(). The debt is capped at what
+ * the limit allows in DEBT_MAX_NS, which bounds the wait after an overrun.
+ *
+ * Callers sample @now before they get here, so another CPU may have refilled
+ * up to a later time already; refill_at never goes back. The clamps to the
+ * depth and the debt cap can race against concurrent charges, which loses at
+ * most a few slices worth of charge.
+ */
+static s64 refill(struct pfs_cgrp_ctx *cgc, u64 now)
+{
+	u64 at = cgc->refill_at, dt;
+	s64 tokens, depth, add, max;
+
+	if ((s64)(now - at) <= 0 ||
+	    __sync_val_compare_and_swap(&cgc->refill_at, at, now) != at)
+		return cgc->tokens;
+
+	depth = cgc->depth;
+	dt = now - at;
+	if (dt >= REFILL_MAX_NS) {
+		cgc->tokens = depth;
+		return depth;
+	}
+
+	add = dt * cgc->limit / FRAC_ONE;
+	tokens = __sync_fetch_and_add(&cgc->tokens, add) + add;
+	max = debt_max(cgc);
+	if (tokens > depth)
+		__sync_val_compare_and_swap(&cgc->tokens, tokens, depth);
+	else if (tokens < -max)
+		__sync_val_compare_and_swap(&cgc->tokens, tokens, -max);
+	return cgc->tokens;
+}
+
+/* the runtime @cgc's limit allows right now, see refill() */
+static u64 tokens_left(struct pfs_cgrp_ctx *cgc, u64 now)
+{
+	s64 tokens = refill(cgc, now);
+
+	return tokens > 0 ? tokens : 0;
+}
+
+/*
+ * Return whether @cgc has tokens left and clip *@slicep to them. Less than
+ * MIN_BUDGET_NS left counts as none to avoid tiny slices, unless the whole
+ * budget of a window is smaller than that.
  */
 static bool budget_left(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
 {
 	u64 left, min_left;
 
-	left = window_left(cgc, now);
+	left = tokens_left(cgc, now);
 	min_left = cgc->limit * window_ns / FRAC_ONE;
 	if (min_left > MIN_BUDGET_NS)
 		min_left = MIN_BUDGET_NS;
@@ -672,34 +700,27 @@ static void wait_end(struct pfs_task_ctx *taskc, u64 now)
 }
 
 /*
- * Has @cgc's subtree used more CPU time in the current window, including the
- * debt carried over, than its limit allows? The full slots may have used
- * floor(limit) CPUs since the window began, the rate limited slot its whole
- * budget. Runtime is charged late, by a tick or, in a virtual machine whose
- * CPU was preempted, by much more, so a margin of a tick per slot plus one
- * window's budget absorbs that. The margin only bounds the excess once.
+ * Has @cgc's subtree run beyond its limit, i.e. is its token bucket in debt,
+ * by more than a margin? Runtime is charged late, by a tick or, in a virtual
+ * machine whose CPU was preempted, by much more, so a margin of a tick per
+ * slot plus one window's budget absorbs that. The margin only bounds the
+ * excess once.
  */
 static bool over_limit(struct pfs_cgrp_ctx *cgc, u64 now)
 {
-	u64 full = cgc->limit / FRAC_ONE;
 	u64 width = div_round_up(cgc->limit, FRAC_ONE);
-	u64 budget = cgc->limit * window_ns / FRAC_ONE;
-	u64 allowed;
+	u64 margin = cgc->limit * window_ns / FRAC_ONE + width * TICK_SLACK_NS;
 
-	window_left(cgc, now);
-	/* 2 * budget >= full * window_ns, it can't underflow */
-	allowed = full * (now % window_ns) + 2 * budget - full * window_ns +
-		  width * TICK_SLACK_NS;
-	return cgc->window_used > allowed;
+	return refill(cgc, now) < -(s64)margin;
 }
 
 /*
  * Take a slot in a single limited cgroup. The first floor(limit) slots are
- * free. The last slot of a fractional limit needs budget left in the window,
- * see budget_left(). The last full slot and the rate limited slot also need
- * the cgroup to be within its limit, see over_limit(), so that a cgroup which
- * ran beyond it, e.g. with tasks on credit, pays the excess back. Once the
- * debt reached its cap, no slot is handed out until it went down.
+ * free. The last slot of a fractional limit needs tokens, see budget_left().
+ * The last full slot and the rate limited slot also need the cgroup to be
+ * within its limit, see over_limit(), so that a cgroup which ran beyond it,
+ * e.g. with tasks on credit, pays the excess back. Once the debt reached its
+ * cap, no slot is handed out until it went down.
  */
 static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 				     u64 *slicep)
@@ -720,7 +741,7 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 	}
 
 	/* the window timer retries the cgroups refused for budget */
-	if ((taken + 1 >= full || cgc->window_used >= debt_max(cgc)) &&
+	if ((taken + 1 >= full || cgc->tokens <= -debt_max(cgc)) &&
 	    over_limit(cgc, now)) {
 		__sync_fetch_and_sub(&cgc->nr_slots, 1);
 		stat_inc(PFS_STAT_PARK_DEBT);
@@ -942,38 +963,37 @@ static bool must_not_park(struct task_struct *p)
 
 /*
  * Can @cgc let a task run on credit, without a slot, and for how long? Only
- * with the part of the window's budget which the tasks holding full slots
- * can't use until the window ends, i.e. what the cgroup left unused earlier
- * in the window, and only while it is within its limit, see over_limit(). The
- * rate limited slot draws on the same budget as credit. A cgroup which keeps
- * its slots busy, e.g. threads that take turns on a lock, gives no credit;
- * one whose tasks often sleep, e.g. a database or pipes, does.
+ * with the tokens it has, i.e. what it saved up while it ran below its limit,
+ * and only while it is within its limit, see over_limit(). The holders of
+ * full slots don't need tokens: they use at most floor(limit) CPUs while the
+ * bucket refills at the limit. The rate limited slot draws on the same tokens
+ * as credit. A cgroup which keeps its slots busy, e.g. threads that take
+ * turns on a lock, saves nothing and gives no credit once its tokens are
+ * spent; one whose tasks often sleep, e.g. a database or pipes, does.
  */
 static bool credit_ok(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
 {
-	u64 full = cgc->limit / FRAC_ONE, taken = cgc->nr_slots;
-	u64 left, held, min_left;
+	u64 left, min_left;
 
 	if (over_limit(cgc, now))
 		return false;
 
-	left = window_left(cgc, now);
-	held = (taken < full ? taken : full) * (window_ns - now % window_ns);
+	left = tokens_left(cgc, now);
 	min_left = cgc->limit * window_ns / FRAC_ONE;
 	if (min_left > MIN_BUDGET_NS)
 		min_left = MIN_BUDGET_NS;
-	if (left <= held || left - held < min_left)
+	if (!left || left < min_left)
 		return false;
-	if (left - held < *slicep)
-		*slicep = left - held;
+	if (left < *slicep)
+		*slicep = left;
 	return true;
 }
 
 /*
  * Whether a task of @cgrp which found no free slot may run on credit, without
  * slots: every limited cgroup on the path can give credit, see credit_ok(),
- * the smallest of which clips *@slicep. The runtime is charged to the
- * windows, and any excess is paid back as debt.
+ * the smallest of which clips *@slicep. The runtime is taken off the
+ * buckets, and any excess is paid back as debt.
  */
 static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
 {
@@ -1153,7 +1173,7 @@ enum walk_result {
 	WK_EMPTY,		/* every task of the DSQ was examined */
 	WK_MORE,		/* stopped early, more tasks may be admittable */
 	WK_FULL,		/* @cgid itself has no free slot */
-	WK_BUDGET,		/* @cgid's rate limited slot is out of budget */
+	WK_BUDGET,		/* @cgid's rate limited slot is out of tokens */
 };
 
 /*
@@ -1684,8 +1704,8 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Don't let a task wait which may hold a lock others wait for, see
-	 * the top of the file. Woken tasks run on credit while the budget
-	 * lasts, as do io_uring workers, which never return to user space.
+	 * the top of the file. Woken tasks run on credit while the tokens
+	 * last, as do io_uring workers, which never return to user space.
 	 */
 	if (ret != RESERVE_OK) {
 		slice = credit_ns && credit_ns < slice_ns ? credit_ns : slice_ns;
@@ -1721,7 +1741,7 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	bpf_cgroup_release(cgrp);
 }
 
-/* charge @delta of runtime to the windows of the limited cgroups on the path */
+/* take @delta of runtime off the buckets of the limited cgroups on the path */
 static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
 {
 	struct pfs_cgrp_ctx *cgc;
@@ -1741,15 +1761,15 @@ static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
 		if (!cgc->limit)
 			continue;
 
-		window_left(cgc, now);
-		__sync_fetch_and_add(&cgc->window_used, delta);
+		refill(cgc, now);
+		__sync_fetch_and_add(&cgc->tokens, -(s64)delta);
 		count_window(cgc, now, cgc->stat.nr_waiting > 0);
 	}
 }
 
 /*
  * Charge @p's runtime since it started running, or since it was last charged,
- * to its vtime, scaled by its weight and @cgrp's share, and to the windows on
+ * to its vtime, scaled by its weight and @cgrp's share, and to the buckets on
  * @cgrp's path.
  */
 static void charge_task(struct task_struct *p, struct pfs_task_ctx *taskc,
@@ -1880,9 +1900,9 @@ void BPF_STRUCT_OPS(pfs_dispatch, s32 cpu, struct task_struct *prev)
 	 * comes first, keep_prev() reserves again and keeps it running, if it
 	 * ends up being the only task for the CPU, ops.enqueue() does.
 	 *
-	 * Charge @prev's runtime first, otherwise the retries see the window
-	 * usage from before it ran and can admit a task to a rate limited slot
-	 * whose budget @prev just used up. ops.stopping() charges the rest.
+	 * Charge @prev's runtime first, otherwise the retries see the tokens
+	 * from before it ran and can admit a task to a rate limited slot
+	 * whose tokens @prev just used up. ops.stopping() charges the rest.
 	 * @prev is NULL if it isn't an SCX task.
 	 */
 	if (prev) {
@@ -2208,8 +2228,15 @@ void BPF_STRUCT_OPS(pfs_cgroup_move, struct task_struct *p,
 	set_task_cgrp(taskc, to);
 }
 
-static void set_limit(struct pfs_cgrp_ctx *cgc, u64 limit)
+/*
+ * Set @cgc's limit to @limit milli-CPUs with a cpu.max period of @period_us.
+ * A cgroup which becomes limited starts with a full bucket, as CFS starts
+ * with the quota of a period; a change of the limit keeps the tokens or debt.
+ */
+static void set_limit(struct pfs_cgrp_ctx *cgc, u64 limit, u64 period_us)
 {
+	u64 depth;
+
 	/* without wait DSQs the cgroup's tasks can't wait for slots */
 	if (cgc->no_dsq)
 		limit = 0;
@@ -2219,6 +2246,14 @@ static void set_limit(struct pfs_cgrp_ctx *cgc, u64 limit)
 	else if (cgc->limit && !limit)
 		__sync_fetch_and_sub(&nr_limited, 1);
 
+	depth = limit ? bucket_depth(limit, period_us * 1000) : 0;
+	if (!cgc->limit && limit) {
+		cgc->refill_at = window_now();
+		cgc->tokens = depth;
+	}
+	cgc->depth = depth;
+	if (cgc->tokens > (s64)depth)
+		cgc->tokens = depth;
 	cgc->limit = limit;
 }
 
@@ -2266,7 +2301,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_cgroup_init, struct cgroup *cgrp,
 
 	cgc->weight = args->weight;
 	cgc->hweight = HWEIGHT_ONE;
-	set_limit(cgc, bw_to_limit(args->bw_period_us, args->bw_quota_us));
+	set_limit(cgc, bw_to_limit(args->bw_period_us, args->bw_quota_us),
+		  args->bw_period_us);
 	return 0;
 }
 
@@ -2309,7 +2345,7 @@ void BPF_STRUCT_OPS(pfs_cgroup_exit, struct cgroup *cgrp)
 
 	cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
 	if (cgc)
-		set_limit(cgc, 0);
+		set_limit(cgc, 0, 0);
 
 	if (!cgc || !cgc->no_dsq) {
 		drain_destroy_dsq(cgid);
@@ -2327,7 +2363,7 @@ void BPF_STRUCT_OPS(pfs_cgroup_set_bandwidth, struct cgroup *cgrp,
 	if (!cgc)
 		return;
 
-	set_limit(cgc, bw_to_limit(period_us, quota_us));
+	set_limit(cgc, bw_to_limit(period_us, quota_us), period_us);
 
 	/* the limit may have grown, give the waiting tasks a chance */
 	if (nr_waiting(cgrp->kn->id))
@@ -2447,10 +2483,10 @@ static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 	int i, ret;
 
 	/*
-	 * Budgets are refilled at window boundaries. Give the cgroups waiting
-	 * for budget another try. A cgroup which is still out of budget queues
-	 * itself again, and is only retried in the next window: the pass is
-	 * limited to the entries queued before it started.
+	 * Tokens accrue continuously, see refill(). Give the cgroups waiting
+	 * for them another try every window. A cgroup which is still out of
+	 * tokens queues itself again, and is only retried in the next window:
+	 * the pass is limited to the entries queued before it started.
 	 */
 	bpf_for(i, 0, TIMER_BATCH) {
 		if (i >= nr || bpf_map_pop_elem(&budget_q, &cgid))
@@ -2484,7 +2520,7 @@ static int window_timerfn(void *map, int *key, struct bpf_timer *timer)
 		retry_cgroup(cgid, &nr_nokick, &nokick_pid);
 	}
 
-	/* without the timer, cgroups waiting for budget would stall */
+	/* without the timer, cgroups waiting for tokens would stall */
 	ret = bpf_timer_start(timer, window_ns - window_now() % window_ns, 0);
 	if (ret)
 		scx_bpf_error("bpf_timer_start failed (%d)", ret);

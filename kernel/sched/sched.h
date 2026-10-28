@@ -467,8 +467,8 @@ struct cfs_bandwidth {
 
 	/*
 	 * Width mode, see account_cfs_rq_width(): at most width_slots cfs_rqs
-	 * of the group run at once, plus one rate limited extra slot which is
-	 * given width_budget of runtime every width_window.
+	 * of the group run at once, plus one rate limited extra slot whose
+	 * runtime accrues at width_frac per period, up to width_depth.
 	 */
 	u8			width;
 	u8			width_extra;
@@ -476,12 +476,15 @@ struct cfs_bandwidth {
 	u8			width_throttled; /* a cfs_rq waited in this window */
 	int			width_slots;
 	int			width_active;
-	u64			width_budget;
+	u64			width_frac;	/* quota beyond the full slots */
+	u64			width_budget;	/* width_frac per width_window */
+	u64			width_depth;
+	u64			width_refilled;
 	ktime_t			width_window;
-	/* runtime beyond the limit, paid back before slots are handed out */
+	/* usage against the limit; a debt, if negative, is paid back first */
 	atomic64_t		width_runtime;	/* charged since width_settled */
 	u64			width_settled;
-	u64			width_debt;
+	s64			width_tokens;
 	u64			width_debt_max;
 	u64			width_margin;
 
