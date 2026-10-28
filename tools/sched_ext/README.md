@@ -204,7 +204,10 @@ number of threads of a cgroup that run at once, instead of a CPU time budget
 per period. A cgroup limited to N CPUs has floor(N) slots without any time
 accounting; threads beyond them wait in a queue of the cgroup and take a slot
 as soon as one is given back, on the CPU that gave it back. A fractional
-limit adds one slot whose use is limited to the fraction of a 10 ms window.
+limit adds one slot whose CPU time is limited by a token bucket: it accrues
+at the limit, up to what the fraction allows in one `cpu.max` period (10 ms for
+a limit of 0.1 with the usual 100 ms period), so a burst that CFS runs at once
+from the quota of a period runs at once here too.
 Limits apply at every level of the hierarchy, and `cpu.weight` splits the
 machine between cgroups under contention as in scx_flatcg. The header comment
 of `scx_pfs.bpf.c` describes the design.
@@ -217,7 +220,7 @@ latency although the average usage is below the limit.
 ### Options
 
 ```
-scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-q NR] [-i SECS] [-S FILE] [-v]
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-b BURST_PCT] [-q NR] [-i SECS] [-S FILE] [-v]
 ```
 
 | Option | Default | Meaning |
@@ -225,19 +228,21 @@ scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-q 
 | `-s` | 2500 | Slice. A thread whose slice ends while others of its cgroup wait gives its slots back and queues again. |
 | `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
 | `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
-| `-k` | 1000 | A thread that woke up and found no free slot runs without one for up to this long, if its cgroup has budget its slot holders can't use (see below); 0 makes it wait. |
-| `-w` | 10000 | Accounting window for fractional limits, credit and debt (minimum 1000). |
+| `-k` | 1000 | A thread that woke up and found no free slot runs without one for up to this long, if its cgroup has saved up CPU time (see below); 0 makes it wait. |
+| `-w` | 10000 | How often a cgroup out of CPU time for its fractional slot gets another try, the debt margin, and the window of the throttling counters (minimum 1000). |
+| `-b` | 100 | Depth of the token bucket of a cgroup, in percent of what the fractional part of its limit allows per `cpu.max` period, but at least one window's worth of the whole limit. 0 gives about the 10 ms windows of earlier versions; at most 1000. |
 | `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
 | `-i` | 1 | Interval of the counter report, in seconds, which includes the throttling counters of each cgroup. |
 | `-S` | off | Also write the throttling counters to FILE every second (replaced atomically). |
 
 `-s` takes 100 to 1000000 us, `-c`, `-r` and `-k` at most 1000000 us, `-w` 1000
-to 1000000 us and `-i` 1 to 86400 s; scx_pfs refuses other values.
+to 1000000 us, `-b` 0 to 1000 and `-i` 1 to 86400 s; scx_pfs refuses other
+values.
 
 ### Counters
 
 Printed every `-i` seconds: `park_full` (a thread waited for a slot),
-`park_budget` (the fractional slot was out of budget), `park_woken` (a woken
+`park_budget` (the fractional slot was out of tokens), `park_woken` (a woken
 thread waited), `admit` (waiting threads let in), `retry`, `cut` (slots
 taken back for a woken thread), `yield_keep`/`yield_rotate` (what
 `sched_yield()` did), `too_deep` (threads of cgroups deeper than 31 levels,
@@ -268,7 +273,7 @@ cgroup path=/kubepods/burstable/pod1234 nr_periods=1005 nr_throttled=1000 thrott
 - `nr_periods`: windows (`-w`, 10 ms) in which the cgroup ran or had a
   waiting thread.
 - `nr_throttled`: windows in which at least one runnable thread of the cgroup
-  waited, for a slot or for the fractional budget.
+  waited, for a slot or for the tokens of the fractional slot.
 - `throttled_usec`: wall time during which at least one thread of the cgroup
   waited, from the first waiter's start to the last waiter's end, including
   a wait still in progress. Unlike CFS's, which adds up the throttled time of
@@ -337,25 +342,30 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
   thread waiting for that lock, in any cgroup. Exiting threads, kernel threads
   and threads being killed never wait. A thread that woke up (or an io_uring
   worker) and finds no free slot runs without one for up to `-k` (1 ms) if its
-  cgroup has budget that the threads holding its slots can't use until the
-  10 ms window ends, i.e. time the cgroup left unused earlier in the window. Its
+  cgroup has tokens, i.e. time it saved up while it ran below its limit. Its
   concurrency can then exceed the limit, its usage can't. A cgroup that keeps
-  all its slots busy gives no credit: its woken threads wait for a slot, ahead
-  of the rotated ones, and take one from a rotated holder after `-c`. That is
-  the trade-off: credit whenever the window has budget left would bound a
-  woken lock owner's wait further, but threads taking turns on a contended
+  all its slots busy saves nothing and gives no credit once its tokens are
+  spent: its woken threads wait for a slot, ahead of the rotated ones, and take
+  one from a rotated holder after `-c`. That is the trade-off: credit beyond
+  the tokens, e.g. a budget every window, would bound a woken lock owner's wait
+  further, but threads taking turns on a contended
   mutex then burn the limit on wakeups that block again (lock+yield at limit 4
   fell to 0.18 of its throughput). A thread preempted, rotated or yielding
   (also through the in-kernel `yield()`) in the kernel with a sleeping lock
   held can still wait: sched_ext doesn't tell whether a thread is returning to
   user space.
-- All runtime is charged, with or without a slot, and usage beyond the limit
-  (credit, threads that never wait, slices ending on a tick) is carried over
-  as debt, up to one second's worth of the limit. While a cgroup is beyond its
-  limit by more than a window's budget, its last full slot and the fractional
-  slot aren't handed out until it paid the debt back (`park_debt`). Usage
-  averages at the limit, but pipe and database loads can run slightly above it
-  for a window and below it in the next.
+- All runtime is taken off the bucket, with or without a slot, and usage
+  beyond the limit (credit, threads that never wait, slices ending on a tick)
+  leaves it negative, a debt of up to one second's worth of the limit. While
+  the debt is more than a window's budget, the last full slot and the
+  fractional slot aren't handed out until it is paid back (`park_debt`).
+  Usage averages at the limit, but pipe and database loads can run slightly
+  above it for a window and below it in the next.
+- Fractional limits are still enforced as time. A burst of up to the bucket's
+  depth runs at once, but a thread that keeps the fractional slot busy runs
+  about limit x 10 ms every 10 ms window. A cgroup whose bucket is full can
+  use up to twice the fraction over one period, the bucket plus what accrues
+  meanwhile, as a CFS group can over 100 ms that span two periods.
 
 
 # Troubleshooting
