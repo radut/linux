@@ -270,7 +270,12 @@ static void wait_hotplug_settled(__u64 first_ms)
 		return;			/* no sysfs file: nothing to wait for */
 
 	for (try = 1; try <= HOTPLUG_SETTLE_TRIES; try++) {
-		usleep(ms * 1000);
+		/* not usleep(): POSIX leaves it unspecified at a second or more,
+		 * and -H 5000 doubles to 80s */
+		struct timespec ts = { .tv_sec = ms / 1000,
+				       .tv_nsec = (ms % 1000) * 1000000 };
+
+		nanosleep(&ts, NULL);
 		seq = scx_hotplug_seq();
 		if (seq == prev) {
 			if (try > 1 || verbose)
