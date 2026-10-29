@@ -987,9 +987,11 @@ Limits of this implementation
   that core scheduling force-idles gives its slots up after a tick if tasks
   wait for them (``core_release`` in ``stats``), and runs on credit when its
   cookie runs again. Children of a limited parent whose own limits bind can
-  still stall for up to a second when their cookies don't fit the cores
-  (8 busy threads in each of two children limited to 2 on 4 two-thread
-  cores).
+  still stall for one and a half seconds when their cookies don't fit the
+  cores: with 8 busy threads in each of two children limited to 2 on 4
+  two-thread cores, the worst stall over five runs was 135, 144, 578, 648 and
+  1607 ms, against 76-163 ms under CFS bandwidth control with core scheduling
+  and 15-55 ms with core scheduling off.
 - With ``nohz_full``, a CPU running a single task of a limited group keeps its
   tick so that the group's slots can rotate.
 - Group hierarchies deeper than 63 levels are only limited on their top 63
