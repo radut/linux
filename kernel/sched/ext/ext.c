@@ -8648,6 +8648,11 @@ static s32 scx_enable(struct scx_enable_cmd *cmd, struct bpf_link *link)
 		return -EINVAL;
 	}
 
+	if (pfs_enabled()) {
+		pr_err("sched_ext: Not available while the Parallel Fair Scheduler is active\n");
+		return -EBUSY;
+	}
+
 	if (!READ_ONCE(helper)) {
 		mutex_lock(&helper_mutex);
 		if (!helper) {

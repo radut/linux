@@ -496,6 +496,111 @@ struct cfs_bandwidth {
 };
 
 /* Task group related information */
+
+/* cpu.stat throttling statistics under PFS, see pfs_group_throttle_stat() */
+struct pfs_throttle_stat {
+	int			nr_periods;
+	int			nr_throttled;
+	u64			throttled_ns;
+};
+
+#ifdef CONFIG_SCHED_PFS
+/*
+ * Parallel Fair Scheduler, see Documentation/scheduler/sched-pfs.rst.
+ */
+
+/* Per task group state. */
+struct pfs_group {
+	/* protects ->waiters, ->nr_waiting and the window timer's state */
+	raw_spinlock_t		lock;
+	/* FIFO of tasks waiting for a slot at this level */
+	struct list_head	waiters;
+	/* the ones which woke up, admitted first */
+	struct list_head	wake_waiters;
+	unsigned int		nr_waiting;
+	unsigned int		nr_woken;
+	unsigned int		woken_streak;
+	/* slots taken by tasks of the subtree */
+	atomic_t		nr_slots;
+	/* limit in milli-CPUs, 0 if none */
+	unsigned int		limit;
+	/* task_group depth, the root is 0 */
+	int			depth;
+
+	/* token bucket of the limit, see pfs_refill() */
+	atomic64_t		tokens;
+	atomic64_t		refill_at;
+	/* the window timer, started under ->lock, see pfs_arm_window_timer() */
+	struct hrtimer		window_timer;
+	u64			timer_expires;
+	bool			timer_armed;
+	/* admits waiting tasks when slots were freed without a hand-off */
+	struct irq_work		retry_work;
+
+	/* protects the children's ->weight and ->nr_active and ->child_weight_sum */
+	raw_spinlock_t		weight_lock;
+	/* cpu.weight, protected by the parent's weight_lock */
+	unsigned long		weight;
+	/* active children plus one for own admitted tasks */
+	int			nr_active;
+	/* sum of the active children's weights */
+	unsigned long		child_weight_sum;
+	/* own admitted tasks and their nice weights */
+	atomic_t		nr_own;
+	atomic_long_t		own_weight;
+	/* cached hierarchical weight, see pfs_hweight() */
+	unsigned long		hweight;
+	u64			hweight_at;
+
+	/* runtime under the parent's slots, scaled by weight */
+	atomic64_t		slot_vtime;
+	/* the same for own tasks, as a child of this level */
+	atomic64_t		own_slot_vtime;
+	/* slot service of the last task admitted from the queue */
+	u64			slot_vmin;
+
+	/* cpu.stat throttling statistics, see pfs_stat_period() */
+	u64			stat_period_ns;
+	atomic64_t		stat_next;
+	atomic64_t		stat_thr;
+	atomic_t		nr_periods;
+	atomic_t		nr_throttled;
+	/* under ->lock: since when tasks wait here (0: none), and the sum */
+	u64			throttle_start;
+	u64			throttled_ns;
+};
+
+/* Per CPU state. */
+struct pfs_rq {
+	struct rb_root_cached	tasks_timeline;
+	u64			zero_vruntime;
+	s64			sum_w_vruntime;
+	long			sum_weight;
+	/* admitted tasks of this CPU, including the running one */
+	unsigned int		nr_queued;
+	/* sum of their effective weights */
+	unsigned long		load;
+	/* the PFS task between set_next_task() and put_prev_task() */
+	struct task_struct	*curr;
+	/* waiting tasks whose task_cpu() is this CPU */
+	struct list_head	waiters;
+	unsigned int		nr_waiting;
+	/* a task blocked here and gave back slots of this group's path */
+	struct pfs_group	*handoff;
+	/* earliest jiffies for the next push */
+	unsigned long		next_push;
+	unsigned int		push_preempted;
+	/* admitted SCHED_IDLE tasks, see pfs_sched_idle_rq() */
+	unsigned int		nr_idle_policy;
+	/* jiffies of the next periodic balance */
+	unsigned long		next_balance;
+	/* jiffies of the next newly idle scan beyond the LLC */
+	unsigned long		next_remote_pull;
+	/* counted in pfs_idle_cpus, see pfs_set_idle_hint() */
+	unsigned int		idle_hint;
+};
+#endif /* CONFIG_SCHED_PFS */
+
 struct task_group {
 	struct cgroup_subsys_state css;
 
@@ -526,6 +631,10 @@ struct task_group {
 #endif
 
 	struct scx_task_group	scx;
+
+#ifdef CONFIG_SCHED_PFS
+	struct pfs_group	pfs;
+#endif
 
 	struct rcu_head		rcu;
 	struct list_head	list;
@@ -1258,6 +1367,10 @@ struct rq {
 
 	struct sched_dl_entity	fair_server;
 
+#ifdef CONFIG_SCHED_PFS
+	struct pfs_rq		pfs;
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this CPU: */
 	struct list_head	leaf_cfs_rq_list;
@@ -1334,6 +1447,9 @@ struct rq {
 
 	struct sched_avg	avg_rt;
 	struct sched_avg	avg_dl;
+#ifdef CONFIG_SCHED_PFS
+	struct sched_avg	avg_pfs;
+#endif
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 	struct sched_avg	avg_irq;
 #endif
@@ -1551,6 +1667,10 @@ static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
 
 extern bool
 cfs_prio_less(const struct task_struct *a, const struct task_struct *b, bool fi);
+#ifdef CONFIG_SCHED_PFS
+extern bool
+pfs_prio_less(const struct task_struct *a, const struct task_struct *b, bool fi);
+#endif
 
 extern void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi);
 
@@ -1919,6 +2039,54 @@ struct rq_flags {
 };
 
 extern struct balance_callback balance_push_callback;
+
+#ifdef CONFIG_SCHED_PFS
+extern const struct sched_class pfs_sched_class;
+
+DECLARE_STATIC_KEY_FALSE(__pfs_enabled);	/* booted with sched_pfs=1 */
+#define pfs_enabled()		static_branch_unlikely(&__pfs_enabled)
+
+extern void pfs_boot_enable(void);
+extern bool pfs_init_rq(struct rq *rq);
+extern void pfs_init_entity(struct task_struct *p);
+extern void pfs_init_group(struct task_group *tg, struct task_group *parent);
+extern void pfs_offline_group(struct task_group *tg);
+extern void pfs_free_group(struct task_group *tg);
+extern void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
+				    u64 quota_us, u64 burst_us);
+extern void pfs_group_set_weight(struct task_group *tg);
+extern bool pfs_group_throttle_stat(struct task_group *tg,
+				    struct pfs_throttle_stat *st);
+extern struct task_struct *pfs_get_dying_waiter(struct rq *rq);
+extern void pfs_kick_waiter(struct task_struct *p);
+extern void pfs_task_change_group(struct task_struct *p);
+extern bool pfs_can_stop_tick(struct rq *rq);
+extern bool sched_task_cpu_allowed(struct task_struct *p, int cpu);
+extern void pfs_debugfs_init(struct dentry *parent);
+extern void pfs_balance_trigger(struct rq *rq);
+extern void pfs_balance_softirq(void);
+#else /* !CONFIG_SCHED_PFS */
+#define pfs_enabled()		false
+static inline void pfs_boot_enable(void) { }
+static inline bool pfs_init_rq(struct rq *rq) { return false; }
+static inline void pfs_init_entity(struct task_struct *p) { }
+static inline void pfs_init_group(struct task_group *tg, struct task_group *parent) { }
+static inline void pfs_offline_group(struct task_group *tg) { }
+static inline void pfs_free_group(struct task_group *tg) { }
+static inline void pfs_group_set_bandwidth(struct task_group *tg, u64 period_us,
+					   u64 quota_us, u64 burst_us) { }
+static inline void pfs_group_set_weight(struct task_group *tg) { }
+static inline bool pfs_group_throttle_stat(struct task_group *tg,
+					   struct pfs_throttle_stat *st)
+{
+	return false;
+}
+static inline void pfs_kick_waiter(struct task_struct *p) { }
+static inline void pfs_task_change_group(struct task_struct *p) { }
+static inline bool pfs_can_stop_tick(struct rq *rq) { return true; }
+static inline void pfs_balance_trigger(struct rq *rq) { }
+static inline void pfs_balance_softirq(void) { }
+#endif /* !CONFIG_SCHED_PFS */
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 extern const struct sched_class ext_sched_class;
@@ -2906,6 +3074,13 @@ extern const struct sched_class idle_sched_class;
 static inline const struct sched_class *next_active_class(const struct sched_class *class)
 {
 	class++;
+#ifdef CONFIG_SCHED_PFS
+	/* PFS replaces the fair class when enabled, otherwise it is unused */
+	if (class == &fair_sched_class && pfs_enabled())
+		class++;
+	if (class == &pfs_sched_class && !pfs_enabled())
+		class++;
+#endif
 #ifdef CONFIG_SCHED_CLASS_EXT
 	if (scx_switched_all() && class == &fair_sched_class)
 		class++;
@@ -2913,6 +3088,16 @@ static inline const struct sched_class *next_active_class(const struct sched_cla
 		class++;
 #endif
 	return class;
+}
+
+/* The class of SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE tasks. */
+static inline const struct sched_class *normal_sched_class(void)
+{
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		return &pfs_sched_class;
+#endif
+	return &fair_sched_class;
 }
 
 #define for_class_range(class, _from, _to) \
@@ -3737,6 +3922,15 @@ static inline unsigned long cpu_util_dl(struct rq *rq)
 
 extern unsigned long cpu_util_cfs(int cpu);
 extern unsigned long cpu_util_cfs_boost(int cpu);
+
+#ifdef CONFIG_SCHED_PFS
+/* utilization of the normal class when PFS replaces the fair class */
+static inline unsigned long cpu_util_pfs(int cpu)
+{
+	return min(READ_ONCE(cpu_rq(cpu)->avg_pfs.util_avg),
+		   arch_scale_cpu_capacity(cpu));
+}
+#endif
 
 static inline unsigned long cpu_util_rt(struct rq *rq)
 {

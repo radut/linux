@@ -131,7 +131,10 @@ the number of CPUs which run tasks of the group at the same time::
 
 With 1, a group whose bandwidth is written afterwards (e.g. by writing its
 cpu.max again) is in width mode; groups keep their mode until their next
-write, so changing the value has no immediate effect. A group with a limit
+write, so changing the value has no immediate effect. The sysctl is not
+namespaced; a delegated cgroup that rewrites its own cpu.max takes the mode
+the sysctl has at that time, so groups can end up in different modes. A
+group with a limit
 of L = quota / period has floor(L) slots without a time limit. A cfs_rq of
 the group takes a slot when its tasks start running on a CPU and gives it
 back when they stop; without a free slot it is throttled until one is given

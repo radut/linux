@@ -6752,6 +6752,17 @@ Kernel parameters
 			cost of significant additional memory use for tables.
 
 
+	sched_pfs=	[KNL] Use the Parallel Fair Scheduler instead of
+			the fair class for SCHED_NORMAL, SCHED_BATCH and
+			SCHED_IDLE tasks: a cgroup CPU limit (cpu.max) caps
+			the number of threads of the group which run at once
+			instead of granting CPU time per period. Without the
+			parameter or with 0, the fair class is used. Only
+			present with CONFIG_SCHED_PFS=y; sched_ext cannot be
+			enabled while PFS is in use.
+			See Documentation/scheduler/sched-pfs.rst.
+			Format: <bool> (just "sched_pfs" means 1)
+
 	sched_proxy_exec= [KNL]
 			Enables or disables "proxy execution" style
 			solution to mutex-based priority inversion.

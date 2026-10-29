@@ -9,6 +9,9 @@ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se);
 int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se);
 int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq);
 int update_rt_rq_load_avg(u64 now, struct rq *rq, int running);
+#ifdef CONFIG_SCHED_PFS
+int update_pfs_rq_load_avg(u64 now, struct rq *rq, int running);
+#endif
 int update_dl_rq_load_avg(u64 now, struct rq *rq, int running);
 bool update_other_load_avgs(struct rq *rq);
 
@@ -141,6 +144,9 @@ static inline void update_idle_rq_clock_pelt(struct rq *rq)
 	u32 util_sum = rq->cfs.avg.util_sum;
 	util_sum += rq->avg_rt.util_sum;
 	util_sum += rq->avg_dl.util_sum;
+#ifdef CONFIG_SCHED_PFS
+	util_sum += rq->avg_pfs.util_sum;
+#endif
 
 	/*
 	 * Reflecting stolen time makes sense only if the idle
