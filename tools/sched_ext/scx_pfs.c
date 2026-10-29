@@ -22,7 +22,7 @@ const char help_fmt[] =
 "See the top-level comment in .bpf.c for more details.\n"
 "\n"
 "Usage: %s [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US]\n"
-"       [-b BURST_PCT] [-q NR] [-i INTERVAL] [-S FILE] [-v]\n"
+"       [-b BURST_PCT] [-q NR] [-i INTERVAL] [-H SETTLE_MS] [-S FILE] [-v]\n"
 "\n"
 "  -s SLICE_US   Slice duration (default: 2500, 100 to 1000000)\n"
 "  -c CUT_US     A task holding slots since a rotation gives them to a task\n"
@@ -43,6 +43,10 @@ const char help_fmt[] =
 "                such cgroups are found by a slower sweep (default: 65536,\n"
 "                16 to 16777216)\n"
 "  -i INTERVAL   Report interval in seconds, with a line of throttling counters\n"
+"  -H SETTLE_MS  After a hotplug restart, wait for the hotplug sequence to\n"
+"                stop moving before reloading, starting at this interval and\n"
+"                doubling to 16x it, 0 to reload immediately as before\n"
+"                (default: 20, at most 5000)\n"
 "                per limited cgroup (default: 1, at most 86400)\n"
 "  -S FILE       Write the throttling counters of the limited cgroups to FILE\n"
 "                every second, see the README for the format\n"
@@ -55,6 +59,7 @@ const char help_fmt[] =
 #define MAX_BURST_PCT	1000
 #define MIN_SLICE_US	100
 #define MAX_INTERVAL	(24 * 3600)
+#define MAX_SETTLE_MS	5000
 #define MIN_CGRP_Q	16
 #define MAX_CGRP_Q	(1 << 24)
 
@@ -231,11 +236,63 @@ static void dump_cgrp_stats(struct scx_pfs *skel, const char *file)
 		fprintf(stderr, "-S: can't write %s: %s\n", file, strerror(errno));
 }
 
+/*
+ * A CPU going offline or online exits the scheduler with SCX_ECODE_ACT_RESTART,
+ * and main()'s restart below reopens, reloads and reattaches. The sequence
+ * number of the last hotplug event is latched when the skeleton is opened and
+ * the kernel refuses the enable if it has moved by the time the attach lands,
+ * so a reattach that races the next event is rejected and the scheduler stays
+ * off for the length of another open, load and attach. Under churn that keeps
+ * repeating: measured over two runs of 20 offline/online cycles, 14 gaps of
+ * median 1.8 s and worst 4.0 s in one, and 4 gaps of median 10.9 s and worst
+ * 27.3 s in the other, with 19 and 26 rejected enables respectively.
+ *
+ * Reloading into the next event is what costs the time, so wait for the
+ * sequence to stop moving before reopening. The wait doubles its interval up
+ * to a cap and gives up after a bounded number of tries, after which the
+ * attach is made anyway: a scheduler that keeps retrying is better than one
+ * that stays off because the churn outlasted the loop.
+ */
+#define HOTPLUG_SETTLE_MS	20	/* -H: first interval, 0 disables the wait */
+#define HOTPLUG_SETTLE_TRIES	10
+
+static void wait_hotplug_settled(__u64 first_ms)
+{
+	__u64 ms = first_ms, cap = first_ms * 16;
+	long seq, prev;
+	int try;
+
+	if (!first_ms)
+		return;
+
+	prev = scx_hotplug_seq();
+	if (prev < 0)
+		return;			/* no sysfs file: nothing to wait for */
+
+	for (try = 1; try <= HOTPLUG_SETTLE_TRIES; try++) {
+		usleep(ms * 1000);
+		seq = scx_hotplug_seq();
+		if (seq == prev) {
+			if (try > 1 || verbose)
+				fprintf(stderr, "hotplug_seq %ld settled after %d tr%s\n",
+					seq, try, try == 1 ? "y" : "ies");
+			return;
+		}
+		prev = seq;
+		if (ms < cap)
+			ms *= 2;
+	}
+	fprintf(stderr, "hotplug_seq still moving (%ld) after %d tries, attaching anyway\n",
+		prev, HOTPLUG_SETTLE_TRIES);
+}
+
 int main(int argc, char **argv)
 {
 	struct scx_pfs *skel;
 	struct bpf_link *link;
 	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q, secs;
+	__u64 settle_ms = HOTPLUG_SETTLE_MS;
+	bool restarted = false;
 	const char *stats_file = NULL;
 	long nr_cpus;
 	__s32 opt;
@@ -245,6 +302,8 @@ int main(int argc, char **argv)
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 restart:
+	if (restarted)
+		wait_hotplug_settled(settle_ms);
 	optind = 1;
 	skel = SCX_OPS_OPEN(pfs_ops, scx_pfs);
 
@@ -255,7 +314,7 @@ restart:
 	skel->rodata->slice_ns = 2500 * 1000;
 	skel->rodata->window_ns = 10 * 1000 * 1000;
 
-	while ((opt = getopt(argc, argv, "s:c:r:k:w:b:q:i:S:vh")) != -1) {
+	while ((opt = getopt(argc, argv, "s:c:r:k:w:b:q:i:H:S:vh")) != -1) {
 		switch (opt) {
 		case 's':
 			skel->rodata->slice_ns = 1000 *
@@ -287,6 +346,9 @@ restart:
 			break;
 		case 'i':
 			intv = parse_opt(opt, optarg, 1, MAX_INTERVAL);
+			break;
+		case 'H':
+			settle_ms = parse_opt(opt, optarg, 0, MAX_SETTLE_MS);
 			break;
 		case 'S':
 			stats_file = optarg;
@@ -350,7 +412,9 @@ restart:
 	ecode = UEI_REPORT(skel, uei);
 	scx_pfs__destroy(skel);
 
-	if (!exit_req && UEI_ECODE_RESTART(ecode))
+	if (!exit_req && UEI_ECODE_RESTART(ecode)) {
+		restarted = true;
 		goto restart;
+	}
 	return 0;
 }
