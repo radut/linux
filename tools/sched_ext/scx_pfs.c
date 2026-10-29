@@ -139,7 +139,7 @@ static void print_stats(struct scx_pfs *skel)
 	       "too_deep=%llu activate=%llu hweight=%llu keep=%llu\n"
 	       "park_woken=%llu cut=%llu yield_keep=%llu yield_rotate=%llu "
 	       "rescue=%llu lost_path=%llu credit=%llu drain=%llu/%llu no_dsq=%llu\n"
-	       "park_race=%llu park_debt=%llu hotplug=%llu\n",
+	       "park_race=%llu park_debt=%llu hotplug=%llu yield_credit=%llu\n",
 	       stats[PFS_STAT_DIRECT], stats[PFS_STAT_SHARED],
 	       stats[PFS_STAT_PARK_FULL], stats[PFS_STAT_PARK_BUDGET],
 	       stats[PFS_STAT_ADMIT], stats[PFS_STAT_REPARK],
@@ -153,7 +153,7 @@ static void print_stats(struct scx_pfs *skel)
 	       stats[PFS_STAT_CREDIT], stats[PFS_STAT_DRAIN],
 	       stats[PFS_STAT_DRAIN_FAIL], stats[PFS_STAT_NO_DSQ],
 	       stats[PFS_STAT_PARK_RACE], stats[PFS_STAT_PARK_DEBT],
-	       stats[PFS_STAT_HOTPLUG]);
+	       stats[PFS_STAT_HOTPLUG], stats[PFS_STAT_YIELD_CREDIT]);
 	fflush(stdout);
 }
 
