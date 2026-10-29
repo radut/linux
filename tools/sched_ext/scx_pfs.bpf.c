@@ -304,6 +304,7 @@ struct pfs_task_ctx {
 	u64		admitted_at;	/* when the slots were taken */
 	u32		rotated;	/* admitted after a rotation, not a wakeup */
 	u32		credit;		/* runs on credit since a wakeup */
+	u32		yielded;	/* gave its slots up in ops.yield(), see pfs_yield() */
 	u64		parking_cgid;	/* parked there, not yet seen by a walk */
 	u64		wait_mask;	/* levels counted as waiting, see wait_begin() */
 	/*
@@ -1723,18 +1724,28 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Don't let a task wait which may hold a lock others wait for, see
 	 * the top of the file. Woken tasks run on credit while the tokens
 	 * last, as do io_uring workers, which never return to user space.
+	 *
+	 * A task that has just yielded runs on credit whether or not tokens are
+	 * left: an in-kernel yield() holds locks (RTNL in
+	 * netlink_broadcast_filtered()), and a cgroup which has spent its
+	 * tokens is exactly the one whose tasks would wait longest. The runtime
+	 * is charged as always, so the bucket goes into debt and the cgroup
+	 * pays it back; it gains no CPU over a window.
 	 */
 	if (ret != RESERVE_OK) {
+		bool yielded = taskc->yielded;
+
 		slice = credit_ns && credit_ns < slice_ns ? credit_ns : slice_ns;
-		if (must_not_park(p) ||
+		if (must_not_park(p) || yielded ||
 		    (credit_ns &&
 		     ((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
 		     credit_left(cgrp, window_now(), &slice))) {
-			stat_inc(PFS_STAT_CREDIT);
+			stat_inc(yielded ? PFS_STAT_YIELD_CREDIT : PFS_STAT_CREDIT);
 			ret = RESERVE_OK;
 			credit = true;
 		}
 	}
+	taskc->yielded = 0;
 
 	if (ret == RESERVE_OK) {
 		stat_inc(PFS_STAT_SHARED);
@@ -2109,6 +2120,20 @@ bool BPF_STRUCT_OPS(pfs_yield, struct task_struct *from, struct task_struct *to)
 		 * CPU: yield it, ops.enqueue() takes the free slots again.
 		 */
 	}
+
+	/*
+	 * yield() is called from inside the kernel too, with locks held:
+	 * netlink_broadcast_filtered() yields with RTNL held when a listener is
+	 * congested, and gfs2 and jfs yield in kernel paths. The enqueue that
+	 * follows this must therefore not park the task - everybody waiting for
+	 * that lock, in any cgroup, would wait for this cgroup's slot queue.
+	 * Mark it so reserve_slots() lets it run on credit instead, as it does
+	 * for a task that woke up as the new owner of a lock. kPFS defers the
+	 * same decision to the task's return to user space, which has no
+	 * counterpart here.
+	 */
+	if (taskc)
+		taskc->yielded = 1;
 
 	from->scx.slice = 0;
 	return false;

@@ -52,6 +52,7 @@ enum pfs_stat_idx {
 	PFS_STAT_PARK_RACE,		/* retries queued again for a landing park */
 	PFS_STAT_PARK_DEBT,		/* slot refused: the cgroup ran beyond its limit */
 	PFS_STAT_HOTPLUG,		/* CPUs going on or offline */
+	PFS_STAT_YIELD_CREDIT,	/* yielded in the kernel, ran on credit instead of parking */
 
 	PFS_NR_STATS,
 };
