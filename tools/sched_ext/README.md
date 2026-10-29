@@ -197,6 +197,183 @@ Similar to scx_simple, in limited scenarios, this scheduler can perform
 reasonably well on single socket-socket systems with a unified L3 cache and show
 significantly lowered hierarchical scheduling overhead.
 
+## scx_pfs
+
+The Parallel Fair Scheduler: cgroup v2 CPU limits (`cpu.max`) as a cap on the
+number of threads of a cgroup that run at once, instead of a CPU time budget
+per period. A cgroup limited to N CPUs has floor(N) slots without any time
+accounting; threads beyond them wait in a queue of the cgroup and take a slot
+as soon as one is given back, on the CPU that gave it back. A fractional
+limit adds one slot whose CPU time is limited by a token bucket: it accrues
+at the limit, up to what the fraction allows in one `cpu.max` period (10 ms for
+a limit of 0.1 with the usual 100 ms period), so a burst that CFS runs at once
+from the quota of a period runs at once here too.
+Limits apply at every level of the hierarchy, and `cpu.weight` splits the
+machine between cgroups under contention as in scx_flatcg. The header comment
+of `scx_pfs.bpf.c` describes the design.
+
+The motivation is container CPU limits: with CFS bandwidth control a pod
+limited to 4 CPUs with 32 runnable threads runs on 32 CPUs for 1/8 of the
+100 ms period and then stalls for the rest of it, which shows up as tail
+latency although the average usage is below the limit.
+
+### Options
+
+```
+scx_pfs [-s SLICE_US] [-c CUT_US] [-r ROT_US] [-k CREDIT_US] [-w WINDOW_US] [-b BURST_PCT] [-q NR] [-i SECS] [-S FILE] [-v]
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `-s` | 2500 | Slice. A thread whose slice ends while others of its cgroup wait gives its slots back and queues again. |
+| `-c` | 500 | A thread holding slots since a rotation gives them to a thread that woke up after this long; also the least time a thread keeps its slots on `sched_yield()`. |
+| `-r` | 0 (off) | Like `-c`, for any waiting thread. 1000 makes spin hand-offs about 1.5x faster but splits a contended machine less precisely by `cpu.weight`. |
+| `-k` | 1000 | A thread that woke up and found no free slot runs without one for up to this long, if its cgroup has saved up CPU time (see below); 0 makes it wait. |
+| `-w` | 10000 | How often a cgroup out of CPU time for its fractional slot gets another try, the debt margin, and the window of the throttling counters (minimum 1000). |
+| `-b` | 100 | Depth of the token bucket of a cgroup, in percent of what the fractional part of its limit allows per `cpu.max` period, but at least one window's worth of the whole limit. 0 gives about the 10 ms windows of earlier versions; at most 1000. |
+| `-q` | 65536 | Size of the queues of cgroups with waiting threads (16 to 16777216). Cgroups beyond it are found by a slower sweep of all cgroups once per window; `overflow` counts them. |
+| `-i` | 1 | Interval of the counter report, in seconds, which includes the throttling counters of each cgroup. |
+| `-S` | off | Also write the throttling counters to FILE every second (replaced atomically). |
+
+`-s` takes 100 to 1000000 us, `-c`, `-r` and `-k` at most 1000000 us, `-w` 1000
+to 1000000 us, `-b` 0 to 1000 and `-i` 1 to 86400 s; scx_pfs refuses other
+values.
+
+### Counters
+
+Printed every `-i` seconds: `park_full` (a thread waited for a slot),
+`park_budget` (the fractional slot was out of tokens), `park_woken` (a woken
+thread waited), `admit` (waiting threads let in), `retry`, `cut` (slots
+taken back for a woken thread), `yield_keep`/`yield_rotate` (what
+`sched_yield()` did), `too_deep` (threads of cgroups deeper than 31 levels,
+not limited), `rescue` (waiting cgroups the timer retried because no retry
+walked them for 50 ms; it grows when admitted threads wait long for a CPU),
+`lost_path` (threads whose cgroup was removed under them), `credit` (threads
+that ran without a slot instead of waiting, see below), `overflow` (cgroups
+that didn't fit in the queues, see `-q`), `drain` (threads still waiting
+when their cgroup was removed, moved/kept; should stay 0/0), `no_dsq`
+(cgroups not limited because their queue couldn't be allocated),
+`park_race` (retries repeated for a thread about to start waiting),
+`park_debt` (slots refused because the cgroup ran beyond its limit), and
+internal ones (`direct`, `shared`, `repark`, `race`, `activate`, `hweight`,
+`keep`). CFS's `nr_throttled` stays 0: waiting threads are queued by
+scx_pfs, not throttled.
+
+### Throttling counters
+
+scx_pfs can't write `cpu.stat`, so it keeps `cpu.stat`-like counters per
+cgroup in BPF. Each report (every `-i` seconds and at exit) ends with one line
+per cgroup that was limited and ran or waited, in key=value form:
+
+```
+cgroup path=/kubepods/burstable/pod1234 nr_periods=1005 nr_throttled=1000 throttled_usec=10000420
+```
+
+- `path`: the cgroup's path below `/sys/fs/cgroup`.
+- `nr_periods`: windows (`-w`, 10 ms) in which the cgroup ran or had a
+  waiting thread.
+- `nr_throttled`: windows in which at least one runnable thread of the cgroup
+  waited, for a slot or for the tokens of the fractional slot.
+- `throttled_usec`: wall time during which at least one thread of the cgroup
+  waited, from the first waiter's start to the last waiter's end, including
+  a wait still in progress. Unlike CFS's, which adds up the throttled time of
+  each CPU, it can't exceed the elapsed time.
+
+A thread waits in the cgroup whose limit refused it; that cgroup and every
+limited ancestor whose slots are all taken at that moment count it, as
+`cpu.stat` counts a throttled parent. Counters start at zero when the cgroup
+is created or scx_pfs is loaded. `-S FILE` writes the same lines without the
+`cgroup` prefix and with `key value` pairs, as in `cpu.stat`:
+`/kubepods/burstable/pod1234 nr_periods 1005 nr_throttled 1000 throttled_usec 10000420`.
+
+### Running it
+
+Start it as root and stop it with Ctrl-C (the kernel scheduler takes over
+again), or install `pfs-test/scx_pfs.service` as a sandboxed systemd unit,
+or run it in a container with `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON`
+only (`pfs-test/scx-container.sh`), which is the shape of a Kubernetes
+DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
+following run-time changes of `cpu.max` needs the `cgroup_set_bandwidth`
+operation (6.17 or later). v6.19 is the oldest tag it has been loaded and run
+on: v6.12 and v6.13 are missing `cgroup_set_bandwidth` and several of the
+kfuncs it calls. `pfs-test/` compares it with CFS bandwidth control
+on plain cgroups, systemd units, Docker and Podman; its README has the
+reproduction steps and the full result tables.
+
+### Measurements
+
+On an 8-vCPU local VM (median of 5 boots, same kernel image for both):
+
+- Limit 1 with 8 busy threads: 0.83 vs 0.61 million iterations/s, worst stall
+  of a thread 23 vs 93 ms, CPUs used 0.99 in both, `nr_throttled` 0.
+- Four request threads with 1 ms of work every 20 ms next to 8 busy threads
+  of the same cgroup, limit 1: p50/p99 2.2/3.1 ms vs 349/1036 ms.
+- Request latency at limit 0.5 through the kit (cgroup, Docker and systemd
+  paths): p99 30-34 ms vs 82-84 ms.
+
+On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
+
+- PostgreSQL pgbench TPC-B, 32 clients, limit 4: p99 10.0 ms vs 46.9 ms, at
+  6050 vs 9003 transactions/s; select-only p99 1.46 vs 12.4 ms.
+- 16 threads calling `sched_yield()` 100 times while holding one of 4
+  mutexes, limit 4: 37.6k vs 11.1k events/s; sysbench cpu p99 9.2 vs 44 ms.
+- hackbench in a pod limited to 4 CPUs: 2.22 s vs 3.26 s (processes).
+
+### Disadvantages
+
+- Databases lose 27-37% of their throughput against CFS at the same limit
+  (PostgreSQL, MariaDB at limits 4 and 2), with much better tails: the pod
+  uses 2.8-3.0 of 4 CPUs. Against a 4-vCPU VM without limit, limit 4 gives
+  89-91% of its transactions/s.
+- More spinning threads than slots collapse: Redis with 4 I/O threads at
+  limit 2 serves 5.1k requests/s vs 86k under CFS; two threads passing a flag
+  in a busy loop, 8 pairs at limit 2, reach 0.08 of CFS's rate. Keep
+  busy-polling threads at or below the limit.
+- A web server at limit 4 with 8 threads next to heavy neighbours (two
+  unlimited 16-thread spinners and 20 limited pods) reached only 3197 vs
+  5337 requests/s using 2.23 of 4 CPUs, and missed its fixed rate (p99 14.9 s).
+- With 50-100 pods on the node, a 1 ms sleeper outside the pods overshoots by
+  4.7-8.0 ms at p99 vs 1.0-2.4 ms under CFS, and migrations are about 100
+  times as frequent.
+- On machines with an unstable `sched_clock` (e.g. KVM guests whose
+  kvm-clock isn't marked stable, `sched_clock_stable()` 0 in
+  `/sys/kernel/debug/sched/debug`), kernels without "softirq: Treat an
+  interrupted idle task as idle in tick_irq_exit()" charge a waiting thread
+  the idle time of the CPU it is woken on: `cpu.stat`, `getrusage()` and the
+  thread CPU clocks over-report, by up to 20 times at limit 0.1. The limit
+  itself holds; a `sched_switch` trace counts the CPUs correctly.
+- Waiting for a slot costs latency even in an otherwise idle cgroup: four
+  request threads at limit 1 have a median of 3.1 ms vs 1.15 ms under CFS.
+- `cpu.max.burst` is ignored, and so are cgroups deeper than 31 levels.
+- A thread waiting for a slot while it holds a kernel lock stalls every
+  thread waiting for that lock, in any cgroup. Exiting threads, kernel threads
+  and threads being killed never wait. A thread that woke up (or an io_uring
+  worker) and finds no free slot runs without one for up to `-k` (1 ms) if its
+  cgroup has tokens, i.e. time it saved up while it ran below its limit. Its
+  concurrency can then exceed the limit, its usage can't. A cgroup that keeps
+  all its slots busy saves nothing and gives no credit once its tokens are
+  spent: its woken threads wait for a slot, ahead of the rotated ones, and take
+  one from a rotated holder after `-c`. That is the trade-off: credit beyond
+  the tokens, e.g. a budget every window, would bound a woken lock owner's wait
+  further, but threads taking turns on a contended
+  mutex then burn the limit on wakeups that block again (lock+yield at limit 4
+  fell to 0.18 of its throughput). A thread preempted, rotated or yielding
+  (also through the in-kernel `yield()`) in the kernel with a sleeping lock
+  held can still wait: sched_ext doesn't tell whether a thread is returning to
+  user space.
+- All runtime is taken off the bucket, with or without a slot, and usage
+  beyond the limit (credit, threads that never wait, slices ending on a tick)
+  leaves it negative, a debt of up to one second's worth of the limit. While
+  the debt is more than a window's budget, the last full slot and the
+  fractional slot aren't handed out until it is paid back (`park_debt`).
+  Usage averages at the limit, but pipe and database loads can run slightly
+  above it for a window and below it in the next.
+- Fractional limits are still enforced as time. A burst of up to the bucket's
+  depth runs at once, but a thread that keeps the fractional slot busy runs
+  about limit x 10 ms every 10 ms window. A cgroup whose bucket is full can
+  use up to twice the fraction over one period, the bucket plus what accrues
+  meanwhile, as a CFS group can over 100 ms that span two periods.
+
 
 # Troubleshooting
 

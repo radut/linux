@@ -9813,6 +9813,7 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 {
 	int i, ret = 0, runtime_enabled, runtime_was_enabled;
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+	bool width, width_was;
 	u64 period, quota, burst;
 
 	period = (u64)period_us * NSEC_PER_USEC;
@@ -9837,12 +9838,16 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 
 	runtime_enabled = quota != RUNTIME_INF;
 	runtime_was_enabled = cfs_b->quota != RUNTIME_INF;
+	width = runtime_enabled && cfs_width_mode();
+	width_was = cfs_b->width;
 	/*
 	 * If we need to toggle cfs_bandwidth_used, off->on must occur
 	 * before making related changes, and on->off must occur afterwards
 	 */
 	if (runtime_enabled && !runtime_was_enabled)
 		cfs_bandwidth_usage_inc();
+	if (width && !width_was)
+		cfs_width_usage_inc();
 
 	scoped_guard (raw_spinlock_irq, &cfs_b->lock) {
 		cfs_b->period = ns_to_ktime(period);
@@ -9850,6 +9855,7 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 		cfs_b->burst = burst;
 
 		__refill_cfs_bandwidth_runtime(cfs_b);
+		cfs_width_config(cfs_b, width);
 
 		/*
 		 * Restart the period timer (if active) to handle new
@@ -9866,6 +9872,7 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 		guard(rq_lock_irq)(rq);
 
 		cfs_rq->runtime_enabled = runtime_enabled;
+		cfs_width_config_rq(cfs_rq, width);
 		cfs_rq->runtime_remaining = 1;
 
 		if (cfs_rq->throttled) {
@@ -9876,6 +9883,8 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 
 	if (runtime_was_enabled && !runtime_enabled)
 		cfs_bandwidth_usage_dec();
+	if (width_was && !width)
+		cfs_width_usage_dec();
 
 	return 0;
 }

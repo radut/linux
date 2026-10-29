@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-2.0
+# Example unit for running scx_pfs on a host. Install:
+#   install -m 755 scx_pfs /usr/local/sbin/scx_pfs
+#   install -m 644 scx_pfs.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl start scx_pfs   # enable: at boot
+# While it runs, every task on the host is scheduled by it, not only limited
+# cgroups. Stopping the unit returns all tasks to the kernel's scheduler.
+[Unit]
+Description=scx_pfs sched_ext scheduler (cgroup CPU limits as concurrency caps)
+ConditionPathExists=/sys/kernel/sched_ext/state
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/scx_pfs -i 60
+# scx_pfs detaches on SIGINT/SIGTERM within one report interval
+KillSignal=SIGINT
+TimeoutStopSec=90
+# if the kernel ejects the scheduler (watchdog) the loader exits; try again
+Restart=on-failure
+RestartSec=10
+# keep the loader itself responsive under load
+Nice=-10
+CPUWeight=1000
+# Sandboxing. Loading the scheduler needs bpf() with CAP_BPF, CAP_PERFMON
+# and CAP_SYS_ADMIN (struct_ops), read access to /sys/kernel/btf and
+# /sys/kernel/sched_ext, and nothing else: the loader writes no files, opens
+# no sockets and only reports on stdout.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
