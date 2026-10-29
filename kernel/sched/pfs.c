@@ -128,13 +128,14 @@ enum pfs_stat {
 	PFS_STAT_BALANCE,	/* tasks moved by the periodic balancer */
 	PFS_STAT_SLOT_NS,	/* runtime of tasks holding slots, ns */
 	PFS_STAT_CREDIT_NS,	/* runtime of tasks of limited groups on credit, ns */
+	PFS_STAT_CORE_RELEASE,	/* slots given up by tasks of a forced idle CPU */
 	PFS_NR_STATS,
 };
 
 static const char * const pfs_stat_names[PFS_NR_STATS] = {
 	"admit", "park_full", "park_budget", "park_fifo", "park_debt", "rotate", "handoff",
 	"handoff_local", "inplace", "retry", "pull", "push", "kick", "credit",
-	"user_park", "yield", "balance", "slot_ns", "credit_ns",
+	"user_park", "yield", "balance", "slot_ns", "credit_ns", "core_release",
 };
 
 static DEFINE_PER_CPU(unsigned long [PFS_NR_STATS], pfs_stats);
@@ -2549,11 +2550,85 @@ static void set_next_task_pfs(struct rq *rq, struct task_struct *p,
 	}
 }
 
+#ifdef CONFIG_SCHED_CORE
+/* how long an admitted task of a forced idle CPU keeps its slots */
+#define PFS_CORE_HOLD_NS	TICK_NSEC
+
+/* Does a level whose slot @pe holds have tasks waiting for one? */
+static bool pfs_slots_wanted(struct sched_pfs_entity *pe)
+{
+	struct pfs_group *lg;
+
+	for_each_pfs_level(lg, pe->grp) {
+		if (lg->depth <= PFS_MAX_DEPTH &&
+		    (pe->slot_mask & BIT_ULL(lg->depth)) &&
+		    READ_ONCE(lg->nr_waiting))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Core scheduling idles an SMT sibling whose tasks have another cookie than
+ * the task the core runs. Admitted tasks queued on the forced idle sibling
+ * hold their slots without running, for as long as the other cookie runs,
+ * while tasks of their groups wait for the slots elsewhere: a parent limited
+ * to 4 CPUs with busy children of two cookies got 3.2-3.6 CPUs, and threads
+ * stalled for up to a second. Called on the tick of a CPU of the core, with
+ * the core's run queue lock, which covers the siblings: an admitted task of
+ * a forced idle sibling that hasn't run for PFS_CORE_HOLD_NS gives its slots
+ * up if somebody waits for them. It stays queued on credit, like a task woken
+ * in the kernel, and parks on its way back to user space.
+ */
+static void pfs_core_release_slots(struct rq *rq)
+{
+	int cpu = cpu_of(rq), sib;
+
+	if (!rq->core->core_forceidle_count || !atomic_read(&pfs_nr_limited))
+		return;
+
+	for_each_cpu(sib, cpu_smt_mask(cpu)) {
+		struct rq *srq = cpu_rq(sib);
+		u64 now = rq_clock_task(srq);
+		struct rb_node *node;
+
+		if (sib == cpu || srq->curr != srq->idle || !srq->pfs.nr_queued)
+			continue;
+
+		for (node = rb_first_cached(&srq->pfs.tasks_timeline); node;
+		     node = rb_next(node)) {
+			struct sched_pfs_entity *pe = __node_2_pe(node);
+			struct task_struct *p = pfs_task_of(pe);
+			u64 mask = pe->slot_mask;
+
+			if (!mask || pe->state != PFS_QUEUED ||
+			    (s64)(now - p->se.exec_start) < (s64)PFS_CORE_HOLD_NS ||
+			    !pfs_slots_wanted(pe))
+				continue;
+
+			/* charged to the group the slots are on */
+			pfs_flush_charge(p);
+			pe->slot_mask = 0;
+			pe->unslotted = 1;
+			pe->run_start = p->se.sum_exec_runtime;
+			pe->run_limit = 0;
+			pfs_put_slots(pe->grp, mask, true);
+			pfs_request_user_park(p);
+			pfs_stat(PFS_STAT_CORE_RELEASE);
+		}
+	}
+}
+#else
+static inline void pfs_core_release_slots(struct rq *rq) { }
+#endif
+
 static void task_tick_pfs(struct rq *rq, struct task_struct *curr, int queued)
 {
 	struct sched_pfs_entity *pe = &curr->pfs;
 
 	update_curr_pfs(rq);
+	if (sched_core_enabled(rq))
+		pfs_core_release_slots(rq);
 	update_pfs_rq_load_avg(rq_clock_pelt(rq), rq, 1);
 	cpufreq_update_util(rq, 0);
 

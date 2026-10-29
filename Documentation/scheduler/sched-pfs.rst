@@ -983,7 +983,13 @@ Limits of this implementation
   by their virtual runtimes relative to each CPU's average, without the
   snapshot the fair class takes at forced idle, so the fairness between
   cookies across siblings is approximate. Tasks waiting for a slot are
-  never picked through the core tree.
+  never picked through the core tree. An admitted task queued on a sibling
+  that core scheduling force-idles gives its slots up after a tick if tasks
+  wait for them (``core_release`` in ``stats``), and runs on credit when its
+  cookie runs again. Children of a limited parent whose own limits bind can
+  still stall for up to a second when their cookies don't fit the cores
+  (8 busy threads in each of two children limited to 2 on 4 two-thread
+  cores).
 - With ``nohz_full``, a CPU running a single task of a limited group keeps its
   tick so that the group's slots can rotate.
 - Group hierarchies deeper than 63 levels are only limited on their top 63
