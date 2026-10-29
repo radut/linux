@@ -258,6 +258,7 @@ static void dump_cgrp_stats(struct scx_pfs *skel, const char *file)
 #define HOTPLUG_SETTLE_TRIES	10
 #define HOTPLUG_SETTLE_BUDGET_MS 1000	/* never sit the churn out: total per restart */
 #define HOTPLUG_SKIP_MAX	4	/* doomed attaches skipped in a row before trying one */
+#define EXIT_POLL_PER_SEC	20	/* exit checks per second of the stats loop */
 
 static void wait_hotplug_settled(__u64 first_ms)
 {
@@ -443,6 +444,8 @@ restart:
 	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
 
 	for (secs = 0; !exit_req && !UEI_EXITED(skel, uei); secs++) {
+		int tick;
+
 		if (!(secs % intv)) {
 			print_stats(skel);
 			print_cgrp_stats(skel, stdout, true);
@@ -450,7 +453,22 @@ restart:
 		}
 		if (stats_file)
 			dump_cgrp_stats(skel, stats_file);
-		sleep(1);
+
+		/*
+		 * Check for an exit far more often than stats are printed. The
+		 * scheduler is off from the moment it exits until this loop
+		 * notices, and a once a second check left it off for a further
+		 * 0-1000ms: measured against the 5ms state poll, the median
+		 * time from the ejection to the loader's next open was 525ms
+		 * where the enable that follows it costs about 70ms.
+		 */
+		for (tick = 0; tick < EXIT_POLL_PER_SEC; tick++) {
+			struct timespec ts = { .tv_nsec = (1000 / EXIT_POLL_PER_SEC) * 1000000 };
+
+			if (exit_req || UEI_EXITED(skel, uei))
+				break;
+			nanosleep(&ts, NULL);
+		}
 	}
 	print_stats(skel);
 	print_cgrp_stats(skel, stdout, true);
