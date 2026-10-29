@@ -254,29 +254,45 @@ static void dump_cgrp_stats(struct scx_pfs *skel, const char *file)
  * that stays off because the churn outlasted the loop.
  */
 #define HOTPLUG_SETTLE_MS	20	/* -H: first interval, 0 disables the wait */
+#define HOTPLUG_SETTLE_CAP_MS	250	/* under the ~500ms from an exit to the next event */
 #define HOTPLUG_SETTLE_TRIES	10
+#define HOTPLUG_SETTLE_BUDGET_MS 1000	/* never sit the churn out: total per restart */
+#define HOTPLUG_SKIP_MAX	4	/* doomed attaches skipped in a row before trying one */
 
 static void wait_hotplug_settled(__u64 first_ms)
 {
-	__u64 ms = first_ms, cap = first_ms * 16;
+	__u64 ms = first_ms, cap = HOTPLUG_SETTLE_CAP_MS, spent = 0;
 	long seq, prev;
 	int try;
 
 	if (!first_ms)
 		return;
 
+	if (cap < first_ms)
+		cap = first_ms;
+
 	prev = scx_hotplug_seq();
 	if (prev < 0)
 		return;			/* no sysfs file: nothing to wait for */
 
 	for (try = 1; try <= HOTPLUG_SETTLE_TRIES; try++) {
+		struct timespec ts;
+
+		if (spent >= HOTPLUG_SETTLE_BUDGET_MS) {
+			fprintf(stderr,
+				"hotplug_seq still moving (%ld) after %llums, attaching anyway\n",
+				prev, (unsigned long long)spent);
+			return;
+		}
+		if (ms > HOTPLUG_SETTLE_BUDGET_MS - spent)
+			ms = HOTPLUG_SETTLE_BUDGET_MS - spent;
+		spent += ms;
 		/*
 		 * not usleep(): POSIX leaves it unspecified at a second or
 		 * more, and -H 5000 doubles to 80s
 		 */
-		struct timespec ts = { .tv_sec = ms / 1000,
-				       .tv_nsec = (ms % 1000) * 1000000 };
-
+		ts.tv_sec = ms / 1000;
+		ts.tv_nsec = (ms % 1000) * 1000000;
 		nanosleep(&ts, NULL);
 		seq = scx_hotplug_seq();
 		if (seq == prev) {
@@ -300,6 +316,7 @@ int main(int argc, char **argv)
 	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q, secs;
 	__u64 settle_ms = HOTPLUG_SETTLE_MS;
 	bool restarted = false;
+	int skips = 0;
 	const char *stats_file = NULL;
 	long nr_cpus;
 	__s32 opt;
@@ -397,6 +414,32 @@ restart:
 	bpf_map__set_max_entries(skel->maps.waitset, nr_cgrp_q);
 
 	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);
+
+	/*
+	 * The load takes long enough for another hotplug event to land, and the
+	 * sequence was latched when the skeleton was opened, so the enable would
+	 * be refused and cost an exit, a report and a destroy on top of the
+	 * attach. Read the sequence back and reopen at once instead; an attach
+	 * is only tens of milliseconds, so after a few skips in a row take the
+	 * attach anyway rather than loop on reloads.
+	 */
+	if (settle_ms && skips < HOTPLUG_SKIP_MAX) {
+		long seq_now = scx_hotplug_seq();
+
+		if (seq_now >= 0 &&
+		    (__u64)seq_now != skel->struct_ops.pfs_ops->hotplug_seq) {
+			if (verbose)
+				fprintf(stderr,
+					"hotplug_seq moved %llu -> %ld during the load, reopening\n",
+					(unsigned long long)skel->struct_ops.pfs_ops->hotplug_seq,
+					seq_now);
+			scx_pfs__destroy(skel);
+			skips++;
+			restarted = true;
+			goto restart;
+		}
+	}
+	skips = 0;
 	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
 
 	for (secs = 0; !exit_req && !UEI_EXITED(skel, uei); secs++) {
