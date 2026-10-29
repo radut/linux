@@ -2589,11 +2589,21 @@ static void pfs_core_release_slots(struct rq *rq)
 
 	for_each_cpu(sib, cpu_smt_mask(cpu)) {
 		struct rq *srq = cpu_rq(sib);
-		u64 now = rq_clock_task(srq);
 		struct rb_node *node;
+		u64 now;
 
 		if (sib == cpu || srq->curr != srq->idle || !srq->pfs.nr_queued)
 			continue;
+
+		/*
+		 * The core's lock covers the sibling, but only its own CPU
+		 * updates its clock and nothing has on this tick, so
+		 * rq_clock_task() would trip assert_clock_updated() and read a
+		 * stale value to compare exec_start against. Both timestamps
+		 * have to come from the sibling's clock, so update it here.
+		 */
+		update_rq_clock(srq);
+		now = rq_clock_task(srq);
 
 		for (node = rb_first_cached(&srq->pfs.tasks_timeline); node;
 		     node = rb_next(node)) {
