@@ -139,9 +139,10 @@ of L = quota / period has floor(L) slots without a time limit. A cfs_rq of
 the group takes a slot when its tasks start running on a CPU and gives it
 back when they stop; without a free slot it is throttled until one is given
 back. A fractional limit adds one more slot whose CPU time is limited by a
-token bucket: it accrues continuously at L - floor(L) CPUs, up to what that
-fraction allows in one period plus cpu.max.burst, e.g. 10ms for a limit of
-0.1 with a period of 100ms. A group which ran below its limit can thus run a
+token bucket of the group: tokens accrue continuously at L CPUs, all runtime
+of the group is taken off, and the bucket holds what the fraction
+L - floor(L) allows in one period plus cpu.max.burst, e.g. 10ms for a limit
+of 0.1 with a period of 100ms. The extra slot runs on the tokens. A group which ran below its limit can thus run a
 burst of up to that size at once, as it can from the quota of a period
 without width mode, while a group which keeps the slot busy gets about
 (L - floor(L)) * window of it every window of min(period, 10ms) rather than
@@ -162,9 +163,8 @@ or write the limits of all groups again after changing it.
 A throttled task keeps running until it returns to user space, so a slot
 alone doesn't bound the time a group spends in the kernel, e.g. in long reads
 of /dev/urandom or in pipe writes. Width mode therefore charges all runtime
-of the group, with or without a slot, against a second bucket which accrues
-at L and is as deep as the first one: usage beyond L leaves it negative, a
-debt of up to what L allows in one second. While the debt is above a margin
+of the group, with or without a slot, against the bucket: usage beyond L
+leaves it negative, a debt of up to what L allows in one second. While the debt is above a margin
 of one window's budget plus a tick per slot, no slot is handed out, so that
 the group pays it back by running below its limit. Such loads average at the
 limit, as with bandwidth control, but in throttled stretches.

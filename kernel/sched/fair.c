@@ -6895,12 +6895,12 @@ static void __throttle_cfs_rq(struct cfs_rq *cfs_rq);
  * gets set) and gives it back in put_prev_task_fair() when the group stops
  * running on that CPU. floor(L) slots have no time limit. A fractional L adds
  * one more slot, which is rate limited with the runtime machinery: its holder
- * draws on cfs_b->runtime, which is refilled continuously at (L - floor(L))
- * CPUs, up to a depth of what that fraction allows in one period plus
- * cpu.max.burst, see cfs_width_refill(). A group which ran below its limit
- * can thus run a burst of up to the depth at once, as CFS runs it from the
- * quota of a period, while a group which keeps the slot busy gets about
- * (L - floor(L)) * window every window of min(period, CFS_WIDTH_WINDOW).
+ * draws on cfs_b->runtime, which is set from the group's tokens, see below.
+ * A group which ran below its limit can thus run a burst of up to what the
+ * fraction allows in one period plus cpu.max.burst at once, as CFS runs it
+ * from the quota of a period, while a group which keeps the slot busy gets
+ * about (L - floor(L)) * window every window of min(period,
+ * CFS_WIDTH_WINDOW).
  *
  * A cfs_rq which finds no free slot is throttled the usual way and waits on
  * cfs_b->throttled_cfs_rq. A throttled cfs_rq holds no slot. Giving a slot
@@ -6920,13 +6920,13 @@ static void __throttle_cfs_rq(struct cfs_rq *cfs_rq);
  * kernel, e.g. in a long read() of /dev/urandom or a pipe write, and the
  * slots alone don't bound the group's usage. All runtime of the group, with
  * or without a slot, is therefore charged to cfs_b->width_runtime and taken
- * off a second bucket of the same depth which accrues at L, see
- * cfs_width_settle(). Usage beyond L leaves it negative, a debt. While the
- * debt is above a margin which absorbs late charges, no slot is handed out,
- * so that the group pays it back by running below its limit, as CFS pays
- * back runtime overdrawn in the kernel with a throttled period. A burst of
- * the rate limited slot out of its saved up runtime is within the depth and
- * leaves no debt.
+ * off the group's token bucket, which accrues at L up to the depth above,
+ * see cfs_width_settle(). The rate limited slot is only handed out with
+ * tokens, and gets them as its runtime, so that its overruns (charges arrive
+ * late) shorten its next turns. Usage beyond L leaves the bucket negative, a
+ * debt. While the debt is above a margin which absorbs late charges, no slot
+ * is handed out, so that the group pays it back by running below its limit,
+ * as CFS pays back runtime overdrawn in the kernel with a throttled period.
  */
 #define CFS_WIDTH_WINDOW	(10 * NSEC_PER_MSEC)
 /* the debt is capped at what the limit allows in this time */
@@ -6977,37 +6977,15 @@ static bool cfs_width_in_debt(struct cfs_bandwidth *cfs_b)
 }
 
 /*
- * Refill the runtime of the rate limited slot for the time elapsed since the
- * last call, at width_frac per period, up to width_depth.
- */
-static void cfs_width_refill(struct cfs_bandwidth *cfs_b)
-{
-	u64 now = ktime_get_mono_fast_ns(), elapsed, add;
-
-	lockdep_assert_held(&cfs_b->lock);
-
-	if (!cfs_b->width_extra || now <= cfs_b->width_refilled)
-		return;
-
-	elapsed = now - cfs_b->width_refilled;
-	cfs_b->width_refilled = now;
-	if (cfs_b->runtime >= cfs_b->width_depth)
-		return;
-
-	add = mul_u64_u64_div_u64(cfs_b->width_frac,
-				  min(elapsed, (u64)NSEC_PER_SEC * 1000),
-				  ktime_to_ns(cfs_b->period));
-	cfs_b->runtime = min(cfs_b->runtime + add, cfs_b->width_depth);
-}
-
-/*
- * Can the rate limited slot be handed out? It needs runtime, and at least
- * half a window's worth, so that a holder which used it up doesn't take it
- * back for a few microseconds at a time.
+ * Can the rate limited slot be handed out? Its runtime is the group's
+ * tokens, and it needs at least half a window's worth, so that a holder
+ * which used them up doesn't take the slot back for a few microseconds at a
+ * time. Runtime is charged as it is used, so a grant isn't taken off here.
  */
 static bool cfs_width_extra_ready(struct cfs_bandwidth *cfs_b)
 {
-	cfs_width_refill(cfs_b);
+	cfs_width_settle(cfs_b);
+	cfs_b->runtime = max_t(s64, cfs_b->width_tokens, 0);
 	return cfs_b->runtime && cfs_b->runtime >= cfs_b->width_budget / 2;
 }
 
@@ -7047,12 +7025,9 @@ static void __cfs_width_release(struct cfs_bandwidth *cfs_b, struct cfs_rq *cfs_
 		cfs_b->width_active--;
 	} else if (cfs_rq->width_slot == CFS_WIDTH_EXTRA) {
 		cfs_b->width_extra_busy = 0;
-		/* return what is left, a debt stays with the cfs_rq */
-		if (cfs_rq->runtime_remaining > 0) {
-			cfs_b->runtime = min(cfs_b->runtime + cfs_rq->runtime_remaining,
-					     cfs_b->width_depth);
+		/* an unused grant lapses: only used runtime takes tokens */
+		if (cfs_rq->runtime_remaining > 0)
 			cfs_rq->runtime_remaining = 0;
-		}
 	}
 	cfs_rq->width_slot = CFS_WIDTH_NONE;
 }
@@ -7206,14 +7181,13 @@ static __always_inline void cfs_width_put(struct cfs_rq *cfs_rq)
 /* Set up width mode from cfs_b->quota and cfs_b->period */
 void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width)
 {
-	u64 period = ktime_to_ns(cfs_b->period), window, slots, debt_max;
+	u64 period = ktime_to_ns(cfs_b->period), window, slots, debt_max, frac = 0;
 
 	lockdep_assert_held(&cfs_b->lock);
 
 	cfs_b->width = width;
 	cfs_b->width_slots = 0;
 	cfs_b->width_extra = 0;
-	cfs_b->width_frac = 0;
 	cfs_b->width_budget = 0;
 	cfs_b->width_depth = 0;
 	if (!width)
@@ -7224,15 +7198,14 @@ void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width)
 	cfs_b->width_slots = min_t(u64, slots, INT_MAX);
 	cfs_b->width_window = ns_to_ktime(window);
 	if (slots < INT_MAX)
-		cfs_b->width_frac = cfs_b->quota - slots * period;
-	cfs_b->width_budget = mul_u64_u64_div_u64(cfs_b->width_frac, window, period);
+		frac = cfs_b->quota - slots * period;
+	cfs_b->width_budget = mul_u64_u64_div_u64(frac, window, period);
 	cfs_b->width_extra = cfs_b->width_budget > 0;
 	/* start full, as CFS starts with the quota of a period */
 	if (cfs_b->width_extra)
-		cfs_b->width_depth = cfs_b->width_frac + cfs_b->burst;
+		cfs_b->width_depth = frac + cfs_b->burst;
 	cfs_b->runtime = cfs_b->width_depth;
 	cfs_b->runtime_snap = cfs_b->runtime;
-	cfs_b->width_refilled = ktime_get_mono_fast_ns();
 
 	/*
 	 * Charges arrive late, by up to a tick per running CPU plus a batch,
@@ -7918,7 +7891,6 @@ static int do_cfs_width_period_timer(struct cfs_bandwidth *cfs_b, int overrun,
 	__must_hold(&cfs_b->lock)
 {
 	cfs_b->nr_periods += overrun;
-	cfs_width_refill(cfs_b);
 
 	/*
 	 * A window counts as throttled if a cfs_rq waited for a slot or for
