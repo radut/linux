@@ -23,6 +23,7 @@ struct pfs_cgrp_stat {
 	__u64 throttled_id;	/* last window counted in nr_throttled */
 	__s32 nr_waiting;	/* tasks waiting in the DSQs of the cgroup */
 	__u32 pad;
+	__s64 tokens_ns;	/* the token bucket at its last refill, a debt if < 0 */
 };
 
 enum pfs_stat_idx {

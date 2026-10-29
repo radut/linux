@@ -166,6 +166,11 @@ static struct {
 	__u64	now;
 } dump;
 
+#define KVFMT \
+	"cgroup path=%s nr_periods=%llu nr_throttled=%llu throttled_usec=%llu tokens_ns=%lld\n"
+#define PLAINFMT \
+	"%s nr_periods %llu nr_throttled %llu throttled_usec %llu tokens_ns %lld\n"
+
 static int dump_one(const char *path, const struct stat *sb, int type,
 		    struct FTW *ftw)
 {
@@ -187,12 +192,17 @@ static int dump_one(const char *path, const struct stat *sb, int type,
 	if (st->nr_waiting > 0 && st->wait_since && dump.now > st->wait_since)
 		throttled += dump.now - st->wait_since;
 	path += strlen(CGROUP_FS);
-	fprintf(dump.f, dump.kv ?
-		"cgroup path=%s nr_periods=%llu nr_throttled=%llu throttled_usec=%llu\n" :
-		"%s nr_periods %llu nr_throttled %llu throttled_usec %llu\n",
+	/*
+	 * tokens last, appended: it is the token bucket, negative while the
+	 * cgroup owes runtime, and a reader of the first four fields is
+	 * unaffected. Without it the debt is not observable from user space,
+	 * which a test of the credit a yielding task gets has to check.
+	 */
+	fprintf(dump.f, dump.kv ? KVFMT : PLAINFMT,
 		*path ? path : "/", (unsigned long long)st->nr_periods,
 		(unsigned long long)st->nr_throttled,
-		(unsigned long long)throttled / 1000);
+		(unsigned long long)throttled / 1000,
+		(long long)st->tokens_ns);
 	return 0;
 }
 
