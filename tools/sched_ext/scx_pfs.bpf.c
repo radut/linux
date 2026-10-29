@@ -1013,6 +1013,38 @@ static bool credit_ok(struct pfs_cgrp_ctx *cgc, u64 now, u64 *slicep)
  * the smallest of which clips *@slicep. The runtime is taken off the
  * buckets, and any excess is paid back as debt.
  */
+/*
+ * Credit for a task which has just yielded. Unlike credit_left() it does not
+ * require tokens: an in-kernel yield() holds locks, and a cgroup which has
+ * spent its tokens is the one whose tasks would wait longest. It does keep the
+ * debt margin, which is what stops this from becoming a way around the limit -
+ * sched_yield(2) reaches the same ops.yield(), so a thread looping on it would
+ * otherwise draw credit for ever. Once the cgroup's debt passes a window's
+ * budget plus a tick per slot, over_limit() refuses and the task parks as any
+ * other, pays the debt back, and its average usage stays at the limit.
+ */
+static bool yield_credit_ok(struct cgroup *cgrp, u64 now)
+{
+	struct pfs_cgrp_ctx *cgc;
+	u64 cgid;
+	int level;
+
+	if (too_deep(cgrp))
+		return true;
+
+	bpf_for(level, 1, MAX_LEVELS) {
+		if (level > cgrp->level)
+			break;
+
+		cgc = find_ancestor_ctx(cgrp, level, &cgid);
+		if (!cgc)
+			return false;
+		if (cgc->limit && over_limit(cgc, now))
+			return false;
+	}
+	return true;
+}
+
 static bool credit_left(struct cgroup *cgrp, u64 now, u64 *slicep)
 {
 	struct pfs_cgrp_ctx *cgc;
@@ -1725,18 +1757,18 @@ void BPF_STRUCT_OPS(pfs_enqueue, struct task_struct *p, u64 enq_flags)
 	 * the top of the file. Woken tasks run on credit while the tokens
 	 * last, as do io_uring workers, which never return to user space.
 	 *
-	 * A task that has just yielded runs on credit whether or not tokens are
-	 * left: an in-kernel yield() holds locks (RTNL in
-	 * netlink_broadcast_filtered()), and a cgroup which has spent its
-	 * tokens is exactly the one whose tasks would wait longest. The runtime
-	 * is charged as always, so the bucket goes into debt and the cgroup
-	 * pays it back; it gains no CPU over a window.
+	 * A task that has just yielded runs on credit without needing tokens,
+	 * but only while its cgroup's debt is under the margin over_limit()
+	 * allows: an in-kernel yield() holds locks, while sched_yield(2) reaches
+	 * the same op, so an unbounded version would let a yield loop run past
+	 * the limit. See yield_credit_ok().
 	 */
 	if (ret != RESERVE_OK) {
 		bool yielded = taskc->yielded;
 
 		slice = credit_ns && credit_ns < slice_ns ? credit_ns : slice_ns;
-		if (must_not_park(p) || yielded ||
+		if (must_not_park(p) ||
+		    (yielded && yield_credit_ok(cgrp, window_now())) ||
 		    (credit_ns &&
 		     ((enq_flags & SCX_ENQ_WAKEUP) || (p->flags & PF_IO_WORKER)) &&
 		     credit_left(cgrp, window_now(), &slice))) {
