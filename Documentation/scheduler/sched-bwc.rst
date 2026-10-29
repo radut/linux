@@ -205,8 +205,10 @@ Disadvantages of width mode, measured on the same machines:
   the shares are off the weighted ideal by up to 16%, and two busy groups
   limited to 4 and 8 CPUs reach only 3.50 and 6.35 CPUs while 4 CPUs of the
   machine are idle.
-- Fractional limits are still enforced as time, over a 10ms window, and
-  nr_throttled grows by about 100 per second per group. Database tails are
+- Fractional limits are still enforced as time: a thread which keeps the
+  rate limited slot busy gets (L - floor(L)) * 10ms every 10ms window once
+  the bucket is empty, and nr_throttled grows by about 100 per second per
+  group. Database tails are
   better than without width mode but still 22-87 ms at p99 (PostgreSQL,
   16-vCPU VM).
 - More busy-polling threads than slots collapse: 4 threads passing work

@@ -333,8 +333,13 @@ On a 16-vCPU VM running Kubernetes pods (kernel 7.0, 3 runs or more):
 - With 50-100 pods on the node, a 1 ms sleeper outside the pods overshoots by
   4.7-8.0 ms at p99 vs 1.0-2.4 ms under CFS, and migrations are about 100
   times as frequent.
-- `cpu.stat` over-reports the usage of cgroups with many threads under
-  sched_ext; use a `sched_switch` trace to count CPUs.
+- On machines with an unstable `sched_clock` (e.g. KVM guests whose
+  kvm-clock isn't marked stable, `sched_clock_stable()` 0 in
+  `/sys/kernel/debug/sched/debug`), kernels without "softirq: Treat an
+  interrupted idle task as idle in tick_irq_exit()" charge a waiting thread
+  the idle time of the CPU it is woken on: `cpu.stat`, `getrusage()` and the
+  thread CPU clocks over-report, by up to 20 times at limit 0.1. The limit
+  itself holds; a `sched_switch` trace counts the CPUs correctly.
 - Waiting for a slot costs latency even in an otherwise idle cgroup: four
   request threads at limit 1 have a median of 3.1 ms vs 1.15 ms under CFS.
 - `cpu.max.burst` is ignored, and so are cgroups deeper than 31 levels.
