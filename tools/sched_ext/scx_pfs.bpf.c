@@ -587,6 +587,7 @@ static s64 refill(struct pfs_cgrp_ctx *cgc, u64 now)
 	dt = now - at;
 	if (dt >= REFILL_MAX_NS) {
 		cgc->tokens = depth;
+		cgc->stat.tokens_ns = depth;
 		return depth;
 	}
 
@@ -597,6 +598,11 @@ static s64 refill(struct pfs_cgrp_ctx *cgc, u64 now)
 		__sync_val_compare_and_swap(&cgc->tokens, tokens, depth);
 	else if (tokens < -max)
 		__sync_val_compare_and_swap(&cgc->tokens, tokens, -max);
+	/*
+	 * user space only sees pfs_cgrp_stat, and a test of the credit a
+	 * yielding task gets has to be able to watch the debt
+	 */
+	cgc->stat.tokens_ns = cgc->tokens;
 	return cgc->tokens;
 }
 
