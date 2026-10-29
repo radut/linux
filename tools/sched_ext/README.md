@@ -294,7 +294,9 @@ or run it in a container with `CAP_SYS_ADMIN`, `CAP_BPF` and `CAP_PERFMON`
 only (`pfs-test/scx-container.sh`), which is the shape of a Kubernetes
 DaemonSet. It needs `CONFIG_SCHED_CLASS_EXT=y`;
 following run-time changes of `cpu.max` needs the `cgroup_set_bandwidth`
-operation (6.17 or later). `pfs-test/` compares it with CFS bandwidth control
+operation (6.17 or later). v6.19 is the oldest tag it has been loaded and run
+on: v6.12 and v6.13 are missing `cgroup_set_bandwidth` and several of the
+kfuncs it calls. `pfs-test/` compares it with CFS bandwidth control
 on plain cgroups, systemd units, Docker and Podman; its README has the
 reproduction steps and the full result tables.
 

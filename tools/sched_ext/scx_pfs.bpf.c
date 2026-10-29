@@ -197,6 +197,23 @@ enum {
 #define PARK_LAND_NS		(10 * 1000 * 1000LLU)
 
 _Static_assert(MAX_LEVELS <= SLOT_SEQ_SHIFT, "level bits overlap the sequence");
+_Static_assert((MAX_LEVELS & (MAX_LEVELS - 1)) == 0, "MAX_LEVELS must be a power of two");
+
+/*
+ * The level to index a task's cgroup path with. Every caller is inside
+ * bpf_for(level, .., MAX_LEVELS), which bounds the level, but a verifier
+ * which doesn't carry that bound into the register the access itself uses
+ * rejects the array with "R1 unbounded memory access" (v6.19 and earlier,
+ * tested back to v6.12). Mask the index so that the bound is on the register
+ * being indexed; MAX_LEVELS is a power of two, so this is one AND. The
+ * barrier keeps clang from dropping the mask, which is redundant for the
+ * compiler, since it knows the loop bound, but not for those verifiers.
+ */
+static __always_inline int path_level(int level)
+{
+	barrier_var(level);
+	return level & (MAX_LEVELS - 1);
+}
 
 enum reserve_result {
 	RESERVE_OK,
@@ -654,7 +671,7 @@ static void wait_begin(struct pfs_task_ctx *taskc, struct cgroup *wait_cgrp,
 		cgc = find_ancestor_ctx(wait_cgrp, level, &cgid);
 		if (!cgc)
 			return;
-		if (!cgc->limit || cgid != taskc->path_cgid[level])
+		if (!cgc->limit || cgid != taskc->path_cgid[path_level(level)])
 			continue;
 		if (level < wait_cgrp->level &&
 		    cgc->nr_slots < div_round_up(cgc->limit, FRAC_ONE))
@@ -684,7 +701,7 @@ static void wait_end(struct pfs_task_ctx *taskc, u64 now)
 			break;
 		if (!(mask & (1LLU << level)))
 			continue;
-		cgrp = bpf_cgroup_from_id(taskc->path_cgid[level]);
+		cgrp = bpf_cgroup_from_id(taskc->path_cgid[path_level(level)]);
 		if (!cgrp)
 			continue;
 		cgc = bpf_cgrp_storage_get(&cgrp_ctx, cgrp, 0, 0);
@@ -808,7 +825,7 @@ static void put_path_slots(struct pfs_task_ctx *taskc, u64 mask, u32 flags)
 		if (!(mask & (1LLU << level)))
 			continue;
 
-		cgid = taskc->path_cgid[level];
+		cgid = taskc->path_cgid[path_level(level)];
 		cgrp = bpf_cgroup_from_id(cgid);
 		if (!cgrp) {
 			stat_inc(PFS_STAT_LOST_PATH);
@@ -843,7 +860,7 @@ static void set_task_cgrp(struct pfs_task_ctx *taskc, struct cgroup *cgrp)
 			scx_bpf_error("ancestor cgroup lookup failed");
 			return;
 		}
-		taskc->path_cgid[level] = anc->kn->id;
+		taskc->path_cgid[path_level(level)] = anc->kn->id;
 		bpf_cgroup_release(anc);
 	}
 	/* level 0 is the root, its slot is unused: mark the path valid */
@@ -1996,7 +2013,7 @@ static bool slots_wanted(struct pfs_task_ctx *taskc, u64 mask, bool woken_only)
 			break;
 		if (!(mask & (1LLU << level)))
 			continue;
-		cgid = taskc->path_cgid[level];
+		cgid = taskc->path_cgid[path_level(level)];
 		if (scx_bpf_dsq_nr_queued(cgid | WOKEN_DSQ) > 0 ||
 		    (!woken_only && scx_bpf_dsq_nr_queued(cgid) > 0))
 			return true;
