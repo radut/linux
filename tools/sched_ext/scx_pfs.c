@@ -258,7 +258,6 @@ static void dump_cgrp_stats(struct scx_pfs *skel, const char *file)
 #define HOTPLUG_SETTLE_CAP_MS	250	/* under the ~500ms from an exit to the next event */
 #define HOTPLUG_SETTLE_TRIES	10
 #define HOTPLUG_SETTLE_BUDGET_MS 1000	/* never sit the churn out: total per restart */
-#define HOTPLUG_SKIP_MAX	4	/* doomed attaches skipped in a row before trying one */
 #define EXIT_POLL_PER_SEC	20	/* exit checks per second of the stats loop */
 
 static void wait_hotplug_settled(__u64 first_ms)
@@ -318,7 +317,6 @@ int main(int argc, char **argv)
 	__u64 intv = 1, nr_cgrp_q = NR_CGRP_Q, secs;
 	__u64 settle_ms = HOTPLUG_SETTLE_MS;
 	bool restarted = false;
-	int skips = 0;
 	const char *stats_file = NULL;
 	long nr_cpus;
 	__s32 opt;
@@ -416,32 +414,6 @@ restart:
 	bpf_map__set_max_entries(skel->maps.waitset, nr_cgrp_q);
 
 	SCX_OPS_LOAD(skel, pfs_ops, scx_pfs, uei);
-
-	/*
-	 * The load takes long enough for another hotplug event to land, and the
-	 * sequence was latched when the skeleton was opened, so the enable would
-	 * be refused and cost an exit, a report and a destroy on top of the
-	 * attach. Read the sequence back and reopen at once instead; an attach
-	 * is only tens of milliseconds, so after a few skips in a row take the
-	 * attach anyway rather than loop on reloads.
-	 */
-	if (settle_ms && skips < HOTPLUG_SKIP_MAX) {
-		long seq_now = scx_hotplug_seq();
-
-		if (seq_now >= 0 &&
-		    (__u64)seq_now != skel->struct_ops.pfs_ops->hotplug_seq) {
-			if (verbose)
-				fprintf(stderr,
-					"hotplug_seq moved %llu -> %ld during the load, reopening\n",
-					(unsigned long long)skel->struct_ops.pfs_ops->hotplug_seq,
-					seq_now);
-			scx_pfs__destroy(skel);
-			skips++;
-			restarted = true;
-			goto restart;
-		}
-	}
-	skips = 0;
 	link = SCX_OPS_ATTACH(skel, pfs_ops, scx_pfs);
 
 	for (secs = 0; !exit_req && !UEI_EXITED(skel, uei); secs++) {
