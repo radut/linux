@@ -51,6 +51,7 @@ enum pfs_stat_idx {
 	PFS_STAT_NO_DSQ,		/* cgroups not limited, DSQ creation failed */
 	PFS_STAT_PARK_RACE,		/* retries queued again for a landing park */
 	PFS_STAT_PARK_DEBT,		/* slot refused: the cgroup ran beyond its limit */
+	PFS_STAT_HOTPLUG,		/* CPUs going on or offline */
 
 	PFS_NR_STATS,
 };

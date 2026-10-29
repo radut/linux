@@ -2568,6 +2568,33 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(pfs_init)
 	return ret;
 }
 
+/*
+ * A CPU going on or offline. Nothing here has to be resynced: the slot
+ * accounting is per cgroup (cgrp_ctx.nr_slots) and per task
+ * (pfs_task_ctx.slot_mask), the wait DSQs are per cgroup, dispatch goes to
+ * SCX_DSQ_LOCAL and the core moves a dying CPU's queue itself, the idle mask is
+ * read live in pfs_select_cpu(), and the statistics map is a per-CPU array that
+ * user space sums. Defining the two ops is the point: without them the core
+ * ejects the scheduler on every hotplug event (handle_hotplug() reaches
+ * scx_exit() when neither op is set), and the loader then has to reopen,
+ * reload and reattach, which measured 565ms of BPF load per attempt with the
+ * group's tasks on CFS meanwhile.
+ *
+ * min_share, which user space scales by the online CPU count at open, is left
+ * as it was: it is a heuristic for how long a waiting task may be ahead, it is
+ * rodata and cannot be written from here, and the count it was computed from is
+ * the one the operator sized the scheduler for.
+ */
+void BPF_STRUCT_OPS(pfs_cpu_online, s32 cpu)
+{
+	stat_inc(PFS_STAT_HOTPLUG);
+}
+
+void BPF_STRUCT_OPS(pfs_cpu_offline, s32 cpu)
+{
+	stat_inc(PFS_STAT_HOTPLUG);
+}
+
 void BPF_STRUCT_OPS(pfs_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
@@ -2596,6 +2623,8 @@ SCX_OPS_DEFINE(pfs_ops,
 	       .cgroup_move		= (void *)pfs_cgroup_move,
 	       .cgroup_set_weight	= (void *)pfs_cgroup_set_weight,
 	       .cgroup_set_bandwidth	= (void *)pfs_cgroup_set_bandwidth,
+	       .cpu_online		= (void *)pfs_cpu_online,
+	       .cpu_offline		= (void *)pfs_cpu_offline,
 	       .init			= (void *)pfs_init,
 	       .exit			= (void *)pfs_exit,
 	       .flags			= SCX_OPS_ENQ_EXITING | SCX_OPS_ENQ_LAST,
