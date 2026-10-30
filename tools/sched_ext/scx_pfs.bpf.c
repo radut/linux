@@ -298,7 +298,8 @@ struct pfs_task_ctx {
 	u64		cgid;		/* cgroup the task belongs to */
 	u64		slot_mask;	/* levels of cgid's path holding a slot */
 	u64		slot_seq;
-	u64		started_at;
+	u64		started_at;	/* wall clock, for the wait accounting of wait_end() */
+	u64		exec_at;	/* ->se.sum_exec_runtime when last charged */
 	u64		run_cgid;	/* cgroup counting @p as runnable */
 	u64		run_weight;	/* weight @p is counted with */
 	u64		admitted_at;	/* when the slots were taken */
@@ -1841,13 +1842,14 @@ static void charge_runtime(struct cgroup *cgrp, u64 now, u64 delta)
 static void charge_task(struct task_struct *p, struct pfs_task_ctx *taskc,
 			struct cgroup *cgrp, u64 now)
 {
+	u64 exec = p->se.sum_exec_runtime;
 	u64 delta, vdelta;
 
-	if (now <= taskc->started_at)
+	if (exec <= taskc->exec_at)
 		return;
 
-	delta = now - taskc->started_at;
-	taskc->started_at = now;
+	delta = exec - taskc->exec_at;
+	taskc->exec_at = exec;
 
 	vdelta = scale_by_task_weight_inverse(p, delta);
 	scx_bpf_task_set_dsq_vtime(p, p->scx.dsq_vtime +
@@ -2279,6 +2281,11 @@ s32 BPF_STRUCT_OPS(pfs_init_task, struct task_struct *p,
 	taskc->wait_mask = 0;
 	taskc->run_cgid = 0;
 	taskc->cgid = 0;
+	/*
+	 * Tasks already running when the scheduler is enabled have runtime
+	 * behind them. Without this the first charge bills all of it.
+	 */
+	taskc->exec_at = p->se.sum_exec_runtime;
 
 	/*
 	 * @args->cgroup can't be passed to kfuncs, look it up. An exiting
