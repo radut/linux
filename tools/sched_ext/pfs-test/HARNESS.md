@@ -87,3 +87,160 @@ service workloads `dbsvc-*.sh` / `dbsvc-*.py`.
 
 All objects these create carry a `${LABEL_DOMAIN}` owner/expiry label so a run
 that dies leaves something sweepable behind.
+
+## `mech/mech-pg.sh` - the Postgres cell driver
+
+One invocation is one arm's Postgres cells inside one boot: Postgres in a
+two-level pod cgroup (`/sys/fs/cgroup/rt/pod/ctr`), pgbench driven from the
+root cgroup, one cell per (limit, workload, rep) **in the order given**.
+
+`mech-guest.sh`, `mech-make.sh` and the warm-up path all call it; nothing else
+in the tree does.
+
+### Call
+
+```
+[env] bash mech/mech-pg.sh "LIMITS" "WLS" SECS
+```
+
+| Position/variable | Meaning | Default |
+|---|---|---|
+| `$1` `LIMITS` | `cpu.max` limits in CPUs, **in cell order** | `4 1.5` |
+| `$2` `WLS` | workloads in cell order: `tpcb`, `select` | `tpcb select` |
+| `$3` `SECS` | measured seconds per cell | `30` |
+| `PFS_WORK` | work directory; the Postgres rootfs is `$PFS_WORK/p5` | required |
+| `MD` | directory holding `sample-groups.py` | the script's own directory |
+| `CONC` | the concurrency reducer | `../rm2/conc-pids.py` |
+| `CL` | pgbench clients (the harness uses 16 and 32) | `32` |
+| `REPS`, `SCALE`, `GRPHZ` | reps per cell, `pgbench -i` scale, sampler Hz | `1`, `20`, `100` |
+| `PGV` | the `v=` label on every `R` row | `cfs` |
+| `REV` | `1` reverses both `LIMITS` and `WLS` in place | `0` |
+| `WARM` | `1` force / `0` off / `auto` once per boot | `auto` |
+| `WARMSECS`, `PG_WARM_STAMP` | warm-up cell length, per-boot stamp file | `10`, `/tmp/pg-warmed` |
+| `PG_GATE` | if set, wait **unboundedly** for the guest 1-minute load to fall below it | unset = no gate |
+| `SCXS`, `SF`, `SCXL` | set by the caller for an `scx_pfs` arm: enable the per-cgroup dump, its path, the loader log | unset |
+
+Limits are fractional, and the integer part may be 2 or more: `1.5 2 2.001 2.1
+2.5 2.9 2.999 3 3.5 4 4.001` all convert exactly through
+`printf "%d", l * 100000` into a quota against a 100 ms period. `setlim` now
+**reads `cpu.max` back** and aborts on any mismatch, and prints the quota it
+wrote as `D limset`, so a rounding surprise is visible rather than silent.
+
+Cell order is a parameter because a fixed order confounds every step
+comparison: `mech-rev.sh` passes `LIMITS="2.001 2 4.001 4"`, and the order in
+force is echoed in the `D pgdriver` row.
+
+### Rows
+
+Every rate is a **delta across a measured window, with the window printed
+beside it**. `cpu.stat`'s `usage_usec` is cumulative and is never divided by a
+nominal duration.
+
+```
+R v= lim= wl= rep= tps= lat_ms= cpus= mid_cpus= cell_secs= mid_secs= cpu_src= conc_pids= \
+  trace_secs= mean_running= frac_over_limit= max= hist= \
+  thr_win= thr_per= thr_n= thr_us= thr_frac= [pfs_per= pfs_n= pfs_us= pfs_frac=] \
+  c_thr_win= c_thr_per= c_thr_n= c_thr_us= c_thr_frac= [c_pfs_*] [kPFS stats delta]
+```
+
+* `cpus` = delta of `/rt/pod` `usage_usec` over `cell_secs`; `mid_cpus` = the
+  same delta over the 5 s mid window, `mid_secs`. `cpu_src` names the cgroup
+  both come from and `conc_pids` the size of the thread set the trace filter
+  matched, so each denominator states its interval **and** its task set.
+* `trace_secs mean_running frac_over_limit max hist` come from the concurrency
+  reducer over the mid-window `sched_switch` dump.
+* `thr_*` are `/rt/pod` `cpu.stat` throttling; `c_thr_*` the `ctr` leaf.
+  `pfs_*`/`c_pfs_*` appear only when the `scx_pfs` dump is enabled.
+  `thr_win`/`c_thr_win` is the measured snapshot-to-snapshot interval the
+  `_frac` fields are divided by.
+* The trailing bare `key=value` tokens are the kPFS `debug/sched/pfs/stats`
+  delta over the cell.
+
+Field order up to `mid_cpus=` is fixed, because `calib/exclude.py:75`,
+`calib/final.py:55`, `calib/report.py:38`, `calib/position.py:32` and
+`calib/headline.py:29` all anchor on that prefix; `exclude.py` additionally
+reads `\bthr_frac=` by name, and `rm2/summ2.py` reads `lim`, `wl`, `tps`,
+`cpus`, `lat_ms`, `mean_running` and the `thr_*`/`c_thr_*`/`pfs_*` set as an
+unordered `key=value` map (`summ2.py:98`, `:23`). Every field added since the
+original is appended **after** `mid_cpus=`, so all five regexes still match -
+verified against each one.
+
+`D` rows: `D pgdriver` (one per invocation: kernel, variant, cell order, every
+knob), `D limset` (per cell: quota written and read back), `D pgload`
+(loadavg on both sides of the run, into this stream and so into the per-boot
+file the exclusion rule reads), `D pgwarm` (the discarded warm-up cell, with
+its own tps and window), `D cell` (window, transactions, `tokens_ns` either
+side), `D pgprog` (the `pgbench -P 1` progress series), `D scx0`/`D scx1`
+(scx_pfs global counters either side), `D grpsample` (the sampler's own
+trailer, including its CPU cost), `D cgstale` (a cgroup an earlier arm left
+behind) and `D warn`.
+
+`G` rows are the 100 Hz per-cgroup samples across the mid window:
+`G lim= wl= t= limit= slots= waiting= tokens_us= active= path=`. `slots <
+width` with `waiting > 0` is work the scheduler held back; `slots < width`
+with `waiting == 0` is work the benchmark did not offer. Nothing else
+separates them. `path=` is on every row because without it a sample's pod and
+leaf rows cannot be told apart, which is how the first run lost slot
+attribution.
+
+The driver ends with `PG-DONE`. Callers filter its output with
+`grep -E '^R |^D |^G |failed|PG-DONE'`.
+
+### Recovered verbatim vs reconstructed
+
+This file was **rebuilt after the original was lost**, and the two halves are
+not equally trustworthy.
+
+**Recovered verbatim** (the original is `rm2/pg-guest.sh` plus eight
+replacements, and the rebuild reproduces the original's own line numbering -
+`D grpsample` at line 113 and the `G` row `awk` at 114, matching the recovered
+listing of the live file):
+
+* the header's phase-1 argument and its `pfs.c` / `scx_pfs.bpf.c` citations;
+* the cgroup layout, `setlim`'s conversion, the tmpfs, `initdb`, the Postgres
+  command line and every `pgbench` invocation including `-n -c $CL -j 4 -T
+  $SECS -P 1`;
+* `tsnap`, `toksnap` (`tokens_ns`, field 9 of the scx_pfs `PLAINFMT` line) and
+  `scxsnap` with its `drain=N/M` split;
+* the cell loop, the `vacuum analyze` + `checkpoint` before each cell, the
+  1.1 s settles around the scx dump, the 5 s mid window with the group sampler
+  started inside it and waited for before it closes;
+* the `R`, `D cell`, `D pgprog`, `D scx0`, `D scx1`, `D grpsample` and `G` rows
+  and the whole-cell transaction parse that handles both `pgbench` forms.
+
+**Reconstructed** - derived from the call sites and the measurement rules, not
+recovered. Each site is marked `# RECONSTRUCTED:` in the file:
+
+* `PFS_WORK`-rooted paths, `set -u` with the previously unguarded `SCXS`,
+  `SF`, `SCXL`, `P5RES`, `TAG` defaulted, `MD` defaulting to the script's own
+  directory and `CONC` naming the reducer (the original called it `conc5.py`
+  in its own directory; the in-tree name is `rm2/conc-pids.py`, same output);
+* `cell_secs`, `mid_secs`, `cpu_src`, `conc_pids`, `thr_win`, `c_thr_win` on
+  the `R` row, and `thr_frac`/`pfs_frac` divided by the **measured snapshot
+  interval** rather than the pgbench interval. This last one is a deliberate
+  change of value, not just of presentation: the original divided by `t1-t0`,
+  which under an scx arm is short of the snapshot span by the two 1.1 s
+  settles. For `cfs` and `kpfs` arms no settle runs and the two denominators
+  agree to within microseconds, so only scx `pfs_frac` moves;
+* `setlim`'s read-back and the `D limset` row;
+* the stale-cgroup check. Nothing here resets a counter by recreating a
+  cgroup, but a leftover `/rt` tree means an earlier arm's teardown failed, so
+  the removal is attempted and **a failure is fatal**. An older harness let
+  exactly this `rmdir` fail silently and read 4.9 CPUs where the limit was
+  1.5;
+* `D pgload` and the `PG_GATE` wait, which has no cap and no fall-through;
+* `REV`, and the `warmcell` discarded cell in the shape of the **first cell of
+  the order in force**. `calib/warmup-guest.sh` also runs a discarded cell per
+  boot, but at a fixed shape (limit 2, `tpcb`, 16 clients) that stops matching
+  as soon as a caller reverses the order, which is why the driver has its own;
+  `WARM=auto` pays it once per boot via a stamp file and `WARM=0` says
+  `warm=off` rather than omitting it in silence.
+
+**Known defects carried over on purpose**, so a re-measurement is comparable
+with the data already collected:
+
+* `v=` is `${PGV:-cfs}` and is *not* an arm label: on an `scx3` arm the rows
+  still read `v=cfs`. `calib/final.py:17` says so and keys on the `D arm=`
+  line instead. Set `PGV` to override.
+* When the `sched_switch` dump is empty the reducer prints `no events` and the
+  `R` row then carries no `trace_secs`/`mean_running`/`hist`.
