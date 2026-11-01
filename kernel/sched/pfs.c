@@ -159,6 +159,48 @@ static inline void pfs_stat_add(enum pfs_k_stat idx, u64 val)
 	this_cpu_add(pfs_stats[idx], val);
 }
 
+/*
+ * Slot index at which a refusal of pfs_take_slot() is counted; indices at or
+ * above it share the last bucket. A limited level hands out ceil(limit)
+ * slots, see pfs_width(), so this covers limits below nine CPUs exactly.
+ */
+#define PFS_K_SLOT_IDX_MAX	8
+
+/*
+ * Why pfs_take_slot() refused a slot, and whether the refused slot was one
+ * of the floor(limit) guaranteed slots or the fractional one above them.
+ * park_debt alone cannot tell those apart, and the debt gate does refuse
+ * guaranteed slots: it runs for taken + 1 >= floor(limit), i.e. also for the
+ * last full slot, and for every index once the debt reached its cap. The
+ * budget gate runs only for taken >= floor(limit), so a budget refusal is
+ * never of a guaranteed slot and has no second class here.
+ */
+enum pfs_k_refuse {
+	PFS_K_REFUSE_BUDGET,		/* no tokens for the fractional slot */
+	PFS_K_REFUSE_DEBT_GUAR,		/* over the limit, taken < floor(limit) */
+	PFS_K_REFUSE_DEBT_FRAC,		/* over the limit, taken >= floor(limit) */
+	PFS_K_NR_REFUSE,
+};
+
+static const char * const pfs_refuse_names[PFS_K_NR_REFUSE] = {
+	"refuse_budget_frac", "refuse_debt_guar", "refuse_debt_frac",
+};
+
+/* buckets per reason: the indices 0..PFS_K_SLOT_IDX_MAX-1 and one for the rest */
+#define PFS_K_REFUSE_BUCKETS	(PFS_K_SLOT_IDX_MAX + 1)
+#define PFS_K_NR_REFUSALS	(PFS_K_NR_REFUSE * PFS_K_REFUSE_BUCKETS)
+
+/* flat, like pfs_stats above: [reason * PFS_K_REFUSE_BUCKETS + slot index] */
+static DEFINE_PER_CPU(unsigned long [PFS_K_NR_REFUSALS], pfs_refusals);
+
+/* Count one refusal of the slot at index @taken, see pfs_take_slot(). */
+static inline void pfs_refuse_stat(enum pfs_k_refuse reason, unsigned int taken)
+{
+	unsigned int idx = min_t(unsigned int, taken, PFS_K_SLOT_IDX_MAX);
+
+	this_cpu_inc(pfs_refusals[reason * PFS_K_REFUSE_BUCKETS + idx]);
+}
+
 /* groups with a limit; while there are none, admission is a no-op */
 static atomic_t pfs_nr_limited;
 
@@ -742,6 +784,7 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 				 PFS_MIN_BUDGET_NS);
 		if (!left || left < min_left) {
 			/* the window timer retries, see pfs_arm_window_timer() */
+			pfs_refuse_stat(PFS_K_REFUSE_BUDGET, taken);
 			atomic_dec(&lg->nr_slots);
 			return PFS_RES_BUDGET;
 		}
@@ -759,6 +802,9 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 
 		if (excess) {
 			pfs_stat(PFS_K_STAT_PARK_DEBT);
+			pfs_refuse_stat(taken < limit / 1000 ?
+					PFS_K_REFUSE_DEBT_GUAR :
+					PFS_K_REFUSE_DEBT_FRAC, taken);
 			atomic_dec(&lg->nr_slots);
 			/*
 			 * Retry when the full slots, if any, would have paid
@@ -3759,19 +3805,36 @@ struct task_struct *pfs_get_dying_waiter(struct rq *rq)
 
 static int pfs_stats_show(struct seq_file *m, void *v)
 {
+	unsigned long refuse[PFS_K_NR_REFUSALS] = { };
 	unsigned long sum[PFS_K_NR_STATS] = { };
 	unsigned int nr_waiting = 0;
-	int cpu, i;
+	int cpu, i, j;
 
 	for_each_possible_cpu(cpu) {
 		for (i = 0; i < PFS_K_NR_STATS; i++)
 			sum[i] += per_cpu(pfs_stats, cpu)[i];
+		for (i = 0; i < PFS_K_NR_REFUSALS; i++)
+			refuse[i] += per_cpu(pfs_refusals, cpu)[i];
 		nr_waiting += READ_ONCE(cpu_rq(cpu)->pfs.nr_waiting);
 	}
 	seq_printf(m, "enabled %d\nlimited_groups %d\nwaiting %u\n",
 		   pfs_enabled() ? 1 : 0, atomic_read(&pfs_nr_limited), nr_waiting);
 	for (i = 0; i < PFS_K_NR_STATS; i++)
 		seq_printf(m, "%s %lu\n", pfs_stat_names[i], sum[i]);
+	/*
+	 * Appended after the counters above, which keep their labels, order
+	 * and one-value-per-line form: <reason>_<slot index> for the indices
+	 * below PFS_K_SLOT_IDX_MAX and <reason>_hi for the rest. A reader
+	 * wanting only the old fields is unaffected.
+	 */
+	for (i = 0; i < PFS_K_NR_REFUSE; i++) {
+		unsigned long *r = &refuse[i * PFS_K_REFUSE_BUCKETS];
+
+		for (j = 0; j < PFS_K_SLOT_IDX_MAX; j++)
+			seq_printf(m, "%s_%d %lu\n", pfs_refuse_names[i], j, r[j]);
+		seq_printf(m, "%s_hi %lu\n", pfs_refuse_names[i],
+			   r[PFS_K_SLOT_IDX_MAX]);
+	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(pfs_stats);

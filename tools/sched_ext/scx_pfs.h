@@ -58,4 +58,38 @@ enum pfs_stat_idx {
 	PFS_NR_STATS,
 };
 
+/*
+ * Slot index at which a refusal of take_slot() is counted; indices at or
+ * above it share the last bucket. A limited cgroup hands out ceil(limit)
+ * slots, so this covers limits below nine CPUs exactly.
+ */
+#define PFS_SLOT_IDX_MAX	8
+
+/*
+ * Why take_slot() refused a slot, and whether the refused slot was one of
+ * the floor(limit) guaranteed slots or the fractional one above them.
+ * park_debt alone cannot tell those apart, and the debt gate does refuse
+ * guaranteed slots: it runs for taken + 1 >= full, i.e. also for the last
+ * full slot, and for every index once the debt reached its cap. The budget
+ * gate runs only for taken >= full, so a budget refusal is never of a
+ * guaranteed slot and has no second class here.
+ *
+ * Kept apart from the kernel scheduler's enum pfs_k_refuse in
+ * kernel/sched/pfs.c on purpose: both end up in vmlinux BTF on a kernel
+ * built with CONFIG_DEBUG_INFO_BTF=y, and a shared enumerator name there is
+ * a redefinition clang refuses.
+ */
+enum pfs_refuse_idx {
+	PFS_REFUSE_BUDGET,	/* no tokens for the fractional slot */
+	PFS_REFUSE_DEBT_GUAR,	/* over the limit, taken < full */
+	PFS_REFUSE_DEBT_FRAC,	/* over the limit, taken >= full */
+
+	PFS_NR_REFUSE,
+};
+
+/* buckets per reason: the indices 0..PFS_SLOT_IDX_MAX-1 and one for the rest */
+#define PFS_REFUSE_BUCKETS	(PFS_SLOT_IDX_MAX + 1)
+/* entries of the flat slot_refuse array: [reason * BUCKETS + slot index] */
+#define PFS_NR_SLOT_REFUSE	(PFS_NR_REFUSE * PFS_REFUSE_BUCKETS)
+
 #endif /* __SCX_EXAMPLE_PFS_H */
