@@ -24,6 +24,10 @@ these from the environment:
 | `SSH_B`        | `user@host` of the node under test                    | required where used |
 | `LABEL_DOMAIN` | domain prefix for the throwaway k8s labels            | `pfs-test.example` |
 | `PFS_PUBLISH_DENY` | regex the fragment generators refuse to publish   | addresses, `@`, absolute paths |
+| `PFS_IMG`      | kernel build dir holding `arch/x86/boot/bzImage`      | `$PFS_WORK/fix3/b-pkgkpfs8` |
+| `PFS_BINDIR`   | directory holding the `scx_pfs` binaries              | `$PFS_WORK/fix3/hp/bin` |
+| `PFS_SCXBIN`   | the `scx_pfs` binary every scx arm loads             | `$PFS_BINDIR/cand-charge` |
+| `PFS_SCXBIN_<arm>` | that one arm's binary instead, e.g. `PFS_SCXBIN_scx3` | falls back to `PFS_SCXBIN` |
 
 A script that needs one of the required variables fails immediately with the
 message in its `${VAR:?...}` expansion rather than falling back to a guess.
@@ -168,6 +172,54 @@ uncorrected. Both are required.
 `mech.sh`, `mech2.sh`, `mech-rev.sh`, `mech-make.sh` with their guest side
 (`mech-guest.sh`) and queue drivers, plus `sample-groups.py` and `swlat.py`
 (switch-latency distribution from a trace).
+
+### What is being measured is read, not asserted
+
+`mech.sh` and `mech-make.sh` take the kernel image and the scheduler binary
+from `PFS_IMG`, `PFS_BINDIR`, `PFS_SCXBIN` and the per-arm `PFS_SCXBIN_<arm>`,
+defaulting to the paths the harness has always used. The guard line they print
+before the first boot states what is actually there:
+
+```
+guard: img=<path> release=<str|unknown> release_src=<kernel.release|file|none> \
+       bzimage_sha=<16 hex> scxbin=<path> scxbin_sha=<16 hex>
+```
+
+`release` comes from `$PFS_IMG/include/config/kernel.release`, which is what
+kbuild writes for the tree that produced the image (`Makefile:1410-1412`, part
+of `archprepare` at `:1429`); `file(1)` on the bzImage is the fallback, and if
+neither can be read the field says `release=unknown` with `release_src=none`.
+It is never omitted: a missing field reads as "not checked". There is no
+hardcoded commit in the guard any more - asserting a commit that is not the one
+under test silently mislabels every row the run produces, which matters most in
+exactly the runs that compare builds.
+
+Each boot's result file then carries its own provenance, so a reader never has
+to trust a directory name:
+
+```
+D prov boot=<name> img=<path> release=<str> release_src=<src> \
+       bzimage_sha=<hex> scxbin=<path> scxbin_sha=<hex> arm_bins="<arm>=<path> ..."
+```
+
+The row is inert to every analysis script: it does not match `^D arm=`, nor
+`^D boot kernel=\S+ arm=` (`final.py`'s position counter), nor
+`^D arm=\S+ cell=pg clients=`, nor the `load_before`/`load_after` scan, nor
+`^(\S+)\s+rc=` in `run.log` - checked against all of them.
+
+**Per-arm binaries.** `mech-guest.sh` takes the binary from `BIN` in the
+environment and bakes no path in, and `mech-pg.sh` never looks at it at all, so
+pointing one arm at its own build needs no change to the call chain:
+`PFS_SCXBIN_scx3=<path>` is enough. Two scx builds in **one boot** additionally
+need a second arm name, and `mech-guest.sh` does not accept one yet - it aborts
+with `R ABORT: unknown arm` on anything but `cfs`, `scx3` and `kpfs`, and the
+per-arm output directory is keyed on the arm name, so the same name twice would
+collide. Until that is extended, two builds are compared across two boots of
+the same family rather than within one.
+
+`mech2.sh`, `calib/run-calib.sh` and `calib/seqtest.sh` still hardcode the
+image, the binary and a commit in their guard lines. They are untouched here on
+purpose; the same four variables would apply to them unchanged.
 
 ## `kit/` - shared reduction and reporting
 
