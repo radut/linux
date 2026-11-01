@@ -220,13 +220,23 @@ def report(rounds_dir, seq_dir):
   # two-factor fit compares).
   for f, ref, test, label in (("f1", "cfs", "scx3", "F1  cfs vs scx_pfs, same boot"),
                               ("f3", "cfs", "kwidth", "F3  cfs vs kwidth, same boot"),
-                              ("m2", "scx3", "scx3b", "M2  scx_pfs build A vs build B, same boot")):
+                              ("m2", "scx3", "scx3b", "M2  scx_pfs build A vs build B, same boot"),
+                              ("m2", "cfs", "scx3", "M3  cfs vs scx_pfs, same boot (mech m2 naming)")):
       d = fam(f)
       print(f"\n=== {label} ===  boots: {' '.join(sorted(d))}")
       print("\n-- position effect, pos2/pos1 of tps --")
       positions(d, None)
       print("\n-- arm contrast, position-balanced --")
-      contrast(d, ref, test)
+      # A surface whose boots do not carry BOTH of its arms must say so. It used to print the
+      # header and no rows, which is indistinguishable from "measured, no difference": res-mix
+      # ran ARMS_M2="cfs scx3" into the m2 family, whose only surface then compared scx3b/scx3,
+      # and a whole node's contrast silently came back blank.
+      seen = {r[1] for rows in d.values() for r in rows}
+      if d and not {ref, test} <= seen:
+          print(f"   SKIPPED: these boots carry arms {{{', '.join(sorted(seen))}}}; "
+                f"this surface compares {test}/{ref}")
+      else:
+          contrast(d, ref, test)
 
   d2 = fam("f2")
   print(f"\n=== F2  kpfs alone (boot-only, no in-boot cfs) ===  boots: {' '.join(sorted(d2))}")
