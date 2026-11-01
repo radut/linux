@@ -31,7 +31,7 @@ def kept(res):
     rl = exclude.runlog_loads(res)
     out = []
     for fn in sorted(os.listdir(res)):
-        if not re.match(r"^(r\d+-f\d|s\d-[a-z0-9-]+)\.txt$", fn):
+        if not exclude.BOOT_FILE.match(fn):
             continue
         name = fn[:-4]
         if not exclude.check(os.path.join(res, fn), rl.get(name, [])):

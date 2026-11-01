@@ -37,6 +37,18 @@ THRESH_FRAC = 0.90
 THRESH_THR = 0.01
 THRESH_LOAD = 8.0
 
+# Which files in a result directory are boot files. This is a FILENAME filter and nothing else:
+# it decides what the rule is applied TO, never what the rule decides. It is widened, not
+# narrowed, every time a driver adds a boot-name shape, because a shape it does not match is
+# skipped in silence - and a rule that analyses zero boots prints "boots seen 0", which reads
+# like a clean result instead of like missing data. Shapes:
+#   r<N>-f<N>        the calibration rounds        run-calib.sh
+#   s<N>-<name>      the sequence test             seqtest.sh
+#   m<N>[x]-<name>   the mechanism phase 0+1       mech.sh, mech-make.sh
+#   p<N>[x]-<name>   the mechanism phase 2         mech2.sh
+# the last two optionally carrying the per-round suffix -r<N> that RTAG appends.
+BOOT_FILE = re.compile(r"^(r\d+-f\d|s\d-[a-z0-9-]+|[mp]\d+[a-z]?-[a-z0-9]+(?:-r\d+)?)\.txt$")
+
 def runlog_loads(res):
     """boot name -> loadavg fields, from a result dir's run.log.
 
@@ -96,7 +108,7 @@ def main(argv):
         continue
     rl = runlog_loads(res)
     for fn in sorted(os.listdir(res)):
-        if not re.match(r"^(r\d+-f\d|s\d-[a-z0-9-]+)\.txt$", fn):
+        if not BOOT_FILE.match(fn):
             continue
         name = fn[:-4]
         rows.append((os.path.basename(res), name,

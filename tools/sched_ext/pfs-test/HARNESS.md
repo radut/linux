@@ -28,6 +28,44 @@ these from the environment:
 A script that needs one of the required variables fails immediately with the
 message in its `${VAR:?...}` expansion rather than falling back to a guess.
 
+## Deployment: these scripts are not run from a bare checkout
+
+The host-side drivers address each other through `$PFS_WORK`, not relative to
+themselves - `run-calib.sh`, `seqtest.sh`, the queue drivers, `mech.sh`,
+`mech-rev.sh`, `mech-make.sh` and `mech2.sh` all spell their guest-side
+counterpart as **`$PFS_WORK/fix3/<dir>/<script>`**. They have to: the host
+environment does not reach the guest through `vng --exec`, so a boot's guest
+script is generated with absolute paths baked in. So the expected layout is
+
+```
+$PFS_WORK/fix3/calib/      \
+$PFS_WORK/fix3/mech/        > this directory's contents, copied or symlinked
+$PFS_WORK/fix3/rm2/        /
+$PFS_WORK/fix3/hp/bin/     <- the scx_pfs binary every driver checks for
+$PFS_WORK/fix3/b-*/        <- the kernel build trees the boots run
+$PFS_WORK/fix3/*/res-*/    <- where results land; the queue drivers poll these
+$PFS_WORK/p5/root/         <- the Postgres rootfs the cell driver runs
+$PFS_WORK/kbuild-*-src/    <- kernel source for the build-load cell
+```
+
+Running `mech.sh` or `run-calib.sh` straight out of a git checkout will not
+work, and the failure is a missing-file error from inside a guest rather than
+anything obvious.
+
+Two details worth knowing before chasing such an error:
+
+* The `rm2/` suite's **own** drivers (`rm2/su.sh`, `rm2/vmx.sh`) address
+  `$PFS_WORK/rm2/...`, not `$PFS_WORK/fix3/rm2/...`, because they predate the
+  `fix3/` generation. A work directory that runs both suites therefore has
+  `rm2/` in both places, and they are not required to be the same copy.
+* Everything reached *through* a generated guest script resolves relative to
+  itself, not through `$PFS_WORK`: `mech-guest.sh` -> `mech-pg.sh` ->
+  `sample-groups.py` and `rm2/conc-pids.py`, and `calib-guest.sh` /
+  `warmup-guest.sh` -> `rm2/pg-guest.sh`. Those are overridable with `MD`,
+  `CONC` and `PG` respectively. So only the placement of the directory *as a
+  whole* matters, and the warm-up provably runs the same cell driver as the
+  cells it protects.
+
 ## `calib/` - per-boot calibration and the two-factor fit
 
 The paired ratio between two schedulers has a sigma only across boots, so this
@@ -44,7 +82,14 @@ short still yields a smaller usable n.
   test (the same arm twice in a boot) and the queue drivers.
 * `exclude.py` - the boot exclusion rule, applied mechanically: a boot is dropped
   whole on under-delivery by the reference arm, or on a recorded load average
-  over the threshold.
+  over the threshold. Which files it treats as boot files is the single
+  `exclude.BOOT_FILE` pattern, reused by `final.py`; it covers the calibration
+  rounds, the sequence test and the `mech`/phase-2 boots. That pattern is a
+  filename filter only - it decides what the rule is applied to, never what the
+  rule decides - and it is widened whenever a driver adds a boot-name shape,
+  because an unmatched shape is skipped in silence and the run then reports
+  `boots seen 0`, which reads like a clean result instead of like missing
+  data.
 * `position.py` - the within-boot position effect as a number of its own.
 * `headline.py` - the equal-CPU work ratio at one limit, three ways.
 * `final.py` - the result over the kept boots: position effect, the **two-factor
