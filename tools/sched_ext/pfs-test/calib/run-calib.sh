@@ -6,15 +6,14 @@
 # run stopped early still gives a usable, smaller n.
 #
 # Families, and which of them can honour "baseline and variants in the same boot":
-#   F1  b-pkgkpfs8, no sched_pfs   cfs + scx3     IN-BOOT pair (scx loads and unloads at run time)
-#   F2  b-pkgkpfs8, sched_pfs=1    kpfs           NO in-boot CFS possible: kPFS is early_param only
+#   F1  $PFS_IMG, no sched_pfs     cfs + scx3     IN-BOOT pair (scx loads and unloads at run time)
+#   F2  $PFS_IMG, sched_pfs=1      kpfs           NO in-boot CFS possible: kPFS is early_param only
 #                                                 (pfs.c:59, pfs_boot_enable before any run queue),
 #                                                 so its baseline is F1's cfs run of the same round -
 #                                                 boot-adjacent, same session, same image.
-#   F3  b-pkgkwidth4, no sched_pfs cfs + kwidth   IN-BOOT pair (the width sysctl toggles at run time)
+#   F3  $PFS_IMG_KWIDTH, no sched_pfs  cfs + kwidth  IN-BOOT pair (the width sysctl toggles at run time)
 set -u
 S="${PFS_WORK:?set PFS_WORK to a writable work directory}"
-B=$S/fix3/hp/bin
 ROUNDS=${1:-5}
 O=${2:-$S/fix3/calib/res-$(date +%H%M%S)}; FIRST=${3:-1}; mkdir -p $O
 # 4G, as round 2 gave its Postgres boots: the harness loads pgbench scale 20 into a tmpfs, which
@@ -26,12 +25,49 @@ GATE_MAX=${GATE_MAX:-3600}
 # deficit without paying for the other two boots.
 FAMS=${FAMS:-"f1 f2 f3"}
 echo "OUT=$O rounds=$ROUNDS first=$FIRST mem=$MEM fams=$FAMS gate_max=${GATE_MAX}s"
-I1=$S/fix3/b-pkgkpfs8; I3=$S/fix3/b-pkgkwidth4
-for i in $I1 $I3; do
+# IDENTITY of what is being measured, parameterised and READ rather than asserted. The defaults
+# are the paths this harness has always used, so an existing deployment is unaffected; set the
+# variables to measure a different build without filing its rows under a directory named for
+# another one. There is no hardcoded commit anywhere: asserting a commit that is not the one
+# under test silently mislabels every row a run produces.
+#   PFS_IMG          kernel build directory holding arch/x86/boot/bzImage
+#   PFS_BINDIR       directory holding the scx_pfs binaries
+#   PFS_SCXBIN       the scx_pfs binary every scx arm loads
+#   PFS_SCXBIN_<arm> that one arm's binary instead, e.g. PFS_SCXBIN_scx3
+# Two images here: families f1/f2 boot the PFS build, f3 the kwidth build, so each has its own
+# variable and its own guard line.
+#   PFS_IMG_KWIDTH   the kwidth kernel build directory, for family f3
+IMG="${PFS_IMG:-$S/fix3/b-pkgkpfs8}"
+IMG_KW="${PFS_IMG_KWIDTH:-$S/fix3/b-pkgkwidth4}"
+BINDIR="${PFS_BINDIR:-$S/fix3/hp/bin}"
+SCXBIN="${PFS_SCXBIN:-$BINDIR/cand-charge}"
+# mech-guest.sh / calib-guest.sh take the binary from BIN in the environment and bake no path in,
+# so an arm can be pointed at its own build.
+armbin() { local v=PFS_SCXBIN_$1; echo "${!v:-$SCXBIN}"; }
+# The kernel release is read, never claimed. include/config/kernel.release is what kbuild writes
+# for the tree that produced the bzImage (Makefile:1410-1412, part of archprepare at :1429);
+# file(1) on the image is the fallback. If neither can be read the field says unknown, because an
+# omitted field reads as "not checked".
+krelease() {
+	local f=$1/include/config/kernel.release
+	[ -r "$f" ] && { printf '%s kernel.release\n' "$(tr -d '\n' < "$f")"; return; }
+	if command -v file > /dev/null 2>&1; then
+		local v; v=$(file -L "$1/arch/x86/boot/bzImage" 2>/dev/null | sed -n 's/.*version \([^ ]*\).*/\1/p')
+		[ -n "$v" ] && { printf '%s file\n' "$v"; return; }
+	fi
+	printf 'unknown none\n'; }
+# provof IMAGE -> the identity of that image and of the scx_pfs binary, all measured.
+provof() {
+	local rel src; read -r rel src <<< "$(krelease "$1")"
+	printf 'img=%s release=%s release_src=%s bzimage_sha=%s scxbin=%s scxbin_sha=%s' \
+		"$1" "$rel" "$src" "$(sha256sum "$1/arch/x86/boot/bzImage" | cut -c1-16)" \
+		"$SCXBIN" "$(sha256sum "$SCXBIN" | cut -c1-16)"; }
+for i in $IMG $IMG_KW; do
 	[ -f "$i/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $i"; echo CALIB-DONE; exit 1; }
 done
-[ -x $B/cand-charge ] || { echo "ABORT: no scx_pfs binary at $B/cand-charge"; echo CALIB-DONE; exit 1; }
-echo "guard: images present; scx_pfs = $(sha256sum $B/cand-charge | cut -c1-16) (d2370ce7e33b)"
+[ -x "$SCXBIN" ] || { echo "ABORT: no scx_pfs binary at $SCXBIN"; echo CALIB-DONE; exit 1; }
+echo "guard: role=f1f2 $(provof "$IMG")"
+echo "guard: role=f3   $(provof "$IMG_KW")"
 
 boot() { # NAME IMAGE KARGS ARMS...
 	local name=$1 img=$2 kargs=$3; shift 3
@@ -70,7 +106,7 @@ boot() { # NAME IMAGE KARGS ARMS...
 	printf 'bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' "$S" "$O" "$name" >> $O/$name.guest.sh
 	for a in "$@"; do
 		printf 'env BIN=%s KB=%s KSRC=%s bash %s/fix3/calib/calib-guest.sh %s %s/%s-%s\n' \
-			"$B/cand-charge" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
+			"$(armbin $a)" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
 	done
 	cat > $O/$name.run.sh <<EOG
 cd $img
@@ -79,6 +115,11 @@ EOG
 	timeout -k 10 1800 script -q -f -e -c "sg kvm -c 'bash $O/$name.run.sh'" $O/$name.console < /dev/null > /dev/null 2>&1
 	local rc=$?
 	cp $O/$name.console $O/$name.txt 2>/dev/null
+	# The result file carries its own provenance, so a later reader never has to trust a
+	# directory name for what kernel or binary produced these rows. $img, not a global:
+	# this driver boots more than one image.
+	local prov="D prov boot=$name $(provof "$img") arm_bins=\"$(for a in "$@"; do printf '%s=%s ' "$a" "$(armbin $a)"; done)\""
+	echo "$prov"; echo "$prov" >> $O/$name.txt
 	printf '%-14s rc=%-3s arms_done=%s  load_before="%s" load_after="%s"  %s\n' "$name" "$rc" \
 		"$(grep -c 'CALIB-ARM-DONE' $O/$name.txt 2>/dev/null)/warm=$(grep -c 'CALIB-WARMUP-DONE' $O/$name.txt 2>/dev/null)" "$l_before" \
 		"$(cut -d' ' -f1-3 /proc/loadavg)" "$(date -u +%T)"
@@ -88,9 +129,9 @@ EOG
 for r in $(seq $FIRST $((FIRST + ROUNDS - 1))); do
 	# arm order rotated per round so neither a warm cache nor a drifting host favours one arm
 	if [ $((r % 2)) -eq 1 ]; then f1="cfs scx3"; f3="cfs kwidth"; else f1="scx3 cfs"; f3="kwidth cfs"; fi
-	case " $FAMS " in *" f1 "*) boot "r$r-f1" $I1 ""            $f1   ;; esac
-	case " $FAMS " in *" f2 "*) boot "r$r-f2" $I1 "sched_pfs=1" kpfs  ;; esac
-	case " $FAMS " in *" f3 "*) boot "r$r-f3" $I3 ""            $f3   ;; esac
+	case " $FAMS " in *" f1 "*) boot "r$r-f1" $IMG    ""            $f1   ;; esac
+	case " $FAMS " in *" f2 "*) boot "r$r-f2" $IMG    "sched_pfs=1" kpfs  ;; esac
+	case " $FAMS " in *" f3 "*) boot "r$r-f3" $IMG_KW ""            $f3   ;; esac
 done
 echo "=== rows collected ==="
 grep -ch '^R ' $O/*.txt 2>/dev/null | paste -sd+ | bc 2>/dev/null

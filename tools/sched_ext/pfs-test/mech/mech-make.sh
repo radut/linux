@@ -19,6 +19,11 @@ O=${OUTDIR:-$S/fix3/mech/res-mechrev}
 MEM=${MEM:-4G}
 GATE_MAX=${GATE_MAX:-3600}
 ATTEMPTS=${ATTEMPTS:-3}
+# Which arms each family runs. Defaulted to what the mechanism phase has always run, so an
+# unset environment is unchanged. ARMS_M2="cfs scx3 scx3b" (or "scx3 scx3b") is the WITHIN-boot
+# way to compare two scx_pfs builds; point PFS_SCXBIN_scx3 and PFS_SCXBIN_scx3b at them.
+ARMS_M1=${ARMS_M1:-kpfs}
+ARMS_M2=${ARMS_M2:-"cfs scx3"}
 LIMITS=${LIMITS:-"2.001 2 4.001 4"}
 # IDENTITY of what is being measured, parameterised and READ rather than asserted. The defaults
 # are the paths this harness has always used, so an existing deployment is unaffected; set the
@@ -47,12 +52,17 @@ krelease() {
 		[ -n "$v" ] && { printf '%s file\n' "$v"; return; }
 	fi
 	printf 'unknown none\n'; }
+# provof IMAGE -> the identity of that image and of the scx_pfs binary, all measured.
+provof() {
+	local rel src; read -r rel src <<< "$(krelease "$1")"
+	printf 'img=%s release=%s release_src=%s bzimage_sha=%s scxbin=%s scxbin_sha=%s' \
+		"$1" "$rel" "$src" "$(sha256sum "$1/arch/x86/boot/bzImage" | cut -c1-16)" \
+		"$SCXBIN" "$(sha256sum "$SCXBIN" | cut -c1-16)"; }
 [ $# -gt 0 ] || { echo "nothing to make up"; echo MAKEUP-DONE $(date -u +%T); exit 0; }
 echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s attempts=$ATTEMPTS limits=$LIMITS boots=$*"
 [ -f "$IMG/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $IMG"; echo MAKEUP-DONE; exit 1; }
 [ -x "$SCXBIN" ] || { echo "ABORT: no scx_pfs binary at $SCXBIN"; echo MAKEUP-DONE; exit 1; }
-read -r REL REL_SRC <<< "$(krelease "$IMG")"
-PROV="img=$IMG release=$REL release_src=$REL_SRC bzimage_sha=$(sha256sum "$IMG/arch/x86/boot/bzImage" | cut -c1-16) scxbin=$SCXBIN scxbin_sha=$(sha256sum "$SCXBIN" | cut -c1-16)"
+PROV="$(provof "$IMG")"
 echo "guard: $PROV"
 
 boot() { # NAME KARGS ARMS...
@@ -98,8 +108,8 @@ while [ ${#queue[@]} -gt 0 ]; do
 	nm=${queue[0]}; queue=("${queue[@]:1}")
 	n=$(( ${tries[$nm]:-0} + 1 )); tries[$nm]=$n
 	case $nm in
-	m1-*)	kargs="sched_pfs=1"; arms="kpfs" ;;
-	m2-*)	kargs="";            arms="cfs scx3" ;;
+	m1-*)	kargs="sched_pfs=1"; arms="$ARMS_M1" ;;
+	m2-*)	kargs="";            arms="$ARMS_M2" ;;
 	*)	echo "SKIPPED-FINAL $nm: unknown boot name, no family to boot it as"; continue ;;
 	esac
 	[ $n -gt 1 ] && echo "=== retry $n/$ATTEMPTS of $nm  $(date -u +%T) ==="

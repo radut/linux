@@ -16,17 +16,48 @@
 # Same cells as the calibration: calib-guest.sh is called unchanged.
 set -u
 S="${PFS_WORK:?set PFS_WORK to a writable work directory}"
-B=$S/fix3/hp/bin
 O=${1:-$S/fix3/calib/res-seq}; mkdir -p $O
 MEM=${MEM:-4G}
 GATE_MAX=${GATE_MAX:-3600}
 # Which of the three boots to run, so a lost boot can be re-run on its own.
 BOOTS=${BOOTS:-"s1 s2 s3"}
-I1=$S/fix3/b-pkgkpfs8
+# IDENTITY of what is being measured, parameterised and READ rather than asserted. The defaults
+# are the paths this harness has always used, so an existing deployment is unaffected; set the
+# variables to measure a different build without filing its rows under a directory named for
+# another one. There is no hardcoded commit anywhere: asserting a commit that is not the one
+# under test silently mislabels every row a run produces.
+#   PFS_IMG          kernel build directory holding arch/x86/boot/bzImage
+#   PFS_BINDIR       directory holding the scx_pfs binaries
+#   PFS_SCXBIN       the scx_pfs binary every scx arm loads
+#   PFS_SCXBIN_<arm> that one arm's binary instead, e.g. PFS_SCXBIN_scx3
+IMG="${PFS_IMG:-$S/fix3/b-pkgkpfs8}"
+BINDIR="${PFS_BINDIR:-$S/fix3/hp/bin}"
+SCXBIN="${PFS_SCXBIN:-$BINDIR/cand-charge}"
+# mech-guest.sh / calib-guest.sh take the binary from BIN in the environment and bake no path in,
+# so an arm can be pointed at its own build.
+armbin() { local v=PFS_SCXBIN_$1; echo "${!v:-$SCXBIN}"; }
+# The kernel release is read, never claimed. include/config/kernel.release is what kbuild writes
+# for the tree that produced the bzImage (Makefile:1410-1412, part of archprepare at :1429);
+# file(1) on the image is the fallback. If neither can be read the field says unknown, because an
+# omitted field reads as "not checked".
+krelease() {
+	local f=$1/include/config/kernel.release
+	[ -r "$f" ] && { printf '%s kernel.release\n' "$(tr -d '\n' < "$f")"; return; }
+	if command -v file > /dev/null 2>&1; then
+		local v; v=$(file -L "$1/arch/x86/boot/bzImage" 2>/dev/null | sed -n 's/.*version \([^ ]*\).*/\1/p')
+		[ -n "$v" ] && { printf '%s file\n' "$v"; return; }
+	fi
+	printf 'unknown none\n'; }
+# provof IMAGE -> the identity of that image and of the scx_pfs binary, all measured.
+provof() {
+	local rel src; read -r rel src <<< "$(krelease "$1")"
+	printf 'img=%s release=%s release_src=%s bzimage_sha=%s scxbin=%s scxbin_sha=%s' \
+		"$1" "$rel" "$src" "$(sha256sum "$1/arch/x86/boot/bzImage" | cut -c1-16)" \
+		"$SCXBIN" "$(sha256sum "$SCXBIN" | cut -c1-16)"; }
 echo "OUT=$O mem=$MEM boots=$BOOTS gate_max=${GATE_MAX}s"
-[ -f "$I1/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $I1"; echo SEQ-DONE; exit 1; }
-[ -x $B/cand-charge ] || { echo "ABORT: no scx_pfs binary at $B/cand-charge"; echo SEQ-DONE; exit 1; }
-echo "guard: image present; scx_pfs = $(sha256sum $B/cand-charge | cut -c1-16) (d2370ce7e33b)"
+[ -f "$IMG/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $IMG"; echo SEQ-DONE; exit 1; }
+[ -x "$SCXBIN" ] || { echo "ABORT: no scx_pfs binary at $SCXBIN"; echo SEQ-DONE; exit 1; }
+echo "guard: $(provof "$IMG")"
 
 boot() { # NAME IMAGE WARMUP ARM1 ARM2
 	local name=$1 img=$2 warm=$3 a1=$4 a2=$5
@@ -51,7 +82,7 @@ boot() { # NAME IMAGE WARMUP ARM1 ARM2
 	local i=1
 	for a in "$a1" "$a2"; do
 		printf 'env BIN=%s KB=%s KSRC=%s bash %s/fix3/calib/calib-guest.sh %s %s/%s-p%s-%s\n' \
-			"$B/cand-charge" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$i" "$a" >> $O/$name.guest.sh
+			"$(armbin $a)" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$i" "$a" >> $O/$name.guest.sh
 		i=$((i + 1))
 	done
 	cat > $O/$name.run.sh <<EOG
@@ -61,6 +92,11 @@ EOG
 	timeout -k 10 1800 script -q -f -e -c "sg kvm -c 'bash $O/$name.run.sh'" $O/$name.console < /dev/null > /dev/null 2>&1
 	local rc=$?
 	cp $O/$name.console $O/$name.txt 2>/dev/null
+	# The result file carries its own provenance, so a later reader never has to trust a
+	# directory name for what kernel or binary produced these rows. $img, not a global:
+	# this driver boots more than one image.
+	local prov="D prov boot=$name $(provof "$img") arm_bins=\"$(for a in "$a1" "$a2"; do printf '%s=%s ' "$a" "$(armbin $a)"; done)\""
+	echo "$prov"; echo "$prov" >> $O/$name.txt
 	printf '%-16s rc=%-3s arms_done=%s warm=%s  load_before="%s" load_after="%s"  %s\n' "$name" "$rc" \
 		"$(grep -c 'CALIB-ARM-DONE' $O/$name.txt 2>/dev/null)" \
 		"$(grep -c 'CALIB-WARMUP-DONE' $O/$name.txt 2>/dev/null)" "$l_before" \
@@ -70,9 +106,9 @@ EOG
 	echo "D boot=$name load_before=\"$l_before\" load_after=\"$(cut -d' ' -f1-3 /proc/loadavg)\"" >> $O/$name.txt
 }
 
-case " $BOOTS " in *" s1 "*) boot "s1-cfs-warm"   $I1 1 cfs  cfs  ;; esac
-case " $BOOTS " in *" s2 "*) boot "s2-scx3-warm"  $I1 1 scx3 scx3 ;; esac
-case " $BOOTS " in *" s3 "*) boot "s3-cfs-nowarm" $I1 0 cfs  cfs  ;; esac
+case " $BOOTS " in *" s1 "*) boot "s1-cfs-warm"   $IMG 1 cfs  cfs  ;; esac
+case " $BOOTS " in *" s2 "*) boot "s2-scx3-warm"  $IMG 1 scx3 scx3 ;; esac
+case " $BOOTS " in *" s3 "*) boot "s3-cfs-nowarm" $IMG 0 cfs  cfs  ;; esac
 echo "=== rows collected ==="
 grep -ch '^R ' $O/*.txt 2>/dev/null | paste -sd+ | bc 2>/dev/null
 echo SEQ-DONE $(date -u +%T)

@@ -24,8 +24,14 @@ export CL=${CL:-16}
 echo "D boot kernel=$(uname -r) arm=$ARM cpus=$(nproc) cmdline_pfs=$(grep -c sched_pfs=1 /proc/cmdline) limits=$LIMITS cl=$CL"
 
 case $ARM in
-scx3)	export SF=/tmp/scxcg SCXS=1 SCXL=$O/scx-stats.log
-	${BIN:?BIN required for scx3} -i 1 -S $SF > $SCXL 2>&1 & SP=$!
+scx3|scx3b)
+	# One branch, two names. scx3b exists so that TWO scx_pfs builds can be measured inside one
+	# boot - the caller points BIN at a different binary per arm (PFS_SCXBIN_scx3,
+	# PFS_SCXBIN_scx3b in mech.sh) - and it must therefore differ from scx3 in nothing but the
+	# name, or the contrast would measure the harness as well as the two builds. SCXL lands in
+	# the per-arm output directory, so the two loaders do not share a log.
+	export SF=/tmp/scxcg SCXS=1 SCXL=$O/scx-stats.log
+	${BIN:?BIN required for arm $ARM} -i 1 -S $SF > $SCXL 2>&1 & SP=$!
 	for i in $(seq 100); do [ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" = enabled ] && break; sleep 0.1; done
 	st=$(cat /sys/kernel/sched_ext/state 2>/dev/null)
 	echo "D arm=$ARM scx_state=$st stats_file=$SF log=$SCXL"
@@ -50,6 +56,10 @@ echo "D arm=$ARM cleanup postgres=$(pgrep -xc postgres 2>/dev/null || echo 0) me
 
 if [ -n "$SP" ]; then
 	kill -INT $SP 2>/dev/null; wait $SP 2>/dev/null
+	# Wait for sched_ext to actually leave "enabled" before this arm's process exits. With two scx
+	# arms in one boot the next loader attaches straight after, and would fail if the previous one
+	# were still attached. Bounded at 10 s, and the state reached is printed either way.
+	for i in $(seq 100); do [ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" = enabled ] || break; sleep 0.1; done
 	echo "D arm=$ARM scx_unloaded state=$(cat /sys/kernel/sched_ext/state 2>/dev/null) scx_log_lines=$(wc -l < $SCXL 2>/dev/null)"
 fi
 echo "CALIB-ARM-DONE arm=$ARM"

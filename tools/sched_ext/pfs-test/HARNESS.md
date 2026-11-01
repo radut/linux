@@ -28,6 +28,8 @@ these from the environment:
 | `PFS_BINDIR`   | directory holding the `scx_pfs` binaries              | `$PFS_WORK/fix3/hp/bin` |
 | `PFS_SCXBIN`   | the `scx_pfs` binary every scx arm loads             | `$PFS_BINDIR/cand-charge` |
 | `PFS_SCXBIN_<arm>` | that one arm's binary instead, e.g. `PFS_SCXBIN_scx3` | falls back to `PFS_SCXBIN` |
+| `PFS_IMG_KWIDTH` | the kwidth kernel build, for `run-calib.sh`'s family f3 | `$PFS_WORK/fix3/b-pkgkwidth4` |
+| `ARMS_M1`, `ARMS_M2` | which arms `mech.sh`/`mech-make.sh` run per family | `kpfs`, `cfs scx3` |
 
 A script that needs one of the required variables fails immediately with the
 message in its `${VAR:?...}` expansion rather than falling back to a guess.
@@ -217,9 +219,59 @@ per-arm output directory is keyed on the arm name, so the same name twice would
 collide. Until that is extended, two builds are compared across two boots of
 the same family rather than within one.
 
-`mech2.sh`, `calib/run-calib.sh` and `calib/seqtest.sh` still hardcode the
-image, the binary and a commit in their guard lines. They are untouched here on
-purpose; the same four variables would apply to them unchanged.
+`mech2.sh`, `calib/run-calib.sh` and `calib/seqtest.sh` take the same
+variables and print the same measured guard. `run-calib.sh` boots two images and
+so prints two guard lines, `role=f1f2` for the PFS build and `role=f3` for the
+`PFS_IMG_KWIDTH` build, and each boot's `D prov` row carries the image **that
+boot** used rather than a global. No driver in the tree asserts a commit any
+more.
+
+### Comparing two scheduler builds inside one boot
+
+`mech-guest.sh` accepts a second scx arm, **`scx3b`**, handled by the same
+branch as `scx3` and differing in nothing but the name - same cells, same `BIN`
+handling, same row conventions - so a `scx3` vs `scx3b` contrast measures the
+two binaries and not the harness. Point them at the two builds and ask for both:
+
+```
+ARMS_M2="scx3 scx3b" \
+PFS_SCXBIN_scx3=<build A> PFS_SCXBIN_scx3b=<build B> \
+  bash mech/mech.sh <outdir>
+```
+
+Each arm gets its own output directory (`<boot>-scx3`, `<boot>-scx3b`) and so
+its own `scx-stats.log`, and the `D prov` row's `arm_bins` field records which
+binary each arm actually loaded. The scx teardown now waits for
+`/sys/kernel/sched_ext/state` to leave `enabled` before an arm's process exits,
+bounded at 10 s, because the next arm's loader attaches immediately after.
+
+**Use two arms, not three.** `ARMS_M2="cfs scx3 scx3b"` runs fine and the rows
+are all there, but `final.py` and `position.py` compare position 1 against
+position 2 only (`final.py:170`, `position.py:43-44`), so a third arm's cells
+are not in any contrast. Within-boot build comparison therefore wants exactly
+two arms, with the order alternated across rounds (`ARMS_M2="scx3 scx3b"` and
+`ARMS_M2="scx3b scx3"`) so position is balanced the same way the reversed cell
+order balances it.
+
+**What the analysis does and does not know about arm names.** `exclude.py`,
+`final.py`'s `read()`/`positions()`, and `position.py` treat the arm as an
+opaque label, so `scx3b` flows through them unchanged - verified. Three places
+enumerate arm names and would need a decision, not a widening, before they
+report a `scx3b` contrast:
+
+* `calib/final.py:208-209` - the family pairing is the literal list
+  `("f1", "cfs", "scx3")`, `("f3", "cfs", "kwidth")`.
+* `calib/report.py:48` - `PAIRS = [("scx3", "cfs", ...), ("kwidth", "cfs", ...),
+  ("kpfs", "cfs", ...)]`.
+* `calib/headline.py:40,49,52-54` - `cfs` and `scx3` by name throughout; it is
+  the scx3/cfs headline by definition.
+
+`rm2/summ2.py:9` has a fixed default variant list but takes it on argv and keys
+on the `v=` field of an `R` row rather than on the arm, so it is unaffected.
+`calib/position.py:17` additionally has its own boot-filename pattern
+(`^r(\d+)-(f\d)\.txt$`) keyed on round and family, which no `m*`/`p*` boot
+name carries - a separate question from the `exclude.BOOT_FILE` widening,
+because "family" has no meaning for a mech boot.
 
 ## `kit/` - shared reduction and reporting
 

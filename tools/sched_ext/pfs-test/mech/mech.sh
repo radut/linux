@@ -1,8 +1,8 @@
 #!/bin/bash
 # mech.sh [OUTDIR] : phases 0 and 1 of the mechanism investigation, two boots.
 #
-#   m1-kpfs   b-pkgkpfs8 sched_pfs=1   kpfs        Q2: why only 3.23-3.37 of 4 CPUs at 16 clients
-#   m2-f1     b-pkgkpfs8               cfs scx3    Q1: equal CPU, 0.58-0.73 of the work
+#   m1-kpfs   $PFS_IMG sched_pfs=1   $ARMS_M1   Q2: why only 3.23-3.37 of 4 CPUs at 16 clients
+#   m2-f1     $PFS_IMG               $ARMS_M2   Q1: equal CPU, 0.58-0.73 of the work
 #
 # Both boots run limits 4, 4.001, 2, 2.001 x {tpcb, select} at 16 clients. The 4/4.001 pair is
 # the width experiment: both schedulers ceil the limit to a concurrency cap, so 4001 mcpu buys a
@@ -19,6 +19,11 @@ GATE_MAX=${GATE_MAX:-3600}
 # RTAG keeps the per-round boots apart in one outdir; LIMITS is baked into the generated guest
 # script because the host environment does not reach the guest through vng --exec.
 RTAG=${RTAG:-}
+# Which arms each family runs. Defaulted to what the mechanism phase has always run, so an
+# unset environment is unchanged. ARMS_M2="cfs scx3 scx3b" (or "scx3 scx3b") is the WITHIN-boot
+# way to compare two scx_pfs builds; point PFS_SCXBIN_scx3 and PFS_SCXBIN_scx3b at them.
+ARMS_M1=${ARMS_M1:-kpfs}
+ARMS_M2=${ARMS_M2:-"cfs scx3"}
 LIMITS=${LIMITS:-"4 4.001 2 2.001"}
 # IDENTITY of what is being measured, parameterised and READ rather than asserted. The defaults
 # are the paths this harness has always used, so an existing deployment is unaffected; set the
@@ -47,11 +52,16 @@ krelease() {
 		[ -n "$v" ] && { printf '%s file\n' "$v"; return; }
 	fi
 	printf 'unknown none\n'; }
-echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s rtag=${RTAG:-none} limits=$LIMITS"
+# provof IMAGE -> the identity of that image and of the scx_pfs binary, all measured.
+provof() {
+	local rel src; read -r rel src <<< "$(krelease "$1")"
+	printf 'img=%s release=%s release_src=%s bzimage_sha=%s scxbin=%s scxbin_sha=%s' \
+		"$1" "$rel" "$src" "$(sha256sum "$1/arch/x86/boot/bzImage" | cut -c1-16)" \
+		"$SCXBIN" "$(sha256sum "$SCXBIN" | cut -c1-16)"; }
+echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s rtag=${RTAG:-none} limits=$LIMITS arms_m1=\"$ARMS_M1\" arms_m2=\"$ARMS_M2\""
 [ -f "$IMG/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $IMG"; echo MECH-DONE; exit 1; }
 [ -x "$SCXBIN" ] || { echo "ABORT: no scx_pfs binary at $SCXBIN"; echo MECH-DONE; exit 1; }
-read -r REL REL_SRC <<< "$(krelease "$IMG")"
-PROV="img=$IMG release=$REL release_src=$REL_SRC bzimage_sha=$(sha256sum "$IMG/arch/x86/boot/bzImage" | cut -c1-16) scxbin=$SCXBIN scxbin_sha=$(sha256sum "$SCXBIN" | cut -c1-16)"
+PROV="$(provof "$IMG")"
 echo "guard: $PROV"
 
 boot() { # NAME KARGS ARMS...
@@ -94,8 +104,8 @@ EOG
 	echo "D boot=$name load_before=\"$l_before\" load_after=\"$(cut -d' ' -f1-3 /proc/loadavg)\"" >> $O/$name.txt
 }
 
-boot "m1-kpfs$RTAG" "sched_pfs=1" kpfs
-boot "m2-f1$RTAG"   ""            cfs scx3
+boot "m1-kpfs$RTAG" "sched_pfs=1" $ARMS_M1
+boot "m2-f1$RTAG"   ""            $ARMS_M2
 echo "=== rows collected ==="
 grep -ch '^R ' $O/*.txt 2>/dev/null | paste -sd+ | bc 2>/dev/null
 echo MECH-DONE $(date -u +%T)
