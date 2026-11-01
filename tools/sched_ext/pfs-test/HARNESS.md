@@ -71,6 +71,14 @@ Two details worth knowing before chasing such an error:
   `CONC` and `PG` respectively. So only the placement of the directory *as a
   whole* matters, and the warm-up provably runs the same cell driver as the
   cells it protects.
+* **`vng --exec` does not carry the host environment into the guest.** Anything
+  a guest-side script requires must therefore be baked into the generated
+  `*.guest.sh` line, which is why those lines spell out `PFS_WORK`, `BIN`,
+  `LIMITS`, `KB` and `KSRC` explicitly. A guest-side script may rely on the
+  environment only for a variable that has a working `${VAR:-default}`. The
+  test for this is to run a generated line under `env -i`: if it trips a
+  `${VAR:?}` guard there, it will die in the guest too, however well it works
+  from the launcher's shell.
 
 ## `calib/` - per-boot calibration and the two-factor fit
 
@@ -245,33 +253,70 @@ binary each arm actually loaded. The scx teardown now waits for
 `/sys/kernel/sched_ext/state` to leave `enabled` before an arm's process exits,
 bounded at 10 s, because the next arm's loader attaches immediately after.
 
-**Use two arms, not three.** `ARMS_M2="cfs scx3 scx3b"` runs fine and the rows
-are all there, but `final.py` and `position.py` compare position 1 against
-position 2 only (`final.py:170`, `position.py:43-44`), so a third arm's cells
-are not in any contrast. Within-boot build comparison therefore wants exactly
-two arms, with the order alternated across rounds (`ARMS_M2="scx3 scx3b"` and
-`ARMS_M2="scx3b scx3"`) so position is balanced the same way the reversed cell
-order balances it.
+**The locality run is two arms, and three would be wrong - not merely
+discouraged.** `final.py` and `position.py` compute a contrast between position
+1 and position 2 and nothing else (`final.py:170`, `position.py:43-44`). With
+three arms there are three positions, so one arm's cells sit outside the only
+contrast that exists: `ARMS_M2="cfs scx3 scx3b"` would put `cfs` and `scx3` in
+the compared pair and leave `scx3b` - one of the two builds the run exists to
+compare - in position 3, contributing rows that no number is computed from. And
+`cfs` is not wanted in that boot for its own sake either: the question is build
+A against build B at equal CPU, which the `scx3`/`scx3b` pair answers directly.
+So:
 
-**What the analysis does and does not know about arm names.** `exclude.py`,
-`final.py`'s `read()`/`positions()`, and `position.py` treat the arm as an
-opaque label, so `scx3b` flows through them unchanged - verified. Three places
-enumerate arm names and would need a decision, not a widening, before they
-report a `scx3b` contrast:
+```
+round 1, 3, 5 …   ARMS_M2="scx3 scx3b"
+round 2, 4, 6 …   ARMS_M2="scx3b scx3"
+```
 
-* `calib/final.py:208-209` - the family pairing is the literal list
-  `("f1", "cfs", "scx3")`, `("f3", "cfs", "kwidth")`.
-* `calib/report.py:48` - `PAIRS = [("scx3", "cfs", ...), ("kwidth", "cfs", ...),
-  ("kpfs", "cfs", ...)]`.
-* `calib/headline.py:40,49,52-54` - `cfs` and `scx3` by name throughout; it is
-  the scx3/cfs headline by definition.
+Alternating the order across rounds puts each build in each position equally
+often, which cancels position exactly the way the reversed cell order cancels
+it for the kPFS arm, and the two-factor fit in `final.py` then weights the two
+positions equally. One consequence to be aware of: with no `cfs` arm in the
+boot, the exclusion rule's delivery test (A) cannot fire - it is restricted to
+`cfs` on purpose - so those boots are evaluated by the load test (B) alone.
 
+**What the analysis knows about arm names.** `exclude.py`, `final.py`'s
+`read()`/`positions()`, and `position.py` treat the arm as an opaque label, so
+`scx3b` flows through them unchanged. The two pairing lists carry it
+explicitly, **appended** to what was there - no existing pairing was altered,
+reordered or removed, because this is a pre-registered analysis surface:
+
+* `calib/final.py:208-212` - `("m2", "scx3", "scx3b", "M2 …")` after the
+  existing `f1` and `f3` entries.
+* `calib/report.py:48-52` - `("scx3b", "scx3", "in-boot")` after the existing
+  three.
+
+`calib/headline.py` is deliberately untouched: it is the scx3-vs-cfs headline at
+one limit by definition, and the locality contrast is not that.
 `rm2/summ2.py:9` has a fixed default variant list but takes it on argv and keys
 on the `v=` field of an `R` row rather than on the arm, so it is unaffected.
-`calib/position.py:17` additionally has its own boot-filename pattern
-(`^r(\d+)-(f\d)\.txt$`) keyed on round and family, which no `m*`/`p*` boot
-name carries - a separate question from the `exclude.BOOT_FILE` widening,
-because "family" has no meaning for a mech boot.
+
+### Which files are boot files, and whose - one definition
+
+`exclude.BOOT_FILE` decides what the exclusion rule is applied to.
+`exclude.boot_id()` beside it answers the related question of **which family and
+round** a boot name carries, and `position.py` and `report.py` both import it.
+They each used to keep their own copy, and each silently saw zero `m*`/`p*`
+boots as a result - `position.py` matched only `^r(\d+)-(f\d)\.txt$` and
+`report.py` globbed only `r*-f*.txt`, so a `res-mech` or `res-mechrev`
+directory produced an empty table rather than a result.
+
+The leading token **is** the family: `mech.sh`'s header documents `m1` as the
+kPFS family and `m2` as the cfs+scx family, and `mech2.sh` continues them as
+`p1`, `p1b` and `p2`, exactly as `f1`/`f2`/`f3` name the calibration families. A
+boot with no `-r<N>` suffix reports round 0.
+
+`boot_id()` deliberately does **not** match the `s<N>-` sequence boots that
+`BOOT_FILE` does: those carry neither a family nor a round, have never been in
+these two reports, and have their own section in `final.py`. That is the only
+way the two disagree, and it is asserted in the checks rather than left to
+inspection.
+
+`final.py`'s family selector accepts both spellings - an `f<N>` family is
+matched against the calibration shape `r<N>-f<N>` only, and `m*`/`p*` families
+against the leading token - so a mech boot that happens to end in `f1`, such as
+`m2-f1`, cannot be pulled into family `f1`.
 
 ## `kit/` - shared reduction and reporting
 

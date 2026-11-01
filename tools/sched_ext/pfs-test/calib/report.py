@@ -7,6 +7,8 @@ MDD = the smallest difference the cell can call at 80% power with that many boot
 import glob, importlib.util, math, os, re, statistics, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here)
+from exclude import boot_id   # the one definition of "which files are boots, and whose"
 spec = importlib.util.spec_from_file_location("boots", os.path.join(here, "boots.py"))
 B = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(B)
@@ -18,11 +20,13 @@ rows = {}
 def put(rnd, arm, key, val):
     rows.setdefault((rnd, arm), {})[key] = val
 
-for path in sorted(glob.glob(os.path.join(resdir, "r*-f*.txt"))):
-    m = re.match(r"r(\d+)-f(\d)", os.path.basename(path))
-    if not m:
+# Every boot file, not only r*-f*: the old glob meant a res-mech or res-mechrev directory
+# produced an empty table rather than a result. The round is the one boot_id() reports.
+for path in sorted(glob.glob(os.path.join(resdir, "*.txt"))):
+    ident = boot_id(os.path.basename(path))
+    if ident is None:
         continue
-    rnd, arm = int(m.group(1)), None
+    rnd, arm = ident[0], None
     for line in open(path, errors="replace"):
         d = re.search(r"^D arm=(\S+)", line)
         if d:
@@ -45,7 +49,11 @@ for path in sorted(glob.glob(os.path.join(resdir, "r*-f*.txt"))):
                 pass
 
 rounds = sorted({r for r, _ in rows})
-PAIRS = [("scx3", "cfs", "in-boot"), ("kwidth", "cfs", "in-boot"), ("kpfs", "cfs", "boot-adjacent")]
+# Appended to, never reordered or removed: this is a pre-registered analysis surface.
+# ("scx3b", "scx3") is the within-boot contrast of two scx_pfs builds, from a boot run with
+# ARMS_M2="scx3 scx3b".
+PAIRS = [("scx3", "cfs", "in-boot"), ("kwidth", "cfs", "in-boot"), ("kpfs", "cfs", "boot-adjacent"),
+         ("scx3b", "scx3", "in-boot")]
 cells = sorted({k for v in rows.values() for k in v})
 
 def mdd(n, sigma, want=0.80):

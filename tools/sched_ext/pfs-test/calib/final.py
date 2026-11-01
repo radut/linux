@@ -198,15 +198,29 @@ def contrast(data, ref, test):
 def report(rounds_dir, seq_dir):
   k4 = kept(rounds_dir)
   ks = kept(seq_dir) if seq_dir != rounds_dir else k4
-  fam = lambda f: {n: d for n, d in load(rounds_dir, [x for x in k4 if x.endswith(f)]).items()}
+  # Family selector. The calibration boots carry their family as the name's SUFFIX (r4-f1), the
+  # mechanism boots as its leading TOKEN (m2-f1-r1, p1b-kpfs-r2). An f<N> family is matched only
+  # against the calibration shape, so a mech boot that happens to end in f1 (m2-f1) cannot be
+  # pulled into family f1; for the r<N>-f<N> names this selects exactly what the previous
+  # endswith() selected.
+  def famsel(f):
+      if re.fullmatch(r"f\d", f):
+          return [x for x in k4 if re.fullmatch(r"r\d+-f\d", x) and x.endswith(f)]
+      return [x for x in k4 if x.split("-")[0] == f]
+  fam = lambda f: {n: d for n, d in load(rounds_dir, famsel(f)).items()}
 
   print("kept boots")
   print(f"  {os.path.basename(rounds_dir):<7}  {len(k4):2d}  {' '.join(sorted(k4, key=round_key))}")
   if seq_dir != rounds_dir:
       print(f"  {os.path.basename(seq_dir):<7}  {len(ks):2d}  {' '.join(sorted(ks))}")
 
+  # Appended to, never reordered or removed: this is a pre-registered analysis surface. The M2
+  # entry is the within-boot contrast of two scx_pfs builds, from boots run with
+  # ARMS_M2="scx3 scx3b" (two arms, so each build occupies one of the two positions the
+  # two-factor fit compares).
   for f, ref, test, label in (("f1", "cfs", "scx3", "F1  cfs vs scx_pfs, same boot"),
-                              ("f3", "cfs", "kwidth", "F3  cfs vs kwidth, same boot")):
+                              ("f3", "cfs", "kwidth", "F3  cfs vs kwidth, same boot"),
+                              ("m2", "scx3", "scx3b", "M2  scx_pfs build A vs build B, same boot")):
       d = fam(f)
       print(f"\n=== {label} ===  boots: {' '.join(sorted(d))}")
       print("\n-- position effect, pos2/pos1 of tps --")

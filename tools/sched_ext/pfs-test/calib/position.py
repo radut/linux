@@ -11,13 +11,16 @@ pg-guest.sh and is always 'cfs', whatever arm is running - it is not an arm labe
 """
 import os, re, sys, statistics as st
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exclude import boot_id   # the one definition of "which files are boots, and whose"
+
 res = sys.argv[1]
 rows = []  # (round, family, position, arm, cell, metric) -> value
 for fn in sorted(os.listdir(res)):
-    m = re.match(r"^r(\d+)-(f\d)\.txt$", fn)
-    if not m:
+    ident = boot_id(fn)
+    if ident is None:
         continue
-    rnd, fam = int(m.group(1)), m.group(2)
+    rnd, fam = ident
     arm, clients, pos, seen = None, None, 0, set()
     for line in open(os.path.join(res, fn), errors="replace"):
         line = line.replace("\r", "")

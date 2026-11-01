@@ -49,6 +49,32 @@ THRESH_LOAD = 8.0
 # the last two optionally carrying the per-round suffix -r<N> that RTAG appends.
 BOOT_FILE = re.compile(r"^(r\d+-f\d|s\d-[a-z0-9-]+|[mp]\d+[a-z]?-[a-z0-9]+(?:-r\d+)?)\.txt$")
 
+# The family and round a boot file's NAME carries, in ONE place. position.py and report.py both
+# used to keep their own copy of this filter and both silently saw zero mech boots as a result -
+# the fourth time today that a filename pattern quietly excluded data. Additive: BOOT_FILE above
+# and the rule itself are untouched, and this is only ever used to decide what a report is applied
+# TO, never what it decides. Shapes:
+#   r<N>-f<N>                  calibration round N, family f<N>      run-calib.sh
+#   m<N>[x]-<name>[-r<N>]      mechanism phase 0+1, family m<N>[x]   mech.sh, mech-make.sh
+#   p<N>[x]-<name>[-r<N>]      mechanism phase 2,   family p<N>[x]   mech2.sh
+# The leading token IS the family: mech.sh's header documents m1 as the kPFS family and m2 as the
+# cfs+scx family, and mech2.sh continues them as p1, p1b and p2. A boot with no -r<N> suffix
+# reports round 0. This deliberately does NOT match the s<N>- sequence boots that BOOT_FILE does:
+# they carry neither a family nor a round, and have their own section in final.py.
+BOOT_ID = re.compile(r"^(?:r(?P<rnd>\d+)-(?P<fam>f\d)"
+                     r"|(?P<mfam>[mp]\d+[a-z]?)-[a-z0-9]+(?:-r(?P<mrnd>\d+))?)\.txt$")
+
+
+def boot_id(fn):
+    """-> (round, family) for a boot file whose name carries both, else None."""
+    m = BOOT_ID.match(fn)
+    if not m:
+        return None
+    if m.group("fam"):
+        return int(m.group("rnd")), m.group("fam")
+    return int(m.group("mrnd") or 0), m.group("mfam")
+
+
 def runlog_loads(res):
     """boot name -> loadavg fields, from a result dir's run.log.
 
