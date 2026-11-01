@@ -91,11 +91,65 @@ short still yields a smaller usable n.
   `boots seen 0`, which reads like a clean result instead of like missing
   data.
 * `position.py` - the within-boot position effect as a number of its own.
+* `final.py [ROUNDS_DIR [SEQ_DIR]]` - with no argument it reads `res-r4b` and
+  `res-seq` beside itself, exactly as before. Given directories it runs the
+  same code over those, so `res-mech`, `res-mechrev` and `res-mech2` can be
+  reported without copying anything. What it computes does not depend on the
+  argument: the family pairing still keys on the `-f1`/`-f2`/`-f3` suffix, so a
+  directory whose boots are named `m*`/`p*` yields empty F1/F3/F2 tables and a
+  populated per-boot position table, until that pairing is extended.
 * `headline.py` - the equal-CPU work ratio at one limit, three ways.
 * `final.py` - the result over the kept boots: position effect, the **two-factor
   (arm + position) contrast** per cell with delivered CPU beside every ratio, and
   the paired per-boot ratio with a one-sample t test on the log ratio.
 * `boots.py`, `report.py`, `sigma.py` - per-boot inventory, report and sigma.
+
+### The pre-registered correction for the kPFS arm
+
+Written down **before** the reversed-order rounds are reduced, so the choice
+cannot be made after seeing the numbers.
+
+**(a) Position is cancelled by the balanced order plus the within-boot fit.**
+The `m1` boots are run in both cell orders - forward (`4 4.001 2 2.001`) and
+reversed (`2.001 2 4.001 4`, `mech-rev.sh`) - in equal numbers, so every cell
+appears in both positions across the round set. On top of that, the
+**two-factor (arm + position)** fit already in `final.py` is applied *within*
+the `m1` boots: each arm's mean is taken inside a position first and the two
+positions are then weighted equally, so an unequal split of kept boots between
+positions cannot tilt the result. Those two together are the whole correction
+for kPFS.
+
+**(b) The CFS step divisor applies only to arms that have an in-boot CFS
+reference, i.e. the `m2` arms.** For `m2` (`cfs` + `scx3` in one boot) the CFS
+arm's own step from one cell to the next measures the order effect directly,
+and dividing by it is legitimate. For `m1` it is not available and **must not
+be borrowed from another boot**: a cross-boot divisor would carry that other
+boot's variance into the one number the run exists to produce. The `m2` CFS
+arm's step is still **reported separately, as a cross-check** on whether the
+balanced order did its job - never as a divisor for `m1`.
+
+**(c) Why no in-boot CFS arm exists under `sched_pfs=1`.** It is not an
+oversight in the harness, it is the kernel: with `sched_pfs=1` every normal
+task is on PFS, and the fair class is not even iterated.
+
+* `kernel/sched/sched.h:3094` - `normal_sched_class()` returns
+  `&pfs_sched_class` when `pfs_enabled()`, otherwise `&fair_sched_class`.
+* `kernel/sched/sched.h:3074` - `next_active_class()` skips
+  `fair_sched_class` when `pfs_enabled()` ("PFS replaces the fair class when
+  enabled"), so `for_each_active_class()` never visits it.
+* `kernel/sched/sched.h:2046` - `pfs_enabled()` is a static key set once at
+  boot, from the `early_param("sched_pfs", ...)` at `kernel/sched/pfs.c:59`
+  via `pfs_boot_enable()` at `:62`. It cannot be toggled at run time, which is
+  why `run-calib.sh`'s F2 family has no in-boot baseline either.
+
+**(d) The warm-up stays, whatever the correction does.** `calib/warmup-guest.sh`
+and the cell driver's own warm-up cell shrink the position effect; they do not
+remove it - the measured first-run cost was 1.66-2.00x on `tpcb@2 c16` before
+the warm-up existed, and a residual position effect was still visible with it
+in place, which is why the balanced order exists at all. One does not replace
+the other: drop the warm-up and the first measured cell of every boot pays the
+first-run cost again; drop the balanced order and the residual stays
+uncorrected. Both are required.
 
 ## `rm2/` - the repeat-measurement suite
 
