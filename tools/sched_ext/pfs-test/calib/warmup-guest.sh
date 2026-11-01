@@ -13,11 +13,16 @@
 set -u
 S="${PFS_WORK:?set PFS_WORK to a writable work directory}"
 O=${1:?outdir}; mkdir -p $O
+TD=$(cd "$(dirname "$0")" && pwd)
+# Same driver the measured cells use, resolved the same way: a warm-up run by different code
+# than the cell it protects would not be priming the same thing.
+PG=${PG:-$TD/../rm2/pg-guest.sh}
+[ -f "$PG" ] || { echo "D warmup ABORT: no Postgres cell driver at $PG (set PG)"; exit 1; }
 t0=$(date +%s)
 # One cell, the same shape as the first measured one (limit 2, tpcb, clients 16), shortened: this is
 # about priming, not measuring. Full setup is deliberate - initdb and pgbench -i are part of what a
 # first run pays for.
-CL=16 bash $S/rm2/t/pg-guest.sh "2" "tpcb" 10 > $O/warmup.log 2>&1
+CL=16 bash "$PG" "2" "tpcb" 10 > $O/warmup.log 2>&1
 rc=$?
 for i in $(seq 20); do pgrep -x postgres > /dev/null || break; pkill -x postgres; sleep 0.5; done
 pgrep -x postgres > /dev/null && pkill -9 -x postgres

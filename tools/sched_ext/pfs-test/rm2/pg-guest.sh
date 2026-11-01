@@ -2,6 +2,9 @@
 # pg-guest.sh "LIMITS" "WLS" SECS: postgres in a two-level pod cgroup, pgbench (TCP, 32 clients) from the root
 # cgroup; per cell: CPUs from cpu.stat, PFS stats delta, sched_switch concurrency trace over 5 s.
 P5=${PFS_WORK}/p5 TD=$(cd "$(dirname "$0")" && pwd)
+# conc-pids.py is the in-tree name of the reducer this file used to call conc5.py: same code,
+# same argv (TRACE PIDFILE LIMIT), same output fields in the same order.
+CONC=${CONC:-$TD/conc-pids.py}
 LIMITS=${1:-"4 1.5"} WLS=${2:-"tpcb select"} SECS=${3:-30} CL=${CL:-32}
 PGB=$P5/root/usr/lib/postgresql/16/bin
 export LD_LIBRARY_PATH=$P5/root/usr/lib/x86_64-linux-gnu
@@ -55,7 +58,7 @@ for lim in $LIMITS; do for wl in $WLS; do for rep in $(seq ${REPS:-1}); do
 	cpus=$(awk -v a=$u0 -v b=$u1 -v s=$t0 -v e=$t1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }')
 	tps=$(awk '/^tps/ {print int($3)}' /tmp/pgb.out); lat=$(awk '/latency average/ {print $4}' /tmp/pgb.out)
 	st=""; [ -s /tmp/s1 ] && st=$(awk 'NR==FNR {a[$1]=$2; next} $1 ~ /^(admit|credit|park_full|park_budget|park_fifo|rotate|handoff|user_park|credit_ns|slot_ns|park_debt|wake_park)$/ {printf "%s=%d ", $1, $2-a[$1]}' /tmp/s0 /tmp/s1)
-	echo "R v=$V lim=$lim wl=$wl rep=$rep tps=$tps lat_ms=$lat cpus=$cpus mid_cpus=$(awk -v a=$m0 -v b=$m1 -v s=$n0 -v e=$n1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }') $(python3 $TD/conc5.py /tmp/sw.trace /tmp/pids $lim) $(echo "$z0 $z1" | awk -v a=$t0 -v b=$t1 '{w=b-a; printf "thr_per=%d thr_n=%d thr_us=%d thr_frac=%.3f", $7-$1, $8-$2, $9-$3, ($9-$3)/1e6/w; if ($4 != "-") printf " pfs_per=%d pfs_n=%d pfs_us=%d pfs_frac=%.3f", $10-$4, $11-$5, $12-$6, ($12-$6)/1e6/w}') $(echo "$y0 $y1" | awk -v a=$t0 -v b=$t1 '{w=b-a; printf "c_thr_per=%d c_thr_n=%d c_thr_us=%d c_thr_frac=%.3f", $7-$1, $8-$2, $9-$3, ($9-$3)/1e6/w; if ($4 != "-") printf " c_pfs_per=%d c_pfs_n=%d c_pfs_us=%d c_pfs_frac=%.3f", $10-$4, $11-$5, $12-$6, ($12-$6)/1e6/w}') $st"
+	echo "R v=$V lim=$lim wl=$wl rep=$rep tps=$tps lat_ms=$lat cpus=$cpus mid_cpus=$(awk -v a=$m0 -v b=$m1 -v s=$n0 -v e=$n1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }') $(python3 -I $CONC /tmp/sw.trace /tmp/pids $lim) $(echo "$z0 $z1" | awk -v a=$t0 -v b=$t1 '{w=b-a; printf "thr_per=%d thr_n=%d thr_us=%d thr_frac=%.3f", $7-$1, $8-$2, $9-$3, ($9-$3)/1e6/w; if ($4 != "-") printf " pfs_per=%d pfs_n=%d pfs_us=%d pfs_frac=%.3f", $10-$4, $11-$5, $12-$6, ($12-$6)/1e6/w}') $(echo "$y0 $y1" | awk -v a=$t0 -v b=$t1 '{w=b-a; printf "c_thr_per=%d c_thr_n=%d c_thr_us=%d c_thr_frac=%.3f", $7-$1, $8-$2, $9-$3, ($9-$3)/1e6/w; if ($4 != "-") printf " c_pfs_per=%d c_pfs_n=%d c_pfs_us=%d c_pfs_frac=%.3f", $10-$4, $11-$5, $12-$6, ($12-$6)/1e6/w}') $st"
 	rm -f /tmp/sw.trace; : $P5RES/${TAG:-x}-$V-l$lim-$wl-r$rep.trace 2>/dev/null; 
 done; done; done
 [ -d $D ] && cat $D/stats

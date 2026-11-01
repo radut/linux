@@ -7,6 +7,9 @@
 R=$(cd "$(dirname "$0")" && pwd)
 V=$1 RND=$2 PH=$3
 T=$R/t KIT=$R/kit TREE=${TREE:-$R/tree-kit}
+# conc-pids.py is the in-tree name of the reducer this file used to call $T/conc5.py: same
+# code, same argv (TRACE PIDFILE LIMIT), same output fields in the same order.
+CONC=${CONC:-$R/conc-pids.py}
 PERF=$(ls /usr/lib/linux-tools/*/perf | tail -1)
 KV=$V; SCXN=scx_pfs.new
 case $V in scxold) KV=scx; SCXN=scx_pfs.old ;; kpfs*) KV=kpfs ;; esac
@@ -82,7 +85,7 @@ kh() {
 	pst > /tmp/k1
 	for p in $(cat $CG/rt/pod/ctr/cgroup.procs); do kill -9 $p 2>/dev/null; done
 	kill -9 $bp 2>/dev/null; wait $bp 2>/dev/null
-	echo "$pre test=kh-$name limit=$lim cpus=$(awk -v a=$u0 -v b=$u1 -v s=$t0 -v e=$t1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }') nr_thr=$((n1 - n0)) $(python3 $T/conc5.py /tmp/kh.trace /tmp/khpids $lim | cut -d' ' -f1-4) $(pdelta /tmp/k0 /tmp/k1)"
+	echo "$pre test=kh-$name limit=$lim cpus=$(awk -v a=$u0 -v b=$u1 -v s=$t0 -v e=$t1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }') nr_thr=$((n1 - n0)) $(python3 -I $CONC /tmp/kh.trace /tmp/khpids $lim | cut -d' ' -f1-4) $(pdelta /tmp/k0 /tmp/k1)"
 	sleep 1
 }
 
@@ -116,7 +119,7 @@ nest() {
 	local t1 ua1 ub1 up1; t1=$(date +%s.%N)
 	ua1=$(awk '/usage_usec/ {print $2}' $P/a/cpu.stat); ub1=$(awk '/usage_usec/ {print $2}' $P/b/cpu.stat); up1=$(awk '/usage_usec/ {print $2}' $P/cpu.stat)
 	c() { awk -v a=$1 -v b=$2 -v s=$t0 -v e=$t1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }'; }
-	tc() { python3 $T/conc5.py /tmp/n.trace $1 $2 | sed -n 's/.*mean_running=\([0-9.]*\).*/\1/p'; }
+	tc() { python3 -I $CONC /tmp/n.trace $1 $2 | sed -n 's/.*mean_running=\([0-9.]*\).*/\1/p'; }
 	echo "$pre test=nest-$mode cell=$A+$B par_cpus=$(c $up0 $up1) a_cpus=$(c $ua0 $ua1) b_cpus=$(c $ub0 $ub1) par_tr=$(tc /tmp/npp 4) a_tr=$(tc /tmp/npa $A) b_tr=$(tc /tmp/npb $B) a: $(tail -1 /tmp/na.out) | b: $(tail -1 /tmp/nb.out)"
 	rmdir $P/a $P/b $P 2>/dev/null
 	sleep 1

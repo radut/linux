@@ -9,6 +9,11 @@
 set -u
 S="${PFS_WORK:?set PFS_WORK to a writable work directory}"
 ARM=${1:?arm} O=${2:?outdir}; mkdir -p $O
+TD=$(cd "$(dirname "$0")" && pwd)
+# The Postgres cell driver, beside this file in rm2/. Resolved relative to this script: the
+# old absolute $S/rm2/t/ path no longer exists anywhere.
+PG=${PG:-$TD/../rm2/pg-guest.sh}
+[ -f "$PG" ] || { echo "R ABORT: no Postgres cell driver at $PG (set PG)"; exit 1; }
 KW=/proc/sys/kernel/sched_cfs_bandwidth_width
 SP=
 echo "D boot kernel=$(uname -r) arm=$ARM cpus=$(nproc) cmdline_pfs=$(grep -c sched_pfs=1 /proc/cmdline)"
@@ -34,7 +39,7 @@ env KB=${KB:?KB required} KSRC=${KSRC:?KSRC required} \
 
 for cl in 16 32; do
 	echo "D arm=$ARM cell=pg clients=$cl"
-	CL=$cl bash $S/rm2/t/pg-guest.sh "2 4" "tpcb select" 30 2>&1 | grep -E '^R |failed|PG-DONE'
+	CL=$cl bash "$PG" "2 4" "tpcb select" 30 2>&1 | grep -E '^R |failed|PG-DONE'
 done
 
 # Postgres and its tmpfs must go before the next arm runs in this same boot. Without this the

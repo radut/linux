@@ -17,8 +17,12 @@ B=$S/fix3/hp/bin
 O=${1:-$S/fix3/mech/res-mech}; mkdir -p $O
 MEM=${MEM:-4G}
 GATE_MAX=${GATE_MAX:-3600}
+# RTAG keeps the per-round boots apart in one outdir; LIMITS is baked into the generated guest
+# script because the host environment does not reach the guest through vng --exec.
+RTAG=${RTAG:-}
+LIMITS=${LIMITS:-"4 4.001 2 2.001"}
 I1=$S/fix3/b-pkgkpfs8
-echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s"
+echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s rtag=${RTAG:-none} limits=$LIMITS"
 [ -f "$I1/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $I1"; echo MECH-DONE; exit 1; }
 [ -x $B/cand-charge ] || { echo "ABORT: no scx_pfs binary at $B/cand-charge"; echo MECH-DONE; exit 1; }
 echo "guard: image present; scx_pfs = $(sha256sum $B/cand-charge | cut -c1-16) (d2370ce7e33b)"
@@ -41,8 +45,8 @@ boot() { # NAME KARGS ARMS...
 	# cells are compared against position-2 cells here as everywhere else.
 	printf 'bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' "$S" "$O" "$name" >> $O/$name.guest.sh
 	for a in "$@"; do
-		printf 'env BIN=%s bash %s/fix3/mech/mech-guest.sh %s %s/%s-%s\n' \
-			"$B/cand-charge" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
+		printf 'env BIN=%s LIMITS=%s bash %s/fix3/mech/mech-guest.sh %s %s/%s-%s\n' \
+			"$B/cand-charge" "'$LIMITS'" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
 	done
 	cat > $O/$name.run.sh <<EOG
 cd $I1
@@ -59,8 +63,8 @@ EOG
 	echo "D boot=$name load_before=\"$l_before\" load_after=\"$(cut -d' ' -f1-3 /proc/loadavg)\"" >> $O/$name.txt
 }
 
-boot "m1-kpfs" "sched_pfs=1" kpfs
-boot "m2-f1"   ""            cfs scx3
+boot "m1-kpfs$RTAG" "sched_pfs=1" kpfs
+boot "m2-f1$RTAG"   ""            cfs scx3
 echo "=== rows collected ==="
 grep -ch '^R ' $O/*.txt 2>/dev/null | paste -sd+ | bc 2>/dev/null
 echo MECH-DONE $(date -u +%T)
