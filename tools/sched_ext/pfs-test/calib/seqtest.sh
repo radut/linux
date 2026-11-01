@@ -75,14 +75,16 @@ boot() { # NAME IMAGE WARMUP ARM1 ARM2
 	done
 	local l_before; l_before=$(cut -d' ' -f1-3 /proc/loadavg)
 	: > $O/$name.guest.sh
-	[ "$warm" = 1 ] && printf 'bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' \
-		"$S" "$O" "$name" >> $O/$name.guest.sh
+	# PFS_WORK is baked in for the same reason KB and KSRC are: the host environment does not
+	# reach the guest through vng --exec, and every guest-side script requires it.
+	[ "$warm" = 1 ] && printf 'env PFS_WORK=%s bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' \
+		"$S" "$S" "$O" "$name" >> $O/$name.guest.sh
 	# The two runs differ only in their output directory, so the same arm can run twice. The
 	# 'D arm=' label is then identical in both, and run order in the file is what marks position.
 	local i=1
 	for a in "$a1" "$a2"; do
-		printf 'env BIN=%s KB=%s KSRC=%s bash %s/fix3/calib/calib-guest.sh %s %s/%s-p%s-%s\n' \
-			"$(armbin $a)" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$i" "$a" >> $O/$name.guest.sh
+		printf 'env PFS_WORK=%s BIN=%s KB=%s KSRC=%s bash %s/fix3/calib/calib-guest.sh %s %s/%s-p%s-%s\n' \
+			"$S" "$(armbin $a)" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$i" "$a" >> $O/$name.guest.sh
 		i=$((i + 1))
 	done
 	cat > $O/$name.run.sh <<EOG

@@ -103,10 +103,13 @@ boot() { # NAME IMAGE KARGS ARMS...
 	: > $O/$name.guest.sh
 	# One discarded pg cell first, so the boot's first measured arm is not the one that pays the
 	# first-run cost. See warmup-guest.sh for what that cost was worth: 1.66-2.00x on tpcb@2 c16.
-	printf 'bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' "$S" "$O" "$name" >> $O/$name.guest.sh
+	# PFS_WORK is baked in for the same reason LIMITS is: the host environment does not reach the
+	# guest through vng --exec, and every guest-side script requires it.
+	printf 'env PFS_WORK=%s bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' \
+		"$S" "$S" "$O" "$name" >> $O/$name.guest.sh
 	for a in "$@"; do
-		printf 'env BIN=%s KB=%s KSRC=%s bash %s/fix3/calib/calib-guest.sh %s %s/%s-%s\n' \
-			"$(armbin $a)" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
+		printf 'env PFS_WORK=%s BIN=%s KB=%s KSRC=%s bash %s/fix3/calib/calib-guest.sh %s %s/%s-%s\n' \
+			"$S" "$(armbin $a)" "$img" "$S/kbuild-kpfs6-src" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
 	done
 	cat > $O/$name.run.sh <<EOG
 cd $img

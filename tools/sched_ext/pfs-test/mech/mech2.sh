@@ -86,12 +86,15 @@ boot() {
 	done
 	local l_before; l_before=$(cut -d' ' -f1-3 /proc/loadavg)
 	: > $O/$name.guest.sh
-	printf 'bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' "$S" "$O" "$name" >> $O/$name.guest.sh
+	# PFS_WORK is baked in for the same reason LIMITS is: the host environment does not reach the
+	# guest through vng --exec, and every guest-side script requires it.
+	printf 'env PFS_WORK=%s bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' \
+		"$S" "$S" "$O" "$name" >> $O/$name.guest.sh
 	local sp tag arm lims wls burst
 	for sp in "$@"; do
 		IFS='|' read -r tag arm lims wls burst <<< "$sp"
-		printf 'env BIN=%s LIMITS=%s WLS=%s %s bash %s/fix3/mech/mech2-guest.sh %s %s/%s-%s\n' \
-			"$(armbin $arm)" "'$lims'" "'$wls'" "${burst:+BURST=$burst}" \
+		printf 'env PFS_WORK=%s BIN=%s LIMITS=%s WLS=%s %s bash %s/fix3/mech/mech2-guest.sh %s %s/%s-%s\n' \
+			"$S" "$(armbin $arm)" "'$lims'" "'$wls'" "${burst:+BURST=$burst}" \
 			"$S" "$arm" "$O" "$name" "$tag" >> $O/$name.guest.sh
 	done
 	cat > $O/$name.run.sh <<EOG

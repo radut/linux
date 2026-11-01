@@ -15,7 +15,7 @@ O=${RESD:-$R/resx}; mkdir -p $O
 rm -f $O/$name.txt $O/$name.console
 [ "$kargs" = "-" ] && kargs=""
 cat > $O/$name.guest.sh <<EOG
-( env $GE bash $R/guest.sh $* ) 2>&1 | tee $O/$name.txt
+( env PFS_WORK=$S $GE bash $R/guest.sh $* ) 2>&1 | tee $O/$name.txt
 dmesg > $O/$name.dmesg
 EOG
 cat > $O/$name.run.sh <<EOG

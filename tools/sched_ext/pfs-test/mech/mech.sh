@@ -80,10 +80,13 @@ boot() { # NAME KARGS ARMS...
 	: > $O/$name.guest.sh
 	# The warm-up stays: it is the same 30 s discarded cell the calibration used, and position-1
 	# cells are compared against position-2 cells here as everywhere else.
-	printf 'bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' "$S" "$O" "$name" >> $O/$name.guest.sh
+	# PFS_WORK is baked in for the same reason LIMITS is: the host environment does not reach the
+	# guest through vng --exec, and every guest-side script requires it.
+	printf 'env PFS_WORK=%s bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' \
+		"$S" "$S" "$O" "$name" >> $O/$name.guest.sh
 	for a in "$@"; do
-		printf 'env BIN=%s LIMITS=%s bash %s/fix3/mech/mech-guest.sh %s %s/%s-%s\n' \
-			"$(armbin $a)" "'$LIMITS'" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
+		printf 'env PFS_WORK=%s BIN=%s LIMITS=%s bash %s/fix3/mech/mech-guest.sh %s %s/%s-%s\n' \
+			"$S" "$(armbin $a)" "'$LIMITS'" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
 	done
 	cat > $O/$name.run.sh <<EOG
 cd $IMG

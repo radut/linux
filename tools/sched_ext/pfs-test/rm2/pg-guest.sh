@@ -1,7 +1,7 @@
 #!/bin/bash
 # pg-guest.sh "LIMITS" "WLS" SECS: postgres in a two-level pod cgroup, pgbench (TCP, 32 clients) from the root
 # cgroup; per cell: CPUs from cpu.stat, PFS stats delta, sched_switch concurrency trace over 5 s.
-P5=${PFS_WORK}/p5 TD=$(cd "$(dirname "$0")" && pwd)
+P5=${PFS_WORK:?set PFS_WORK to a writable work directory}/p5 TD=$(cd "$(dirname "$0")" && pwd)
 # conc-pids.py is the in-tree name of the reducer this file used to call conc5.py: same code,
 # same argv (TRACE PIDFILE LIMIT), same output fields in the same order.
 CONC=${CONC:-$TD/conc-pids.py}
