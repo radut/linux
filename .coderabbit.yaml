@@ -1,0 +1,69 @@
+# CodeRabbit review settings for this fork's scheduler work.
+#
+# Only keys documented at https://docs.coderabbit.ai/reference/yaml-template are
+# used here. Two of them are load-bearing and would otherwise silently skip most
+# of this repository's pull requests:
+#
+#   auto_review.drafts        defaults to false, and every pull request in the
+#                             scheduler stack is a draft: these are kernel
+#                             patches that are deliberately not marked ready.
+#   auto_review.base_branches defaults to the repository's default branch alone,
+#                             and this is a STACK - each branch's pull request is
+#                             based on the one below it, so only the bottom one
+#                             would be reviewed.
+#
+# NOTE: which branch CodeRabbit reads this file from is not stated in its docs.
+# This copy is on the default branch. If a pull request based on a feature branch
+# turns out to be reviewed with the defaults instead, the file also has to exist
+# on that base branch.
+language: en-US
+
+reviews:
+  # Thorough over polite: these are scheduler patches, and a missed locking or
+  # arithmetic mistake here is a machine that stops, not a lint warning.
+  profile: assertive
+  auto_review:
+    enabled: true
+    drafts: true
+    base_branches:
+      - master
+      - scx-width
+      - kpfs
+      - pfs-slot-stats
+  path_instructions:
+    - path: "kernel/sched/**"
+      instructions: >-
+        Linux kernel C, Documentation/process/coding-style.rst. Check the
+        locking: which of rq->lock, the task_group's own lock and RCU each
+        access is held under, and whether a counter read outside a lock can
+        tear. Check integer arithmetic for overflow and for the difference
+        between ceiling and truncating division - the scheduler here derives a
+        slot WIDTH by rounding a CPU limit up and a token BUDGET by rounding the
+        same limit down, so a mistaken rounding changes behaviour only at
+        fractional limits. Flag anything that can divide by zero when a limit is
+        unset, and any per-CPU counter summed without reading every CPU.
+    - path: "tools/sched_ext/**/*.bpf.c"
+      instructions: >-
+        sched_ext BPF. Check that every map lookup's NULL return is handled,
+        that loops are bounded for the verifier, that no helper is called from a
+        context that forbids sleeping, and that a dispatch path cannot leave a
+        task enqueued nowhere. Flag arithmetic on a fixed-point fraction that
+        mixes the scaled and unscaled forms.
+    - path: "tools/sched_ext/pfs-test/**/*.sh"
+      instructions: >-
+        Measurement shell. The failure that matters most here is a command whose
+        no-match case yields an EMPTY STRING rather than 0 - grep -c prints 0 and
+        exits 1, a glob that matches nothing expands to itself, and an arithmetic
+        test on the result then either errors or reads as a measured zero. Flag
+        any count, delta or rate that can be produced without its denominator
+        being measured in the same window, and any check whose failure path is
+        indistinguishable from its pass path.
+    - path: "tools/sched_ext/pfs-test/**/*.py"
+      instructions: >-
+        Measurement reduction. Flag any statistic reported without its n, any
+        mean over a set that can be empty, and any filter (regex, glob, key
+        lookup) whose no-match case produces a printable zero instead of an
+        error. A table of zeros that means "not measured" is a defect here.
+  path_filters:
+    - "!**/*.patch"
+    - "!**/*.deb"
