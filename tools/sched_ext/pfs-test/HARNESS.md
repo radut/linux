@@ -105,6 +105,13 @@ short still yields a smaller usable n.
   `boots seen 0`, which reads like a clean result instead of like missing
   data.
 * `position.py` - the within-boot position effect as a number of its own.
+* `slots.py RESDIR [ARM...]` - where kPFS refuses a slot, per **limit** and per slot
+  index, from the per-cell `refuse_*` deltas on the R rows. It prints no table it
+  cannot stand behind: boot files whose R rows carry no `refuse_keys=` came from a
+  harness that did not take the counters, and `refuse_keys=0` everywhere means the
+  kernel has none; both exit non-zero and say which, rather than rendering as zeros.
+  It also checks the identity `refuse_debt_guar_* + refuse_debt_frac_* == park_debt`
+  per limit, which is what makes a zero in those buckets trustworthy.
 * `final.py [ROUNDS_DIR [SEQ_DIR]]` - with no argument it reads `res-r4b` and
   `res-seq` beside itself, exactly as before. Given directories it runs the
   same code over those, so `res-mech`, `res-mechrev` and `res-mech2` can be
@@ -402,7 +409,21 @@ R v= lim= wl= rep= tps= lat_ms= cpus= mid_cpus= cell_secs= mid_secs= cpu_src= co
   `thr_win`/`c_thr_win` is the measured snapshot-to-snapshot interval the
   `_frac` fields are divided by.
 * The trailing bare `key=value` tokens are the kPFS `debug/sched/pfs/stats`
-  delta over the cell.
+  delta over the cell: the aggregates (`admit`, `credit`, `park_full`,
+  `park_budget`, `park_fifo`, `rotate`, `handoff`, `user_park`, `credit_ns`,
+  `slot_ns`, `park_debt`, `wake_park`) **and** the per-slot refusal counters
+  `refuse_budget_frac_<i>`, `refuse_debt_guar_<i>`, `refuse_debt_frac_<i>` for
+  `i` in `0..7` plus `_hi` (`pfs.c`: `pfs_refuse_names`, `PFS_K_SLOT_IDX_MAX`).
+  Taking the refusal counters **per cell** is the only thing that attributes a
+  refusal to a **limit** - they are cumulative and machine-wide, so the single
+  dump `mech.sh` takes at warm-up covers one limit and is not comparable with
+  the per-cell `scx_pfs` numbers. `calib/slots.py` reads them.
+* `refuse_keys=` and `refuse_nobase=` are published beside them and are not
+  measurements: `refuse_keys` is how many refusal counters the dump carried, so
+  a kernel without them (`refuse_keys=0`) is distinguishable from a measured
+  zero, and `refuse_nobase` counts the ones that appeared only in the second
+  snapshot, whose "delta" would be their whole history. Reading an absent
+  counter as a zero is the single failure this harness has paid for most.
 
 Field order up to `mid_cpus=` is fixed, because `calib/exclude.py:75`,
 `calib/final.py:55`, `calib/report.py:38`, `calib/position.py:32` and

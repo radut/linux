@@ -228,7 +228,20 @@ for lim in $LIMITS; do for wl in $WLS; do for rep in $(seq ${REPS:-1}); do
 	mid_secs=$(awk -v a=$n0 -v b=$n1 'BEGIN{printf "%.3f", b-a}')
 	thr_win=$(awk -v a=$zt0 -v b=$zt1 'BEGIN{printf "%.3f", b-a}')
 	tps=$(awk '/^tps/ {print int($3)}' /tmp/pgb.out); lat=$(awk '/latency average/ {print $4}' /tmp/pgb.out)
-	st=""; [ -s /tmp/s1 ] && st=$(awk 'NR==FNR {a[$1]=$2; next} $1 ~ /^(admit|credit|park_full|park_budget|park_fifo|rotate|handoff|user_park|credit_ns|slot_ns|park_debt|wake_park)$/ {printf "%s=%d ", $1, $2-a[$1]}' /tmp/s0 /tmp/s1)
+	# The kPFS counter deltas for this cell. The aggregate names are the original set; the
+	# per-slot refusal counters (pfs.c: refuse_budget_frac / refuse_debt_guar / refuse_debt_frac,
+	# buckets _0.._7 and _hi) are taken HERE, per cell, because that is the only thing that
+	# attributes a refusal to a LIMIT: the one dump mech.sh takes at warm-up is a single limit's
+	# and is not comparable with the scx per-cell numbers.
+	# refuse_keys and refuse_nobase are published beside them so an UNINSTRUMENTED kernel, which
+	# prints no refuse_* at all, can never read as a measured zero - and so a counter that appears
+	# only in the second snapshot, whose "delta" would be its whole history, is named rather than
+	# quietly believed.
+	st=""; [ -s /tmp/s1 ] && st=$(awk '
+		NR == FNR { a[$1] = $2; next }
+		$1 ~ /^(admit|credit|park_full|park_budget|park_fifo|rotate|handoff|user_park|credit_ns|slot_ns|park_debt|wake_park)$/ { printf "%s=%d ", $1, $2 - a[$1] }
+		$1 ~ /^refuse_[a-z_]+_([0-9]+|hi)$/ { if (!($1 in a)) miss++; printf "%s=%d ", $1, $2 - a[$1]; nr++ }
+		END { printf "refuse_keys=%d refuse_nobase=%d ", nr + 0, miss + 0 }' /tmp/s0 /tmp/s1)
 	echo "R v=$V lim=$lim wl=$wl rep=$rep tps=$tps lat_ms=$lat cpus=$cpus mid_cpus=$(awk -v a=$m0 -v b=$m1 -v s=$n0 -v e=$n1 'BEGIN { printf "%.3f", (b - a) / 1e6 / (e - s) }') cell_secs=$cell_secs mid_secs=$mid_secs cpu_src=/rt/pod conc_pids=$(wc -l < /tmp/pids) $(python3 -I $CONC /tmp/sw.trace /tmp/pids $lim) $(echo "$z0 $z1" | awk -v w=$thr_win '{printf "thr_win=%.3f thr_per=%d thr_n=%d thr_us=%d thr_frac=%.3f", w, $7-$1, $8-$2, $9-$3, ($9-$3)/1e6/w; if ($4 != "-") printf " pfs_per=%d pfs_n=%d pfs_us=%d pfs_frac=%.3f", $10-$4, $11-$5, $12-$6, ($12-$6)/1e6/w}') $(echo "$y0 $y1" | awk -v w=$thr_win '{printf "c_thr_win=%.3f c_thr_per=%d c_thr_n=%d c_thr_us=%d c_thr_frac=%.3f", w, $7-$1, $8-$2, $9-$3, ($9-$3)/1e6/w; if ($4 != "-") printf " c_pfs_per=%d c_pfs_n=%d c_pfs_us=%d c_pfs_frac=%.3f", $10-$4, $11-$5, $12-$6, ($12-$6)/1e6/w}') $st"
 	# Transactions over the whole cell, to normalise the whole-cell counter deltas. pgbench -T
 	# prints a bare count, -t prints "done/total"; the first field is what completed.
