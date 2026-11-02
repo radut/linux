@@ -25,10 +25,23 @@ from exclude import boot_id   # the one definition of "which files are boots, an
 
 REASONS = ("refuse_budget_frac", "refuse_debt_guar", "refuse_debt_frac")
 BUCKETS = [str(i) for i in range(8)] + ["hi"]
-# park_budget counts the same event as the refuse_budget_frac buckets, park_debt the two
-# refuse_debt_* ones. Summing each way is the integrity check that a zero is a real zero.
+# The aggregate printed beside each reason, and what it is to that reason - these are NOT the same
+# relation, and reading them as one makes a correct kernel look broken:
+#
+#   park_debt   is incremented INSIDE pfs_take_slot(), in the same branch as the refusal counter
+#               (pfs.c: pfs_stat(PFS_K_STAT_PARK_DEBT) beside pfs_refuse_stat(...DEBT...), and
+#               pfs_waiter_linked()'s PFS_RES_DEBT case says "pfs_take_slot() counted it"). So
+#               refuse_debt_guar + refuse_debt_frac == park_debt is an EXACT IDENTITY, checked
+#               below: it is what makes a zero bucket a measured zero rather than a dead counter.
+#
+#   park_budget is incremented in pfs_waiter_linked(), i.e. only when the refused task is actually
+#               LINKED AS A WAITER. A budget refusal whose refusing group is the task's own leaf
+#               returns without parking and only re-arms the window timer, so park_budget is a
+#               SUBSET of the refusals and the two must not be expected to agree. Their ratio is
+#               the useful number - how often a budget refusal costs a park - so it is printed.
 AGG = {"refuse_budget_frac": ("park_budget",), "refuse_debt_guar": ("park_debt",),
        "refuse_debt_frac": ("park_debt",)}
+IDENTITY = ("refuse_debt_guar", "refuse_debt_frac")   # these two, and only these, must sum to park_debt
 
 res = sys.argv[1]
 want = set(sys.argv[2:])
@@ -109,13 +122,15 @@ for arm in sorted({k[0] for k in cells}):
         for l in lims:
             row = [cnt[(arm, l, r, b)] for b in BUCKETS]
             tot = sum(row)
-            a = " ".join(f"{k}={agg[(arm, l)][k]}" for k in AGG[r])
+            a = " ".join(f"{k}={agg[(arm, l)][k]:,}" for k in AGG[r])
+            if r == "refuse_budget_frac" and tot:
+                pk = agg[(arm, l)]["park_budget"]
+                a += f" ({100.0 * pk / tot:.2f}% of refusals parked)"
             print(f"{l:>6} {cells[(arm, l)]:>5} " + " ".join(f"{v:>11,}" for v in row)
-                  + f" {tot:>13,} {a:>13}")
+                  + f" {tot:>13,} {a}")
     # The identity that makes a zero trustworthy: the two debt buckets must sum to park_debt.
     for l in lims:
-        debt = sum(cnt[(arm, l, r, b)] for r in ("refuse_debt_guar", "refuse_debt_frac")
-                   for b in BUCKETS)
+        debt = sum(cnt[(arm, l, r, b)] for r in IDENTITY for b in BUCKETS)
         pd = agg[(arm, l)].get("park_debt")
         if pd is not None and debt != pd:
             print(f"   MISMATCH at limit {l}: refuse_debt_* sum to {debt:,} but park_debt is "

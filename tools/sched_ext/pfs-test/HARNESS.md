@@ -112,7 +112,13 @@ short still yields a smaller usable n.
   harness that did not take the counters, and `refuse_keys=0` everywhere means the
   kernel has none; both exit non-zero and say which, rather than rendering as zeros.
   It also checks the identity `refuse_debt_guar_* + refuse_debt_frac_* == park_debt`
-  per limit, which is what makes a zero in those buckets trustworthy.
+  per limit, which is what makes a zero in those buckets trustworthy. `park_budget`
+  is **not** the same relation and is not checked as one: the debt counters are
+  incremented inside `pfs_take_slot()` beside the refusal, while `park_budget` is
+  incremented in `pfs_waiter_linked()` and so counts only the budget refusals that
+  actually parked a task. Its share of the refusals is printed instead - measured at
+  0.08% (limit 2.5) and 1.81% (limit 3.5), i.e. the window-timer retry absorbs
+  almost all of them.
 * `final.py [ROUNDS_DIR [SEQ_DIR]]` - with no argument it reads `res-r4b` and
   `res-seq` beside itself, exactly as before. Given directories it runs the
   same code over those, so `res-mech`, `res-mechrev` and `res-mech2` can be
