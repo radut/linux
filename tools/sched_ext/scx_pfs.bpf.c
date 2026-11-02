@@ -492,9 +492,34 @@ static bool queue_retry(struct pfs_cgrp_ctx *cgc, u64 cgid)
 	return true;
 }
 
+/*
+ * Wake a CPU for a task that was just admitted, preferring the one it last ran
+ * on while that one is idle.
+ *
+ * A parked task is re-admitted into the shared DSQ and then any idle CPU is
+ * woken to consume it, with no regard for where the task's cache is. Under a
+ * limit that happens on every park and wake: measured on pgbench TPC-B at a
+ * 4-CPU limit, scx_pfs parks a backend 6-7 times and migrates it 9.1-9.2 times
+ * per transaction, against 0.14-0.19 for CFS bandwidth control on the same
+ * kernel, and reaches 5,772 tps against CFS's 9,222.
+ *
+ * The task stays in the shared DSQ either way, so whichever CPU gets there
+ * first still runs it and a busy previous CPU costs it nothing: this only
+ * changes which CPU is woken, not where the task may run. Dispatching to
+ * SCX_DSQ_LOCAL_ON of the previous CPU instead would pin it and trade
+ * utilisation for locality, which is the wrong trade for a group that has few
+ * slots; if the measurement says locality is worth more than that, it is the
+ * next thing to try.
+ */
 static void kick_idle_cpu(struct task_struct *p)
 {
-	s32 cpu;
+	s32 cpu, prev = scx_bpf_task_cpu(p);
+
+	if (prev >= 0 && bpf_cpumask_test_cpu(prev, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev)) {
+		scx_bpf_kick_cpu(prev, SCX_KICK_IDLE);
+		return;
+	}
 
 	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
 	if (cpu >= 0)
