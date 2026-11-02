@@ -108,46 +108,97 @@ enum pfs_state {
 	PFS_PARKING,	/* running task which gave its slots back */
 };
 
-enum pfs_stat {
-	PFS_STAT_ADMIT,		/* slots taken for a task */
-	PFS_STAT_PARK_FULL,	/* waits: no free slot */
-	PFS_STAT_PARK_BUDGET,	/* waits: no budget */
-	PFS_STAT_PARK_FIFO,	/* waits: others wait already */
-	PFS_STAT_PARK_DEBT,	/* slot refused: the group ran beyond its limit */
-	PFS_STAT_ROTATE,	/* gave its slots back at the end of a slice */
-	PFS_STAT_HANDOFF,	/* waiting task pulled to the CPU that freed slots */
-	PFS_STAT_HANDOFF_LOCAL,	/* ... which was already on that CPU */
-	PFS_STAT_INPLACE,	/* waiting task admitted on its own CPU */
-	PFS_STAT_RETRY,		/* retry runs */
-	PFS_STAT_PULL,		/* newly idle pulls */
-	PFS_STAT_PUSH,		/* pushes */
-	PFS_STAT_KICK,		/* idle CPUs kicked */
-	PFS_STAT_CREDIT,	/* admitted without slots, in the kernel */
-	PFS_STAT_USER_PARK,	/* parked or rotated on the way to user space */
-	PFS_STAT_YIELD,		/* yielded: gives its slots back at user return */
-	PFS_STAT_BALANCE,	/* tasks moved by the periodic balancer */
-	PFS_STAT_SLOT_NS,	/* runtime of tasks holding slots, ns */
-	PFS_STAT_CREDIT_NS,	/* runtime of tasks of limited groups on credit, ns */
-	PFS_STAT_CORE_RELEASE,	/* slots given up by tasks of a forced idle CPU */
-	PFS_NR_STATS,
+/*
+ * Counters of the kernel scheduler, printed by name in the debugfs "stats"
+ * file, see pfs_stats_show(). The PFS_K_ prefix keeps them out of the way of
+ * the BPF scheduler's own enum pfs_stat_idx in tools/sched_ext/scx_pfs.h,
+ * whose enumerators spell the same things with different values: with
+ * CONFIG_DEBUG_INFO_BTF=y the kernel ones land in vmlinux BTF, where a name
+ * shared with the BPF enum is a redefinition clang refuses. Keep the two
+ * prefixes apart when adding counters on either side.
+ */
+enum pfs_k_stat {
+	PFS_K_STAT_ADMIT,		/* slots taken for a task */
+	PFS_K_STAT_PARK_FULL,		/* waits: no free slot */
+	PFS_K_STAT_PARK_BUDGET,		/* waits: no budget */
+	PFS_K_STAT_PARK_FIFO,		/* waits: others wait already */
+	PFS_K_STAT_PARK_DEBT,		/* slot refused: the group ran beyond its limit */
+	PFS_K_STAT_ROTATE,		/* gave its slots back at the end of a slice */
+	PFS_K_STAT_HANDOFF,		/* waiting task pulled to the CPU that freed slots */
+	PFS_K_STAT_HANDOFF_LOCAL,	/* ... which was already on that CPU */
+	PFS_K_STAT_INPLACE,		/* waiting task admitted on its own CPU */
+	PFS_K_STAT_RETRY,		/* retry runs */
+	PFS_K_STAT_PULL,		/* newly idle pulls */
+	PFS_K_STAT_PUSH,		/* pushes */
+	PFS_K_STAT_KICK,		/* idle CPUs kicked */
+	PFS_K_STAT_CREDIT,		/* admitted without slots, in the kernel */
+	PFS_K_STAT_USER_PARK,		/* parked or rotated on the way to user space */
+	PFS_K_STAT_YIELD,		/* yielded: gives its slots back at user return */
+	PFS_K_STAT_BALANCE,		/* tasks moved by the periodic balancer */
+	PFS_K_STAT_SLOT_NS,		/* runtime of tasks holding slots, ns */
+	PFS_K_STAT_CREDIT_NS,		/* runtime of tasks of limited groups on credit, ns */
+	PFS_K_STAT_CORE_RELEASE,	/* slots given up by tasks of a forced idle CPU */
+	PFS_K_NR_STATS,
 };
 
-static const char * const pfs_stat_names[PFS_NR_STATS] = {
+static const char * const pfs_stat_names[PFS_K_NR_STATS] = {
 	"admit", "park_full", "park_budget", "park_fifo", "park_debt", "rotate", "handoff",
 	"handoff_local", "inplace", "retry", "pull", "push", "kick", "credit",
 	"user_park", "yield", "balance", "slot_ns", "credit_ns", "core_release",
 };
 
-static DEFINE_PER_CPU(unsigned long [PFS_NR_STATS], pfs_stats);
+static DEFINE_PER_CPU(unsigned long [PFS_K_NR_STATS], pfs_stats);
 
-static inline void pfs_stat(enum pfs_stat idx)
+static inline void pfs_stat(enum pfs_k_stat idx)
 {
 	this_cpu_inc(pfs_stats[idx]);
 }
 
-static inline void pfs_stat_add(enum pfs_stat idx, u64 val)
+static inline void pfs_stat_add(enum pfs_k_stat idx, u64 val)
 {
 	this_cpu_add(pfs_stats[idx], val);
+}
+
+/*
+ * Slot index at which a refusal of pfs_take_slot() is counted; indices at or
+ * above it share the last bucket. A limited level hands out ceil(limit)
+ * slots, see pfs_width(), so this covers limits below nine CPUs exactly.
+ */
+#define PFS_K_SLOT_IDX_MAX	8
+
+/*
+ * Why pfs_take_slot() refused a slot, and whether the refused slot was one
+ * of the floor(limit) guaranteed slots or the fractional one above them.
+ * park_debt alone cannot tell those apart, and the debt gate does refuse
+ * guaranteed slots: it runs for taken + 1 >= floor(limit), i.e. also for the
+ * last full slot, and for every index once the debt reached its cap. The
+ * budget gate runs only for taken >= floor(limit), so a budget refusal is
+ * never of a guaranteed slot and has no second class here.
+ */
+enum pfs_k_refuse {
+	PFS_K_REFUSE_BUDGET,		/* no tokens for the fractional slot */
+	PFS_K_REFUSE_DEBT_GUAR,		/* over the limit, taken < floor(limit) */
+	PFS_K_REFUSE_DEBT_FRAC,		/* over the limit, taken >= floor(limit) */
+	PFS_K_NR_REFUSE,
+};
+
+static const char * const pfs_refuse_names[PFS_K_NR_REFUSE] = {
+	"refuse_budget_frac", "refuse_debt_guar", "refuse_debt_frac",
+};
+
+/* buckets per reason: the indices 0..PFS_K_SLOT_IDX_MAX-1 and one for the rest */
+#define PFS_K_REFUSE_BUCKETS	(PFS_K_SLOT_IDX_MAX + 1)
+#define PFS_K_NR_REFUSALS	(PFS_K_NR_REFUSE * PFS_K_REFUSE_BUCKETS)
+
+/* flat, like pfs_stats above: [reason * PFS_K_REFUSE_BUCKETS + slot index] */
+static DEFINE_PER_CPU(unsigned long [PFS_K_NR_REFUSALS], pfs_refusals);
+
+/* Count one refusal of the slot at index @taken, see pfs_take_slot(). */
+static inline void pfs_refuse_stat(enum pfs_k_refuse reason, unsigned int taken)
+{
+	unsigned int idx = min_t(unsigned int, taken, PFS_K_SLOT_IDX_MAX);
+
+	this_cpu_inc(pfs_refusals[reason * PFS_K_REFUSE_BUCKETS + idx]);
 }
 
 /* groups with a limit; while there are none, admission is a no-op */
@@ -733,6 +784,7 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 				 PFS_MIN_BUDGET_NS);
 		if (!left || left < min_left) {
 			/* the window timer retries, see pfs_arm_window_timer() */
+			pfs_refuse_stat(PFS_K_REFUSE_BUDGET, taken);
 			atomic_dec(&lg->nr_slots);
 			return PFS_RES_BUDGET;
 		}
@@ -749,7 +801,10 @@ static enum pfs_reserve pfs_take_slot(struct pfs_group *lg, u64 now,
 		u64 excess = pfs_over_limit(lg, now);
 
 		if (excess) {
-			pfs_stat(PFS_STAT_PARK_DEBT);
+			pfs_stat(PFS_K_STAT_PARK_DEBT);
+			pfs_refuse_stat(taken < limit / 1000 ?
+					PFS_K_REFUSE_DEBT_GUAR :
+					PFS_K_REFUSE_DEBT_FRAC, taken);
 			atomic_dec(&lg->nr_slots);
 			/*
 			 * Retry when the full slots, if any, would have paid
@@ -841,7 +896,7 @@ static enum pfs_reserve pfs_reserve(struct task_struct *p, struct pfs_group *g,
 	}
 
 	if (mask)
-		pfs_stat(PFS_STAT_ADMIT);
+		pfs_stat(PFS_K_STAT_ADMIT);
 	pe->slot_mask = mask;
 	pe->unslotted = 0;
 	pe->woken = 0;
@@ -1123,7 +1178,7 @@ static void pfs_kick_cpu(int cpu)
 	/* not from a CPU going offline, see pfs_queue_retry() */
 	if (unlikely(!cpu_active(smp_processor_id())))
 		return;
-	pfs_stat(PFS_STAT_KICK);
+	pfs_stat(PFS_K_STAT_KICK);
 	cpumask_set_cpu(cpu, this_cpu_ptr(&pfs_kick_mask));
 	irq_work_queue(this_cpu_ptr(&pfs_kick_work));
 }
@@ -1182,17 +1237,17 @@ static void pfs_waiter_linked(struct pfs_group *lg, enum pfs_reserve why)
 {
 	switch (why) {
 	case PFS_RES_BUDGET:
-		pfs_stat(PFS_STAT_PARK_BUDGET);
+		pfs_stat(PFS_K_STAT_PARK_BUDGET);
 		pfs_arm_window_timer(lg, 0, 0);
 		break;
 	case PFS_RES_DEBT:
 		/* pfs_take_slot() counted it and armed the timer */
 		break;
 	case PFS_RES_FIFO:
-		pfs_stat(PFS_STAT_PARK_FIFO);
+		pfs_stat(PFS_K_STAT_PARK_FIFO);
 		break;
 	default:
-		pfs_stat(PFS_STAT_PARK_FULL);
+		pfs_stat(PFS_K_STAT_PARK_FULL);
 		break;
 	}
 
@@ -1430,7 +1485,7 @@ static void pfs_admit_in_place(struct rq *rq, struct task_struct *p)
 {
 	int cpu;
 
-	pfs_stat(PFS_STAT_INPLACE);
+	pfs_stat(PFS_K_STAT_INPLACE);
 	pfs_unpark(rq, p);
 	pfs_queue_task(rq, p, 0);
 	wakeup_preempt(rq, p, 0);
@@ -1454,7 +1509,7 @@ static void pfs_group_retry(struct pfs_group *lg)
 {
 	int n;
 
-	pfs_stat(PFS_STAT_RETRY);
+	pfs_stat(PFS_K_STAT_RETRY);
 	for (n = 0; n < PFS_RETRY_MAX; n++) {
 		struct task_struct *p;
 		struct rq_flags rf;
@@ -1894,7 +1949,7 @@ static void pfs_admit_credit(struct rq *rq, struct task_struct *p, int flags)
 
 	lockdep_assert_rq_held(rq);
 
-	pfs_stat(PFS_STAT_CREDIT);
+	pfs_stat(PFS_K_STAT_CREDIT);
 	pe->grp = task_pfs_group(p);
 	pe->unslotted = 1;
 	pe->woken = !!(flags & ENQUEUE_WAKEUP);
@@ -2034,7 +2089,7 @@ static void pfs_user_workfn(struct callback_head *work)
 	if (pfs_must_run(p))
 		goto unlock;
 
-	pfs_stat(PFS_STAT_USER_PARK);
+	pfs_stat(PFS_K_STAT_USER_PARK);
 	pe->rotate = 1;
 	resched_curr(rq);
 unlock:
@@ -2100,14 +2155,14 @@ static void pfs_flush_charge(struct task_struct *p)
 	pe->charge_pending = 0;
 	if (pe->slot_mask) {
 		pfs_charge(pe->grp, pending);
-		pfs_stat_add(PFS_STAT_SLOT_NS, pending);
+		pfs_stat_add(PFS_K_STAT_SLOT_NS, pending);
 	} else if (atomic_read(&pfs_nr_limited) &&
 		   pfs_charge(task_pfs_group(p), pending)) {
 		/*
 		 * On credit, or switching out after giving its slots back:
 		 * beyond the slots, but it counts all the same.
 		 */
-		pfs_stat_add(PFS_STAT_CREDIT_NS, pending);
+		pfs_stat_add(PFS_K_STAT_CREDIT_NS, pending);
 	}
 }
 
@@ -2297,7 +2352,7 @@ static void yield_task_pfs(struct rq *rq)
 	if (pe->slot_mask && atomic_read(&pfs_nr_limited) &&
 	    pfs_yield_rotates(curr)) {
 		pfs_request_user_park(curr);
-		pfs_stat(PFS_STAT_YIELD);
+		pfs_stat(PFS_K_STAT_YIELD);
 	}
 
 	if (unlikely(rq->nr_running == 1))
@@ -2624,7 +2679,7 @@ static void pfs_core_release_slots(struct rq *rq)
 			pe->run_limit = 0;
 			pfs_put_slots(pe->grp, mask, true);
 			pfs_request_user_park(p);
-			pfs_stat(PFS_STAT_CORE_RELEASE);
+			pfs_stat(PFS_K_STAT_CORE_RELEASE);
 		}
 	}
 }
@@ -2891,7 +2946,7 @@ static int pfs_newidle(struct rq *this_rq, struct rq_flags *rf)
 	p = pfs_pick_migratable(src, this_cpu, ULONG_MAX);
 	if (p) {
 		move_queued_task_locked(src, this_rq, p);
-		pfs_stat(PFS_STAT_PULL);
+		pfs_stat(PFS_K_STAT_PULL);
 		pulled = 1;
 	}
 	double_unlock_balance(this_rq, src);
@@ -3234,7 +3289,7 @@ static int pfs_detach_attach(struct rq *this_rq, struct rq *src, long imbalance)
 			continue;
 		imbalance -= pe->weight.weight;
 		move_queued_task_locked(src, this_rq, p);
-		pfs_stat(PFS_STAT_BALANCE);
+		pfs_stat(PFS_K_STAT_BALANCE);
 		moved++;
 	}
 	return moved;
@@ -3384,7 +3439,7 @@ static void pfs_push(struct rq *rq)
 	if (task_rq(p) == rq && task_on_rq_queued(p) && p->pfs.on_tree &&
 	    pfs_can_migrate(rq, p, cpu)) {
 		move_queued_task_locked(rq, dst, p);
-		pfs_stat(PFS_STAT_PUSH);
+		pfs_stat(PFS_K_STAT_PUSH);
 	}
 	double_unlock_balance(rq, dst);
 	put_task_struct(p);
@@ -3419,7 +3474,7 @@ static void pfs_rotate_out(struct rq *rq, struct task_struct *prev)
 	pfs_unqueue_task(rq, prev, 0);
 	pfs_release_slots(rq, prev, true);
 	pe->state = PFS_PARKING;
-	pfs_stat(PFS_STAT_ROTATE);
+	pfs_stat(PFS_K_STAT_ROTATE);
 
 	/*
 	 * A task cut short in the burst it woke up for (e.g. by the budget of
@@ -3475,7 +3530,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 				if (ret > 0) {
 					pfs_unpark(rq, p);
 					pfs_queue_task(rq, p, 0);
-					pfs_stat(PFS_STAT_HANDOFF_LOCAL);
+					pfs_stat(PFS_K_STAT_HANDOFF_LOCAL);
 					got = 1;
 				}
 				continue;
@@ -3503,7 +3558,7 @@ static int pfs_handoff(struct rq *rq, struct rq_flags *rf)
 					deactivate_task(src, p, 0);
 					set_task_cpu(p, this_cpu);
 					activate_task(rq, p, 0);
-					pfs_stat(PFS_STAT_HANDOFF);
+					pfs_stat(PFS_K_STAT_HANDOFF);
 					got = 1;
 				}
 			} else if (sched_task_cpu_allowed(p, cpu_of(src))) {
@@ -3750,19 +3805,36 @@ struct task_struct *pfs_get_dying_waiter(struct rq *rq)
 
 static int pfs_stats_show(struct seq_file *m, void *v)
 {
-	unsigned long sum[PFS_NR_STATS] = { };
+	unsigned long refuse[PFS_K_NR_REFUSALS] = { };
+	unsigned long sum[PFS_K_NR_STATS] = { };
 	unsigned int nr_waiting = 0;
-	int cpu, i;
+	int cpu, i, j;
 
 	for_each_possible_cpu(cpu) {
-		for (i = 0; i < PFS_NR_STATS; i++)
+		for (i = 0; i < PFS_K_NR_STATS; i++)
 			sum[i] += per_cpu(pfs_stats, cpu)[i];
+		for (i = 0; i < PFS_K_NR_REFUSALS; i++)
+			refuse[i] += per_cpu(pfs_refusals, cpu)[i];
 		nr_waiting += READ_ONCE(cpu_rq(cpu)->pfs.nr_waiting);
 	}
 	seq_printf(m, "enabled %d\nlimited_groups %d\nwaiting %u\n",
 		   pfs_enabled() ? 1 : 0, atomic_read(&pfs_nr_limited), nr_waiting);
-	for (i = 0; i < PFS_NR_STATS; i++)
+	for (i = 0; i < PFS_K_NR_STATS; i++)
 		seq_printf(m, "%s %lu\n", pfs_stat_names[i], sum[i]);
+	/*
+	 * Appended after the counters above, which keep their labels, order
+	 * and one-value-per-line form: <reason>_<slot index> for the indices
+	 * below PFS_K_SLOT_IDX_MAX and <reason>_hi for the rest. A reader
+	 * wanting only the old fields is unaffected.
+	 */
+	for (i = 0; i < PFS_K_NR_REFUSE; i++) {
+		unsigned long *r = &refuse[i * PFS_K_REFUSE_BUCKETS];
+
+		for (j = 0; j < PFS_K_SLOT_IDX_MAX; j++)
+			seq_printf(m, "%s_%d %lu\n", pfs_refuse_names[i], j, r[j]);
+		seq_printf(m, "%s_hi %lu\n", pfs_refuse_names[i],
+			   r[PFS_K_SLOT_IDX_MAX]);
+	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(pfs_stats);

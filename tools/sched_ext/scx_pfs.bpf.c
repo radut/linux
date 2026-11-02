@@ -375,6 +375,32 @@ static void stat_inc(enum pfs_stat_idx idx)
 		(*cnt_p)++;
 }
 
+/*
+ * Refusals of take_slot() by reason and slot index, see slot_refuse_inc().
+ * A flat array, not a per-CPU one like stats above: this is read inside a
+ * measurement bracket, where reading a per-CPU array of this many entries
+ * costs 0.5-1.1 s on a machine with many CPUs, enough to skew the rates
+ * measured around it, while a flat array reads in milliseconds. Refusals
+ * are the exceptional path, so the atomic add that a shared counter needs
+ * costs nothing that matters and keeps the count exact.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, PFS_NR_SLOT_REFUSE);
+} slot_refuse SEC(".maps");
+
+static void slot_refuse_inc(enum pfs_refuse_idx reason, u64 taken)
+{
+	u32 idx = (u32)reason * PFS_REFUSE_BUCKETS +
+		  (taken < PFS_SLOT_IDX_MAX ? (u32)taken : PFS_SLOT_IDX_MAX);
+	u64 *cnt_p = bpf_map_lookup_elem(&slot_refuse, &idx);
+
+	if (cnt_p)
+		__sync_fetch_and_add(cnt_p, 1);
+}
+
 static u64 div_round_up(u64 dividend, u64 divisor)
 {
 	return (dividend + divisor - 1) / divisor;
@@ -762,6 +788,7 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 
 	if (taken >= full && !budget_left(cgc, now, slicep)) {
 		__sync_fetch_and_sub(&cgc->nr_slots, 1);
+		slot_refuse_inc(PFS_REFUSE_BUDGET, taken);
 		return RESERVE_BUDGET;
 	}
 
@@ -770,6 +797,8 @@ static enum reserve_result take_slot(struct pfs_cgrp_ctx *cgc, u64 now,
 	    over_limit(cgc, now)) {
 		__sync_fetch_and_sub(&cgc->nr_slots, 1);
 		stat_inc(PFS_STAT_PARK_DEBT);
+		slot_refuse_inc(taken < full ? PFS_REFUSE_DEBT_GUAR :
+				PFS_REFUSE_DEBT_FRAC, taken);
 		return RESERVE_BUDGET;
 	}
 

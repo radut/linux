@@ -129,6 +129,42 @@ static void read_stats(struct scx_pfs *skel, __u64 *stats)
 	}
 }
 
+static const char * const refuse_names[PFS_NR_REFUSE] = {
+	"refuse_budget_frac", "refuse_debt_guar", "refuse_debt_frac",
+};
+
+/*
+ * The per-slot-index refusals of take_slot(), one line per reason, as
+ * <reason>_<slot index>=<count> for the indices below PFS_SLOT_IDX_MAX and
+ * <reason>_hi=<count> for the rest. refuse_debt_guar_<i> counts refusals of
+ * a guaranteed slot, i.e. one at an index below floor(limit).
+ *
+ * A flat array, so this is 27 single-value lookups and costs milliseconds,
+ * unlike the per-CPU stats map above.
+ */
+static void print_slot_refuse(struct scx_pfs *skel)
+{
+	int fd = bpf_map__fd(skel->maps.slot_refuse);
+	__u32 reason, idx;
+
+	for (reason = 0; reason < PFS_NR_REFUSE; reason++) {
+		for (idx = 0; idx < PFS_REFUSE_BUCKETS; idx++) {
+			__u32 key = reason * PFS_REFUSE_BUCKETS + idx;
+			__u64 cnt = 0;
+
+			if (bpf_map_lookup_elem(fd, &key, &cnt))
+				cnt = 0;
+			if (idx < PFS_SLOT_IDX_MAX)
+				printf("%s%s_%u=%llu", idx ? " " : "",
+				       refuse_names[reason], idx,
+				       (unsigned long long)cnt);
+			else
+				printf(" %s_hi=%llu\n", refuse_names[reason],
+				       (unsigned long long)cnt);
+		}
+	}
+}
+
 static void print_stats(struct scx_pfs *skel)
 {
 	__u64 stats[PFS_NR_STATS];
@@ -154,6 +190,8 @@ static void print_stats(struct scx_pfs *skel)
 	       stats[PFS_STAT_DRAIN_FAIL], stats[PFS_STAT_NO_DSQ],
 	       stats[PFS_STAT_PARK_RACE], stats[PFS_STAT_PARK_DEBT],
 	       stats[PFS_STAT_HOTPLUG], stats[PFS_STAT_YIELD_CREDIT]);
+	/* appended: the fields above keep their order and spelling */
+	print_slot_refuse(skel);
 	fflush(stdout);
 }
 
