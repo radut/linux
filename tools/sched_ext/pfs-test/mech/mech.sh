@@ -23,6 +23,13 @@ RTAG=${RTAG:-}
 # unset environment is unchanged. ARMS_M2="cfs scx3 scx3b" (or "scx3 scx3b") is the WITHIN-boot
 # way to compare two scx_pfs builds; point PFS_SCXBIN_scx3 and PFS_SCXBIN_scx3b at them.
 ARMS_M1=${ARMS_M1:-kpfs}
+# Which families to boot. "m1 m2" is what the mechanism phase has always run, so an unset
+# environment is unchanged; a targeted rerun of ONE question boots only its family instead of
+# paying for the other's 8 minutes. An unknown name is fatal rather than a silent no-op: a
+# typo here would otherwise produce a run with no boots and a result file with no rows, which
+# reads like a clean result instead of like nothing having happened.
+FAMS=${FAMS:-"m1 m2"}
+for f in $FAMS; do case $f in m1|m2) ;; *) echo "ABORT: FAMS names unknown family '$f' (m1, m2)"; echo MECH-DONE; exit 1 ;; esac; done
 ARMS_M2=${ARMS_M2:-"cfs scx3"}
 LIMITS=${LIMITS:-"4 4.001 2 2.001"}
 # IDENTITY of what is being measured, parameterised and READ rather than asserted. The defaults
@@ -107,8 +114,11 @@ EOG
 	echo "D boot=$name load_before=\"$l_before\" load_after=\"$(cut -d' ' -f1-3 /proc/loadavg)\"" >> $O/$name.txt
 }
 
-boot "m1-kpfs$RTAG" "sched_pfs=1" $ARMS_M1
-boot "m2-f1$RTAG"   ""            $ARMS_M2
+case " $FAMS " in *" m1 "*) boot "m1-kpfs$RTAG" "sched_pfs=1" $ARMS_M1 ;; esac
+case " $FAMS " in *" m2 "*) boot "m2-f1$RTAG"   ""            $ARMS_M2 ;; esac
 echo "=== rows collected ==="
-grep -ch '^R ' $O/*.txt 2>/dev/null | paste -sd+ | bc 2>/dev/null
+# Counted without a glob that can match nothing and without "grep -c", which PRINTS 0 and EXITS 1
+# on no-match: the earlier "grep -ch ... | paste -sd+ | bc" fed bc an empty string and printed a
+# blank line where a 0 belongs, and a blank count is indistinguishable from a count of zero.
+cat $O/*$RTAG.txt 2>/dev/null | grep -c '^R ' || true
 echo MECH-DONE $(date -u +%T)

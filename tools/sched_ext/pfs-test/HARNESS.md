@@ -30,6 +30,7 @@ these from the environment:
 | `PFS_SCXBIN_<arm>` | that one arm's binary instead, e.g. `PFS_SCXBIN_scx3` | falls back to `PFS_SCXBIN` |
 | `PFS_IMG_KWIDTH` | the kwidth kernel build, for `run-calib.sh`'s family f3 | `$PFS_WORK/fix3/b-pkgkwidth4` |
 | `ARMS_M1`, `ARMS_M2` | which arms `mech.sh`/`mech-make.sh` run per family | `kpfs`, `cfs scx3` |
+| `FAMS` | which `mech.sh` families to boot; an unknown name aborts rather than booting nothing | `m1 m2` |
 
 A script that needs one of the required variables fails immediately with the
 message in its `${VAR:?...}` expansion rather than falling back to a guess.
