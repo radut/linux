@@ -465,6 +465,27 @@ struct cfs_bandwidth {
 	struct hrtimer		slack_timer;
 	struct list_head	throttled_cfs_rq;
 
+	/*
+	 * Width mode, see account_cfs_rq_width(): at most width_slots cfs_rqs
+	 * of the group run at once, plus one rate limited extra slot which
+	 * runs on the group's tokens, up to width_depth of them.
+	 */
+	u8			width;
+	u8			width_extra;
+	u8			width_extra_busy;
+	u8			width_throttled; /* a cfs_rq waited in this window */
+	int			width_slots;
+	int			width_active;
+	u64			width_budget;	/* quota beyond the slots per window */
+	u64			width_depth;
+	ktime_t			width_window;
+	/* usage against the limit; a debt, if negative, is paid back first */
+	atomic64_t		width_runtime;	/* charged since width_settled */
+	u64			width_settled;
+	s64			width_tokens;
+	u64			width_debt_max;
+	u64			width_margin;
+
 	/* Statistics: */
 	int			nr_periods;
 	int			nr_throttled;
@@ -769,6 +790,11 @@ struct cfs_rq {
 	u64			throttled_clock_self_time;
 	bool			throttled:1;
 	bool			pelt_clock_throttled:1;
+	u8			width_enabled;
+	u8			width_slot;
+	u8			width_woken;
+	u64			width_used;
+	u64			width_charge;	/* not yet in cfs_b->width_runtime */
 	int			throttle_count;
 	struct list_head	throttled_list;
 	struct list_head	throttled_csd_list;
@@ -3514,6 +3540,14 @@ extern void init_dl_rq(struct dl_rq *dl_rq);
 
 extern void cfs_bandwidth_usage_inc(void);
 extern void cfs_bandwidth_usage_dec(void);
+
+#ifdef CONFIG_CFS_BANDWIDTH
+extern bool cfs_width_mode(void);
+extern void cfs_width_usage_inc(void);
+extern void cfs_width_usage_dec(void);
+extern void cfs_width_config(struct cfs_bandwidth *cfs_b, bool width);
+extern void cfs_width_config_rq(struct cfs_rq *cfs_rq, bool width);
+#endif
 
 #ifdef CONFIG_NO_HZ_COMMON
 
