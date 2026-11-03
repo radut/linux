@@ -1,0 +1,27 @@
+// conc.bt CGID: on-CPU time of the threads in cgroup CGID (cgroup v2 id = inode of the dir) or its direct
+// children (container scopes), from sched_switch. Prints busy ns and traced ns on exit (SIGINT or timeout).
+// Every second: T <ns since start> @busy: <cumulative busy ns>.
+// avg concurrency = busy / traced = CPUs used, independent of cpu.stat accounting.
+BEGIN { @t0 = nsecs; }
+rawtracepoint:sched_switch
+{
+	$p = (struct task_struct *)arg1;
+	$n = (struct task_struct *)arg2;
+	$pc = $p->cgroups->dfl_cgrp;
+	$nc = $n->cgroups->dfl_cgrp;
+	$now = nsecs;
+	if ($pc->kn->id == $1 || $pc->self.parent->cgroup->kn->id == $1) {
+		if (@st[cpu] > 0) { @busy = sum($now - @st[cpu]); @sw = count(); }
+	}
+	if ($nc->kn->id == $1 || $nc->self.parent->cgroup->kn->id == $1) { @st[cpu] = $now; } else { @st[cpu] = 0; }
+}
+interval:s:1
+{
+	printf("T %lu ", nsecs - @t0); print(@busy);
+}
+END
+{
+	printf("conc_traced_ns=%lu\n", nsecs - @t0);
+	print(@busy); print(@sw);
+	clear(@st); delete(@t0);
+}

@@ -1,0 +1,20 @@
+// conc2.bt CGID: on-CPU time of the tasks of cgroup CGID (v2 id = inode of the dir), from sched_switch: the time
+// between two switches on a CPU belongs to the task switched out, whose cgroup is the "cgroup" builtin there.
+// No struct access, so it needs neither BTF nor kernel headers. Every 100 ms: T <ns since start> and the cumulative @busy. Prints traced ns and busy ns on exit.
+BEGIN { @t0 = nsecs; }
+tracepoint:sched:sched_switch
+{
+	$now = nsecs;
+	if (@last[cpu] > 0 && cgroup == $1) { @busy = sum($now - @last[cpu]); }
+	@last[cpu] = $now;
+}
+interval:ms:100
+{
+	printf("T %lu\n", nsecs - @t0); print(@busy);
+}
+END
+{
+	printf("conc_traced_ns=%lu\n", nsecs - @t0);
+	print(@busy);
+	clear(@last); delete(@t0);
+}
