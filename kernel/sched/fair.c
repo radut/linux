@@ -9928,11 +9928,19 @@ cpu_util(int cpu, struct task_struct *p, int dst_cpu, int boost)
 
 unsigned long cpu_util_cfs(int cpu)
 {
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		return cpu_util_pfs(cpu);
+#endif
 	return cpu_util(cpu, NULL, -1, 0);
 }
 
 unsigned long cpu_util_cfs_boost(int cpu)
 {
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		return cpu_util_pfs(cpu);
+#endif
 	return cpu_util(cpu, NULL, -1, 1);
 }
 
@@ -11993,6 +12001,11 @@ static inline bool others_have_blocked(struct rq *rq)
 
 	if (cpu_util_irq(rq))
 		return true;
+
+#ifdef CONFIG_SCHED_PFS
+	if (READ_ONCE(rq->avg_pfs.util_avg))
+		return true;
+#endif
 
 	return false;
 }
@@ -14960,6 +14973,13 @@ static void nohz_balancer_kick(struct rq *rq)
 		flags = NOHZ_STATS_KICK;
 
 	/*
+	 * PFS has no tasks in the fair class to balance, but idle CPUs still
+	 * need their blocked load (rt, dl, irq, pfs) decayed for schedutil.
+	 */
+	if (pfs_enabled())
+		goto out;
+
+	/*
 	 * Most of the time system is not 100% busy. i.e nohz.nr_cpus > 0
 	 * Skip the read if time is not due.
 	 *
@@ -15519,6 +15539,18 @@ static __latent_entropy void sched_balance_softirq(void)
 {
 	struct rq *this_rq = this_rq();
 	enum cpu_idle_type idle = this_rq->idle_balance;
+
+	/*
+	 * PFS replaces the fair class and runs its own balancer; the NOHZ
+	 * idle balance only updates the blocked load of idle CPUs then, see
+	 * nohz_balancer_kick().
+	 */
+	if (pfs_enabled()) {
+		nohz_idle_balance(this_rq, idle);
+		sched_balance_update_blocked_averages(this_rq->cpu);
+		pfs_balance_softirq();
+		return;
+	}
 	/*
 	 * If this CPU has a pending NOHZ_BALANCE_KICK, then do the
 	 * balancing on behalf of the other idle CPUs whose ticks are
@@ -15540,6 +15572,10 @@ static __latent_entropy void sched_balance_softirq(void)
  */
 void sched_balance_trigger(struct rq *rq)
 {
+	/* PFS balances its tasks on its own */
+	if (pfs_enabled())
+		pfs_balance_trigger(rq);
+
 	/*
 	 * Don't need to rebalance while attached to NULL domain or
 	 * runqueue CPU is not active
@@ -15547,7 +15583,7 @@ void sched_balance_trigger(struct rq *rq)
 	if (unlikely(on_null_domain(rq) || !cpu_active(cpu_of(rq))))
 		return;
 
-	if (time_after_eq(jiffies, rq->next_balance))
+	if (!pfs_enabled() && time_after_eq(jiffies, rq->next_balance))
 		raise_softirq(SCHED_SOFTIRQ);
 
 	nohz_balancer_kick(rq);

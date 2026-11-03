@@ -359,6 +359,27 @@ int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
 	return 0;
 }
 
+#ifdef CONFIG_SCHED_PFS
+/*
+ * pfs:
+ *
+ *   util_sum = cpu_scale * load_sum
+ *   util_avg = util_sum / divider
+ *
+ * As for rt_rq, the utilization of PFS tasks on a CPU is tracked as one
+ * signal of the run queue, there is no per-task PELT under PFS.
+ */
+int update_pfs_rq_load_avg(u64 now, struct rq *rq, int running)
+{
+	if (___update_load_sum(now, &rq->avg_pfs, running, running, running)) {
+		___update_load_avg(&rq->avg_pfs, 1);
+		return 1;
+	}
+
+	return 0;
+}
+#endif
+
 /*
  * dl_rq:
  *
@@ -480,11 +501,19 @@ bool update_other_load_avgs(struct rq *rq)
 	const struct sched_class *curr_class = rq->donor->sched_class;
 	unsigned long hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
 
+	bool decayed = false;
+
 	lockdep_assert_rq_held(rq);
+
+#ifdef CONFIG_SCHED_PFS
+	if (pfs_enabled())
+		decayed = update_pfs_rq_load_avg(now, rq,
+						 curr_class == &pfs_sched_class);
+#endif
 
 	/* hw_pressure doesn't care about invariance */
 	return update_rt_rq_load_avg(now, rq, curr_class == &rt_sched_class) |
 		update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
 		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
-		update_irq_load_avg(rq, 0);
+		update_irq_load_avg(rq, 0) | decayed;
 }

@@ -255,8 +255,13 @@ static inline bool prio_less(const struct task_struct *a,
 		return !dl_time_before(a_dl->deadline, b_dl->deadline);
 	}
 
-	if (pa == MAX_RT_PRIO + MAX_NICE)	/* fair */
+	if (pa == MAX_RT_PRIO + MAX_NICE) {	/* fair */
+#ifdef CONFIG_SCHED_PFS
+		if (pfs_enabled())
+			return pfs_prio_less(a, b, in_fi);
+#endif
 		return cfs_prio_less(a, b, in_fi);
+	}
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 	if (pa == MAX_RT_PRIO + MAX_NICE + 1)	/* ext */
@@ -1471,6 +1476,9 @@ bool sched_can_stop_tick(struct rq *rq)
 	if (scx_enabled() && !scx_can_stop_tick(rq))
 		return false;
 
+	if (pfs_enabled() && !pfs_can_stop_tick(rq))
+		return false;
+
 	if (rq->cfs.h_nr_queued > 1)
 		return false;
 
@@ -2570,6 +2578,14 @@ static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 	return cpu_online(cpu);
 }
 
+#ifdef CONFIG_SCHED_PFS
+/* is_cpu_allowed() for PFS, which admits tasks to a CPU's tree. */
+bool sched_task_cpu_allowed(struct task_struct *p, int cpu)
+{
+	return is_cpu_allowed(p, cpu);
+}
+#endif
+
 /*
  * This is how migration works:
  *
@@ -3567,6 +3583,10 @@ void kick_process(struct task_struct *p)
 {
 	guard(preempt)();
 	int cpu = task_cpu(p);
+
+	/* a task waiting for a PFS slot is TASK_RUNNING, not woken up */
+	if (pfs_enabled())
+		pfs_kick_waiter(p);
 
 	if ((cpu != smp_processor_id()) && task_curr(p))
 		smp_send_reschedule(cpu);
@@ -4674,6 +4694,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 #ifdef CONFIG_SCHED_CLASS_EXT
 	init_scx_entity(&p->scx);
 #endif
+	pfs_init_entity(p);
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
@@ -4926,7 +4947,7 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 		p->sched_class = &ext_sched_class;
 #endif
 	} else {
-		p->sched_class = &fair_sched_class;
+		p->sched_class = normal_sched_class();
 	}
 
 	init_entity_runnable_average(&p->se);
@@ -5874,6 +5895,7 @@ void sched_tick(void)
 	if (curr->flags & PF_WQ_WORKER)
 		wq_worker_tick(curr);
 
+	/* PFS balances in sched_balance_trigger(), sched_ext can't be on */
 	if (!scx_switched_all()) {
 		rq->idle_balance = idle_cpu(cpu);
 		sched_balance_trigger(rq);
@@ -6208,7 +6230,7 @@ __pick_next_task(struct rq *rq, struct rq_flags *rf)
 
 	rq->dl_server = NULL;
 
-	if (scx_enabled())
+	if (scx_enabled() || pfs_enabled())
 		goto restart;
 
 	/*
@@ -7688,7 +7710,7 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 		return &ext_sched_class;
 #endif
 
-	return &fair_sched_class;
+	return normal_sched_class();
 }
 
 #ifdef CONFIG_RT_MUTEXES
@@ -8826,6 +8848,51 @@ static void dump_rq_tasks(struct rq *rq, const char *loglvl)
 	}
 }
 
+#ifdef CONFIG_SCHED_PFS
+/*
+ * Tasks waiting for a PFS slot are not on the CPU's run queue tree and are
+ * not pushed away by balance_push(). Move the ones still assigned to the dying
+ * CPU to a CPU they may run on, where they are admitted or wait again. Runs on
+ * the dying CPU from stop_machine(), with interrupts disabled.
+ */
+static void pfs_migrate_dying_waiters(unsigned int cpu)
+{
+	struct task_struct *p;
+	struct rq_flags rf;
+	struct rq *rq;
+
+	if (!pfs_enabled())
+		return;
+
+	lockdep_assert_irqs_disabled();
+
+	while ((p = pfs_get_dying_waiter(cpu_rq(cpu)))) {
+		bool moved = false;
+		int dest_cpu;
+
+		raw_spin_lock(&p->pi_lock);
+		/* may change the affinity, which takes the rq lock: not held yet */
+		dest_cpu = select_fallback_rq(cpu, p);
+		rq = cpu_rq(cpu);
+		rq_lock(rq, &rf);
+		update_rq_clock(rq);
+		if (task_rq(p) == rq && task_on_rq_queued(p) && !task_on_cpu(rq, p) &&
+		    dest_cpu != cpu) {
+			rq = __migrate_task(rq, &rf, p, dest_cpu);
+			moved = task_cpu(p) != cpu;
+		}
+		rq_unlock(rq, &rf);
+		raw_spin_unlock(&p->pi_lock);
+		put_task_struct(p);
+
+		if (WARN_ON_ONCE(!moved))
+			break;
+	}
+}
+#else
+static inline void pfs_migrate_dying_waiters(unsigned int cpu) { }
+#endif
+
 int sched_cpu_dying(unsigned int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -8833,6 +8900,7 @@ int sched_cpu_dying(unsigned int cpu)
 
 	/* Handle pending wakeups and then migrate everything off */
 	sched_tick_stop(cpu);
+	pfs_migrate_dying_waiters(cpu);
 
 	rq_lock_irqsave(rq, &rf);
 	update_rq_clock(rq);
@@ -8923,6 +8991,7 @@ void __init sched_init(void)
 	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
 	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
 #endif
+	pfs_boot_enable();
 
 	wait_bit_init();
 
@@ -8931,6 +9000,7 @@ void __init sched_init(void)
 
 	root_task_group.shares = ROOT_TASK_GROUP_LOAD;
 	init_cfs_bandwidth(&root_task_group.cfs_bandwidth, NULL);
+	pfs_init_group(&root_task_group, NULL);
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 #ifdef CONFIG_EXT_GROUP_SCHED
 	scx_tg_init(&root_task_group);
@@ -9036,7 +9106,8 @@ void __init sched_init(void)
 #endif
 		hrtick_rq_init(rq);
 		atomic_set(&rq->nr_iowait, 0);
-		fair_server_init(rq);
+		if (!pfs_init_rq(rq))
+			fair_server_init(rq);
 #ifdef CONFIG_SCHED_CLASS_EXT
 		ext_server_init(rq);
 #endif
@@ -9343,6 +9414,7 @@ static inline void alloc_uclamp_sched_group(struct task_group *tg,
 
 static void sched_free_group(struct task_group *tg)
 {
+	pfs_free_group(tg);
 	free_fair_sched_group(tg);
 	free_rt_sched_group(tg);
 	autogroup_free(tg);
@@ -9373,6 +9445,8 @@ struct task_group *sched_create_group(struct task_group *parent)
 	tg = kmem_cache_alloc(task_group_cache, GFP_KERNEL | __GFP_ZERO);
 	if (!tg)
 		return ERR_PTR(-ENOMEM);
+
+	pfs_init_group(tg, parent);
 
 	if (!alloc_fair_sched_group(tg, parent))
 		goto err;
@@ -9456,6 +9530,8 @@ static void sched_change_group(struct task_struct *tsk)
 	tg = container_of(task_css_check(tsk, cpu_cgrp_id, true),
 			  struct task_group, css);
 	tg = autogroup_task_group(tsk, tg);
+	if (pfs_enabled())
+		pfs_task_change_group(tsk);
 	tsk->sched_task_group = tg;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -9560,6 +9636,7 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 {
 	struct task_group *tg = css_tg(css);
 
+	pfs_offline_group(tg);
 	/*
 	 * Relies on the RCU grace period between css_released() and this.
 	 */
@@ -9790,9 +9867,11 @@ static int cpu_shares_write_u64(struct cgroup_subsys_state *css,
 	if (shareval > scale_load_down(ULONG_MAX))
 		shareval = MAX_SHARES;
 	ret = sched_group_set_shares(css_tg(css), scale_load(shareval));
-	if (!ret)
+	if (!ret) {
 		scx_group_set_weight(css_tg(css),
 				     sched_weight_to_cgroup(shareval));
+		pfs_group_set_weight(css_tg(css));
+	}
 	return ret;
 }
 
@@ -10010,10 +10089,17 @@ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
 {
 	struct task_group *tg = css_tg(seq_css(sf));
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+	struct pfs_throttle_stat st = {
+		.nr_periods = cfs_b->nr_periods,
+		.nr_throttled = cfs_b->nr_throttled,
+		.throttled_ns = cfs_b->throttled_time,
+	};
 
-	seq_printf(sf, "nr_periods %d\n", cfs_b->nr_periods);
-	seq_printf(sf, "nr_throttled %d\n", cfs_b->nr_throttled);
-	seq_printf(sf, "throttled_time %llu\n", cfs_b->throttled_time);
+	/* PFS holds tasks back by its own limits, see sched-pfs.rst */
+	pfs_group_throttle_stat(tg, &st);
+	seq_printf(sf, "nr_periods %d\n", st.nr_periods);
+	seq_printf(sf, "nr_throttled %d\n", st.nr_throttled);
+	seq_printf(sf, "throttled_time %llu\n", st.throttled_ns);
 
 	if (schedstat_enabled() && tg != &root_task_group) {
 		struct sched_statistics *stats;
@@ -10136,8 +10222,10 @@ static int tg_set_bandwidth(struct task_group *tg,
 #ifdef CONFIG_CFS_BANDWIDTH
 	ret = tg_set_cfs_bandwidth(tg, period_us, quota_us, burst_us);
 #endif /* CONFIG_CFS_BANDWIDTH */
-	if (!ret)
+	if (!ret) {
 		scx_group_set_bandwidth(tg, period_us, quota_us, burst_us);
+		pfs_group_set_bandwidth(tg, period_us, quota_us, burst_us);
+	}
 	return ret;
 }
 
@@ -10351,9 +10439,16 @@ static int cpu_extra_stat_show(struct seq_file *sf,
 	{
 		struct task_group *tg = css_tg(css);
 		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+		struct pfs_throttle_stat st = {
+			.nr_periods = cfs_b->nr_periods,
+			.nr_throttled = cfs_b->nr_throttled,
+			.throttled_ns = cfs_b->throttled_time,
+		};
 		u64 throttled_usec, burst_usec;
 
-		throttled_usec = cfs_b->throttled_time;
+		/* PFS holds tasks back by its own limits, see sched-pfs.rst */
+		pfs_group_throttle_stat(tg, &st);
+		throttled_usec = st.throttled_ns;
 		do_div(throttled_usec, NSEC_PER_USEC);
 		burst_usec = cfs_b->burst_time;
 		do_div(burst_usec, NSEC_PER_USEC);
@@ -10363,7 +10458,7 @@ static int cpu_extra_stat_show(struct seq_file *sf,
 			   "throttled_usec %llu\n"
 			   "nr_bursts %d\n"
 			   "burst_usec %llu\n",
-			   cfs_b->nr_periods, cfs_b->nr_throttled,
+			   st.nr_periods, st.nr_throttled,
 			   throttled_usec, cfs_b->nr_burst, burst_usec);
 	}
 #endif /* CONFIG_CFS_BANDWIDTH */
@@ -10408,8 +10503,10 @@ static int cpu_weight_write_u64(struct cgroup_subsys_state *css,
 	weight = sched_weight_from_cgroup(cgrp_weight);
 
 	ret = sched_group_set_shares(css_tg(css), scale_load(weight));
-	if (!ret)
+	if (!ret) {
 		scx_group_set_weight(css_tg(css), cgrp_weight);
+		pfs_group_set_weight(css_tg(css));
+	}
 	return ret;
 }
 
@@ -10445,9 +10542,11 @@ static int cpu_weight_nice_write_s64(struct cgroup_subsys_state *css,
 	weight = sched_prio_to_weight[idx];
 
 	ret = sched_group_set_shares(css_tg(css), scale_load(weight));
-	if (!ret)
+	if (!ret) {
 		scx_group_set_weight(css_tg(css),
 				     sched_weight_to_cgroup(weight));
+		pfs_group_set_weight(css_tg(css));
+	}
 	return ret;
 }
 #endif /* CONFIG_GROUP_SCHED_WEIGHT */
