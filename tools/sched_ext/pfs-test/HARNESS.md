@@ -286,6 +286,41 @@ Three things to take from it:
   somewhere else. For that arm the throttling signal is only in the loader's own
   counters.
 
+### Which resource binds: slots or budget, and why it decides the answer
+
+A kPFS group that does not reach its limit is in one of two states, and almost every
+question about a shortfall - including "does the extra slot help?" - has the opposite
+answer in each. Do not infer the state from the park totals; read it.
+
+Sample `/sys/kernel/debug/sched/pfs/groups` at 100 Hz. The columns are
+`limit_mcpu slots waiting tokens_us weight hweight active path`, and `slots` is
+**occupancy** (`atomic_read(&g->nr_slots)`), not the configured width. **The sign of
+`tokens_us` is the whole test:** positive means the group has budget left and is
+limited by slots, negative means it is in debt and is limited by budget.
+
+| | slot-bound | budget-bound |
+|---|---|---|
+| example | limit 4 | limit 2 |
+| bucket | 31-37 ms of the 40 ms *unspent* | averages 21.7 ms in debt |
+| occupancy | all 4 busy in 83-89% of samples, 1.4-1.5 waiting | never even reaches 3 |
+| delivery | 3.52-3.62 of 4 - short | 1.99 of 2 - full |
+| budget-refusal counter | exactly 0 | fires, 737k over 6 cells |
+| parks come from | slot-full 194k, queue 652k | the debt gate |
+
+Two consequences worth stating because both have already been got wrong here:
+
+* **A zero budget-refusal counter at an integer limit is not a dead counter.** The debt
+  gate also requires the group to be over its limit, and a slot-bound group never is. So
+  "the gate fires 737k times at a limit of 2 and never at a limit of 4" needs no
+  round-up/round-down explanation - the two cells are simply in different states.
+* **The slot-bound state is itself the limit-4 shortfall.** The group runs out of slots
+  while holding budget it cannot reach, which is why delivery falls short with throttling
+  at 0.1/s and a throttled fraction of 0.000. Nothing is withholding the CPU.
+
+Magnitudes above come from one boot per family on a local 8-CPU `virtme-ng` guest, so
+treat the mechanism as established and the sizes as provisional; the shortfall itself
+reproduces on both 16-CPU nodes (95.9% / 96.5% read-only, 98.2% / 98.5% TPC-B).
+
 ### `calib/delivery.py` - the reduction that needs no position balance
 
 Delivered CPU is an absolute measurement of one arm against its own cgroup limit, not a
