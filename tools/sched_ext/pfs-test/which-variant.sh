@@ -54,10 +54,10 @@ verdict() {
 # grep -q, not "grep -c ... -eq 1": grep -c PRINTS 0 and EXITS 1 on no-match,
 # which makes a count of zero and a failed command the same thing.
 if grep -qw sched_pfs=1 "$CMDLINE" 2>/dev/null; then
-	if [ -d $PFSD ]; then
+	if [ -d "$PFSD" ]; then
 		say "  /proc/cmdline       sched_pfs=1"
 		say "  $PFSD  exists, so the class registered"
-		w=$(cat $PFSD/window_us 2>/dev/null) || w=
+		w=$(cat "$PFSD/window_us" 2>/dev/null) || w=
 		[ -n "${w:-}" ] && say "  window_us           $w"
 		verdict kPFS "  watch: cat $PFSD/stats, groups, waiters"
 	fi
@@ -74,12 +74,12 @@ if grep -qw sched_pfs=1 "$CMDLINE" 2>/dev/null; then
 fi
 
 # ------------------------------------------------------------- 2. scx_pfs
-st=$(cat $SCX/state 2>/dev/null) || st=
+st=$(cat "$SCX/state" 2>/dev/null) || st=
 if [ "${st:-}" = enabled ]; then
-	ops=$(cat $SCX/root/ops 2>/dev/null) || ops=
+	ops=$(cat "$SCX/root/ops" 2>/dev/null) || ops=
 	say "  $SCX/state  enabled"
 	say "  scheduler           ${ops:-unknown}"
-	rej=$(cat $SCX/root/nr_rejected 2>/dev/null) || rej=
+	rej=$(cat "$SCX/root/nr_rejected" 2>/dev/null) || rej=
 	[ -n "${rej:-}" ] && say "  nr_rejected         $rej"
 	say "  note: cpu.stat throttling fields stay ZERO under a BPF scheduler;"
 	say "        read the loader's counters (-i, and -S FILE per cgroup) instead"
@@ -91,13 +91,13 @@ if [ "${st:-}" = enabled ]; then
 fi
 
 # -------------------------------------------------------------- 3. kwidth
-if [ -r $KW ]; then
-	w=$(cat $KW 2>/dev/null) || w=
+if [ -r "$KW" ]; then
+	w=$(cat "$KW" 2>/dev/null) || w=
 	if [ "${w:-}" = 1 ]; then
 		say "  $KW  1"
 		verdict kwidth "  watch: cpu.stat in the cgroup, as for cfs"
 	fi
-	say "  $KW  ${w:-unreadable}"
+	say "  $KW  ${w:-(readable but empty)}"
 else
 	say "  $KW  absent, so this kernel has no width mode"
 fi

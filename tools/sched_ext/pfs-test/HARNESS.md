@@ -277,6 +277,42 @@ Two numbers it will not print:
   them on any cell is called out, because a counter that is never incremented looks
   exactly like one that had nothing to count.
 
+### `which-variant.sh`, and the test that covers its precedence
+
+`which-variant.sh` answers "what is enforcing `cpu.max` on this machine" in the
+four reads that `VARIANTS.md` explains, printing the evidence and then the
+variant name on a line of its own, so `$(which-variant.sh -q)` is the name and
+nothing else.
+
+Its four paths come from the environment (`WV_PFSD`, `WV_SCX`, `WV_KW`,
+`WV_CMDLINE`) for exactly one reason: so that every branch can be exercised
+against fixtures. Nothing in normal use overrides them.
+
+`which-variant-test.sh` does that. It needs no root, no kernel features, no
+network, and exits non-zero on the first wrong answer. The branches it covers
+that no single machine can show are the **precedence** ones, where the width
+sysctl reads `1` while something else is running the tasks:
+
+| fixture | answer | why it is not `kwidth` |
+|---------|--------|------------------------|
+| width=1, `sched_pfs=1`, pfs debugfs present | `kPFS` | the fair class, which the sysctl steers, is not what runs the tasks |
+| width=1, `sched_ext/state` = `enabled` | `scx_pfs` | the same, for the BPF scheduler |
+| width=1, `sched_ext/state` = `disabled` | `kwidth` | sched_ext present but not attached must fall through, not match on the file existing |
+
+A checker that read the cheap sysctl first would answer `kwidth` for the first
+two with every file reading exactly as it should. That is why the order in
+`VARIANTS.md` is normative and why these three cases have a test rather than a
+sentence.
+
+One expectation in that test is uid-dependent, and it is the interesting one.
+With `sched_pfs=1` on the boot line and no pfs debugfs, a **root** caller gets
+`cfs`, because the absence is conclusive; a **non-root** caller gets
+`kPFS-unconfirmed`, because it cannot tell "the directory is not there" from "I
+am not allowed to look", and those mean opposite things. The test asserts the
+right one for the uid it runs as and says when the other is not exercised. An
+earlier version of it expected `cfs` at any uid and failed: the script was
+right and the test was wrong.
+
 ### The four variants, and the `kwidth` arm
 
 All four implementations of the same policy are reachable from one kernel image,
