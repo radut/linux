@@ -20,6 +20,13 @@ own, `CONFIG_SCHED_PFS`, booted with `sched_pfs=1`, see
 no variant of its own: on a `sched_pfs=1` boot the `cfs` variant measures
 kPFS. The results below label those runs kPFS.
 
+**[VARIANTS.md](VARIANTS.md) is the guide to all four**: how to select each one
+from Kubernetes, Docker, systemd or plain cgroups, how to verify it is really
+the one running, and what each reports while it limits you. `./which-variant.sh`
+answers that last question on the machine in front of you - including the case
+where `cpu.stat` shows no throttling because a BPF scheduler is not writing
+those fields, rather than because nothing is being throttled.
+
 ## Requirements
 
 - cgroup v2 (`stat -fc %T /sys/fs/cgroup` prints `cgroup2fs`), root.
