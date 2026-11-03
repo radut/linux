@@ -250,6 +250,33 @@ so prints two guard lines, `role=f1f2` for the PFS build and `role=f3` for the
 boot** used rather than a global. No driver in the tree asserts a commit any
 more.
 
+### `calib/delivery.py` - the reduction that needs no position balance
+
+Delivered CPU is an absolute measurement of one arm against its own cgroup limit, not a
+contrast between two arms, so it is valid in a run with any number of arms - including the
+three-arm runs `mech.sh` refuses to contrast. Those runs are not wasted; they are delivery
+runs, and `ALLOW_UNBALANCED=1` is how you ask for one on purpose.
+
+```
+python3 calib/delivery.py <resdir>
+```
+
+Per arm and cell: delivered CPU against the limit, throttle events per second, the
+throttled fraction, and **work per delivered CPU** - the column that separates "did not
+get the CPU it was allowed" from "got it and did less with it". Then a per-arm summary:
+worst and mean delivery, how many cells fall below 95%, and the mean throttle rate.
+
+Two numbers it will not print:
+
+* **`n/a`, not `0.0`, for a sched_ext arm's throttling.** Loading a BPF scheduler takes the
+  tasks out of the fair class, so the CFS bandwidth counters cannot move. `cpu.stat` still
+  *holds* a zero, and `mech-pg.sh` duly records it, so "the field is missing" is the wrong
+  test. A printed `0.0` there would read as "never throttled" when it means "not accounted
+  here". The rule is structural and named in `NO_CPU_STAT_THR`.
+* **An unflagged all-zero column.** An arm that does report those fields and never moved
+  them on any cell is called out, because a counter that is never incremented looks
+  exactly like one that had nothing to count.
+
 ### The four variants, and the `kwidth` arm
 
 All four implementations of the same policy are reachable from one kernel image,
