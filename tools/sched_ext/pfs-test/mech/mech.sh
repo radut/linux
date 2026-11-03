@@ -31,7 +31,22 @@ ARMS_M1=${ARMS_M1:-kpfs}
 FAMS=${FAMS:-"m1 m2"}
 for f in $FAMS; do case $f in m1|m2) ;; *) echo "ABORT: FAMS names unknown family '$f' (m1, m2)"; echo MECH-DONE; exit 1 ;; esac; done
 ARMS_M2=${ARMS_M2:-"cfs scx3"}
+# Arm names are checked HERE, before a boot is paid for, and against the same list mech-guest.sh
+# accepts. mech-guest.sh does abort on an unknown arm, but only after the guest has booted, so a
+# typo in ARMS_M2 costs a boot and lands a result file holding a warm-up and nothing else.
+for a in $ARMS_M1 $ARMS_M2; do
+	case $a in cfs|kwidth|kpfs|scx3|scx3b) ;;
+	*) echo "ABORT: unknown arm '$a' (cfs, kwidth, kpfs, scx3, scx3b)"; echo MECH-DONE; exit 1 ;; esac
+done
+# kwidth and kpfs are the two arms that are only valid in one family: kwidth needs the fair class
+# to be what runs the group, kpfs needs sched_pfs=1. Caught here for the same reason.
+case " $ARMS_M1 " in *" kwidth "*|*" cfs "*|*" scx3 "*|*" scx3b "*)
+	echo "ABORT: ARMS_M1 is the sched_pfs=1 boot and takes only kpfs, not '$ARMS_M1'"; echo MECH-DONE; exit 1 ;; esac
+case " $ARMS_M2 " in *" kpfs "*)
+	echo "ABORT: kpfs needs a sched_pfs=1 boot, so it belongs in ARMS_M1, not ARMS_M2"; echo MECH-DONE; exit 1 ;; esac
 LIMITS=${LIMITS:-"4 4.001 2 2.001"}
+# Clients per cell. 16 is what mech-guest.sh has always defaulted to, so an unset CL is unchanged.
+CL=${CL:-16}
 # IDENTITY of what is being measured, parameterised and READ rather than asserted. The defaults
 # are the paths this harness has always used, so an existing deployment is unaffected; set the
 # variables to measure a different build without filing its rows under a directory named for
@@ -65,7 +80,7 @@ provof() {
 	printf 'img=%s release=%s release_src=%s bzimage_sha=%s scxbin=%s scxbin_sha=%s' \
 		"$1" "$rel" "$src" "$(sha256sum "$1/arch/x86/boot/bzImage" | cut -c1-16)" \
 		"$SCXBIN" "$(sha256sum "$SCXBIN" | cut -c1-16)"; }
-echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s rtag=${RTAG:-none} limits=$LIMITS arms_m1=\"$ARMS_M1\" arms_m2=\"$ARMS_M2\""
+echo "OUT=$O mem=$MEM gate_max=${GATE_MAX}s rtag=${RTAG:-none} limits=$LIMITS cl=$CL arms_m1=\"$ARMS_M1\" arms_m2=\"$ARMS_M2\""
 [ -f "$IMG/arch/x86/boot/bzImage" ] || { echo "ABORT: no bzImage at $IMG"; echo MECH-DONE; exit 1; }
 [ -x "$SCXBIN" ] || { echo "ABORT: no scx_pfs binary at $SCXBIN"; echo MECH-DONE; exit 1; }
 PROV="$(provof "$IMG")"
@@ -73,6 +88,7 @@ echo "guard: $PROV"
 
 boot() { # NAME KARGS ARMS...
 	local name=$1 kargs=$2; shift 2
+	local nargs=$#
 	while [ "$(ps -eo comm | grep -c qemu-system)" -ne 0 ]; do sleep 30; done
 	local waited=0
 	until [ "$(awk '{print ($1 < 6.0)}' /proc/loadavg)" = 1 ]; do
@@ -91,16 +107,25 @@ boot() { # NAME KARGS ARMS...
 	# guest through vng --exec, and every guest-side script requires it.
 	printf 'env PFS_WORK=%s bash %s/fix3/calib/warmup-guest.sh %s/%s-warmup\n' \
 		"$S" "$S" "$O" "$name" >> $O/$name.guest.sh
+	# CL is baked in for exactly the reason LIMITS is: the host environment does not reach the guest
+	# through "vng --exec", so a CL set on the host was silently dropped and every cell ran at
+	# mech-guest.sh's default of 16 clients. That made the client count unmeasurable from here -
+	# the "scale" dimension of the test plan - while looking like it was being set.
 	for a in "$@"; do
-		printf 'env PFS_WORK=%s BIN=%s LIMITS=%s bash %s/fix3/mech/mech-guest.sh %s %s/%s-%s\n' \
-			"$S" "$(armbin $a)" "'$LIMITS'" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
+		printf 'env PFS_WORK=%s BIN=%s LIMITS=%s CL=%s bash %s/fix3/mech/mech-guest.sh %s %s/%s-%s\n' \
+			"$S" "$(armbin $a)" "'$LIMITS'" "$CL" "$S" "$a" "$O" "$name" "$a" >> $O/$name.guest.sh
 	done
 	cat > $O/$name.run.sh <<EOG
 cd $IMG
 exec vng --run $IMG --user root --cpus 8 --memory $MEM --rwdir=$S --append "$kargs" --exec "bash $O/$name.guest.sh"
 EOG
-	# 2400 s, not 1800: eight cells per arm against the calibration's four, and m2 runs two arms.
-	timeout -k 10 2400 script -q -f -e -c "sg kvm -c 'bash $O/$name.run.sh'" $O/$name.console < /dev/null > /dev/null 2>&1
+	# The timeout SCALES with the arm count instead of being the constant 2400 it was. That constant
+	# was sized for "eight cells per arm, m2 runs two arms", so it was correct only at two arms: a
+	# third arm in one boot (cfs, kwidth and scx3 together) would be killed part-way through the
+	# last one, and a killed boot loses every row it had already produced. 600 + 900 per arm
+	# reproduces 2400 exactly at two arms, so every existing run is timed as before.
+	local btmo=${BOOT_TIMEOUT:-$((600 + 900 * nargs))}
+	timeout -k 10 "$btmo" script -q -f -e -c "sg kvm -c 'bash $O/$name.run.sh'" $O/$name.console < /dev/null > /dev/null 2>&1
 	local rc=$?
 	cp $O/$name.console $O/$name.txt 2>/dev/null
 	# The result file carries its own provenance, so a later reader never has to trust a

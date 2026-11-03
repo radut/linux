@@ -31,6 +31,8 @@ these from the environment:
 | `PFS_IMG_KWIDTH` | the kwidth kernel build, for `run-calib.sh`'s family f3 | `$PFS_WORK/fix3/b-pkgkwidth4` |
 | `ARMS_M1`, `ARMS_M2` | which arms `mech.sh`/`mech-make.sh` run per family | `kpfs`, `cfs scx3` |
 | `FAMS` | which `mech.sh` families to boot; an unknown name aborts rather than booting nothing | `m1 m2` |
+| `CL` | clients per cell, passed into the guest by `mech.sh` | `16` |
+| `BOOT_TIMEOUT` | seconds one `mech.sh` boot may take; the default scales with the arm count | `600 + 900 x arms` |
 
 A script that needs one of the required variables fails immediately with the
 message in its `${VAR:?...}` expansion rather than falling back to a guess.
@@ -234,12 +236,12 @@ The row is inert to every analysis script: it does not match `^D arm=`, nor
 **Per-arm binaries.** `mech-guest.sh` takes the binary from `BIN` in the
 environment and bakes no path in, and `mech-pg.sh` never looks at it at all, so
 pointing one arm at its own build needs no change to the call chain:
-`PFS_SCXBIN_scx3=<path>` is enough. Two scx builds in **one boot** additionally
-need a second arm name, and `mech-guest.sh` does not accept one yet - it aborts
-with `R ABORT: unknown arm` on anything but `cfs`, `scx3` and `kpfs`, and the
-per-arm output directory is keyed on the arm name, so the same name twice would
-collide. Until that is extended, two builds are compared across two boots of
-the same family rather than within one.
+`PFS_SCXBIN_scx3=<path>` is enough. The arms `mech-guest.sh` accepts are `cfs`,
+`kwidth`, `kpfs`, `scx3` and `scx3b`; anything else is `R ABORT: unknown arm`.
+`mech.sh` checks the names itself **before** it pays for a boot, and also
+rejects the two placements that cannot work - `kpfs` outside the `sched_pfs=1`
+family, and anything but `kpfs` inside it. The per-arm output directory is keyed
+on the arm name, so the same name twice in one family would collide.
 
 `mech2.sh`, `calib/run-calib.sh` and `calib/seqtest.sh` take the same
 variables and print the same measured guard. `run-calib.sh` boots two images and
@@ -247,6 +249,48 @@ so prints two guard lines, `role=f1f2` for the PFS build and `role=f3` for the
 `PFS_IMG_KWIDTH` build, and each boot's `D prov` row carries the image **that
 boot** used rather than a global. No driver in the tree asserts a commit any
 more.
+
+### The four variants, and the `kwidth` arm
+
+All four implementations of the same policy are reachable from one kernel image,
+because `b-kpfs10` carries both `CONFIG_SCHED_PFS` and the width-mode sysctl:
+
+| arm | family | what enforces `cpu.max` | how it is selected |
+|-----|--------|-------------------------|--------------------|
+| `cfs` | `m2` (plain boot) | stock CFS bandwidth control | `sched_cfs_bandwidth_width=0` |
+| `kwidth` | `m2` (plain boot) | the width policy inside CFS bandwidth control, v1 | `sched_cfs_bandwidth_width=1` |
+| `scx3` | `m2` (plain boot) | `scx_pfs`, a sched_ext BPF scheduler | the loader attaches |
+| `kpfs` | `m1` (`sched_pfs=1`) | `CONFIG_SCHED_PFS`, a scheduling class | the boot parameter |
+
+`cfs` and `kwidth` differ **only** in that sysctl, so the contrast between them
+is the width policy and nothing else, measured inside one boot against the same
+Postgres instance.
+
+Three ways the `kwidth` arm could quietly measure stock CFS and publish it under
+the kwidth label, each of them fatal rather than reported:
+
+* the kernel does not carry the patch, so `/proc/sys/kernel/sched_cfs_bandwidth_width`
+  does not exist - `R ABORT: ... this kernel has no width mode`;
+* the file exists but the write did not take - the arm **reads the sysctl back**
+  and requires `1`;
+* the boot is a `sched_pfs=1` boot, where the fair class is not what runs the
+  group and the sysctl governs nothing - refused before the cells run.
+
+The `cfs` arm reads the sysctl back the same way and requires `0`, because the
+`kwidth` arm of the same boot can have left it at `1`. For the same reason
+`kwidth` restores it to `0` when its cells are done: without that the arm
+**order** would decide whether a boot completed, which is not a property a
+harness should have.
+
+```
+ARMS_M2="cfs kwidth scx3" LIMITS="1 1.5 2 2.5 3 3.5 4" CL=32 \
+  bash mech/mech.sh <outdir>
+```
+
+That is three arms in one boot. The boot timeout is no longer the constant
+`2400` that was sized for two of them - it is `600 + 900` per arm, which
+reproduces `2400` at two arms exactly, so nothing already measured was timed
+differently. `BOOT_TIMEOUT` overrides it.
 
 ### Comparing two scheduler builds inside one boot
 

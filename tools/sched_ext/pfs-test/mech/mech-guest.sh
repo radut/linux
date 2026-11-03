@@ -37,7 +37,27 @@ scx3|scx3b)
 	echo "D arm=$ARM scx_state=$st stats_file=$SF log=$SCXL"
 	[ "$st" = enabled ] || { echo "R ABORT arm=$ARM: sched_ext not enabled"; exit 1; } ;;
 cfs)	[ -w $KW ] && echo 0 > $KW
-	echo "D arm=$ARM width=$(cat $KW 2>/dev/null || echo na)" ;;
+	# Read the sysctl BACK instead of trusting the write. On a kernel that carries width mode the
+	# file can already hold 1 - the kwidth arm of this same boot puts it there - and a write that
+	# did not take would measure kwidth while filing the rows under cfs. A wrong label is worse
+	# than a missing one, so this aborts rather than reports.
+	w=$(cat $KW 2>/dev/null || echo na)
+	[ "$w" = na ] || [ "$w" = 0 ] || { echo "R ABORT arm=$ARM: width mode reads '$w' after writing 0"; exit 1; }
+	echo "D arm=$ARM width=$w" ;;
+kwidth)	# v1: the same concurrency-cap policy as scx_pfs and kPFS, but inside CFS bandwidth control,
+	# switched on by the sysctl the width-mode patch adds. Three ways this arm could quietly
+	# measure stock CFS and publish the rows as kwidth, each fatal here rather than reported:
+	#   * the kernel does not carry the patch        -> the file does not exist
+	#   * the file exists but the write did not take -> read it back and require 1
+	#   * this is a sched_pfs=1 boot                 -> the fair class is not what runs the group,
+	#                                                   so the sysctl governs nothing at all
+	grep -qw sched_pfs=1 /proc/cmdline && {
+		echo "R ABORT arm=$ARM: kwidth is a CFS bandwidth mode, not measurable on a sched_pfs=1 boot"; exit 1; }
+	[ -w $KW ] || { echo "R ABORT arm=$ARM: $KW absent or read-only, this kernel has no width mode"; exit 1; }
+	echo 1 > $KW 2>/dev/null
+	w=$(cat $KW 2>/dev/null || echo na)
+	[ "$w" = 1 ] || { echo "R ABORT arm=$ARM: width mode reads '$w' after writing 1"; exit 1; }
+	echo "D arm=$ARM width=$w" ;;
 kpfs)	grep -qw sched_pfs=1 /proc/cmdline || { echo "R ABORT arm=$ARM: not a sched_pfs=1 boot"; exit 1; }
 	echo "D arm=$ARM pfs=on debugfs=$([ -d /sys/kernel/debug/sched/pfs ] && echo yes || echo no)"
 	echo "D arm=$ARM features=$(cat /sys/kernel/debug/sched/pfs/features 2>/dev/null) window_us=$(cat /sys/kernel/debug/sched/pfs/window_us 2>/dev/null) burst_pct=$(cat /sys/kernel/debug/sched/pfs/burst_pct 2>/dev/null)" ;;
@@ -61,5 +81,13 @@ if [ -n "$SP" ]; then
 	# were still attached. Bounded at 10 s, and the state reached is printed either way.
 	for i in $(seq 100); do [ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" = enabled ] || break; sleep 0.1; done
 	echo "D arm=$ARM scx_unloaded state=$(cat /sys/kernel/sched_ext/state 2>/dev/null) scx_log_lines=$(wc -l < $SCXL 2>/dev/null)"
+fi
+# Arms share a boot, so an arm that changed a global leaves it as it found it. Only kwidth does:
+# without this a later cfs arm in the same boot would run with width mode still on, and the cfs
+# read-back above would abort the boot rather than measure the wrong thing - correct, but it would
+# make the arm ORDER decide whether a run completes, which is not a property a harness should have.
+if [ "$ARM" = kwidth ] && [ -w $KW ]; then
+	echo 0 > $KW 2>/dev/null
+	echo "D arm=$ARM width_restored=$(cat $KW 2>/dev/null || echo na)"
 fi
 echo "CALIB-ARM-DONE arm=$ARM"
