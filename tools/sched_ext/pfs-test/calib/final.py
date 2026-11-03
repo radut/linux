@@ -218,10 +218,18 @@ def report(rounds_dir, seq_dir):
   # entry is the within-boot contrast of two scx_pfs builds, from boots run with
   # ARMS_M2="scx3 scx3b" (two arms, so each build occupies one of the two positions the
   # two-factor fit compares).
+  # M4 and M5 are the kwidth arm inside the m2 family. The F3 entry above keys on family "f3",
+  # which is run-calib.sh's SEPARATE kwidth kernel image, so it finds no boots in a mech run and
+  # the width variant was compared across kernels. mech-guest.sh now has a kwidth arm, so cfs,
+  # kwidth and scx3 share one boot and one Postgres instance; these two surfaces are the contrasts
+  # that become available from that. M5 is the one that was never measurable at all: the same
+  # policy implemented twice, inside CFS bandwidth control and as a BPF scheduler, side by side.
   for f, ref, test, label in (("f1", "cfs", "scx3", "F1  cfs vs scx_pfs, same boot"),
                               ("f3", "cfs", "kwidth", "F3  cfs vs kwidth, same boot"),
                               ("m2", "scx3", "scx3b", "M2  scx_pfs build A vs build B, same boot"),
-                              ("m2", "cfs", "scx3", "M3  cfs vs scx_pfs, same boot (mech m2 naming)")):
+                              ("m2", "cfs", "scx3", "M3  cfs vs scx_pfs, same boot (mech m2 naming)"),
+                              ("m2", "cfs", "kwidth", "M4  cfs vs kwidth, same boot (mech m2 naming)"),
+                              ("m2", "kwidth", "scx3", "M5  kwidth vs scx_pfs, same boot")):
       d = fam(f)
       print(f"\n=== {label} ===  boots: {' '.join(sorted(d))}")
       print("\n-- position effect, pos2/pos1 of tps --")
