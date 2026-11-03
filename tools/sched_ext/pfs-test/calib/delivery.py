@@ -15,7 +15,15 @@ Four columns earn their place:
   thr/s     cpu.stat throttle events per second. The period is 100 ms, so 10/s is "once
             per period" - stock bandwidth control's normal state. Much above that means
             the group is being stopped and restarted many times inside one period.
-  thr%      fraction of the cell spent throttled, from the same counters.
+  thr_cpu   throttled cfs_rq-seconds per wall second, i.e. thr_us/1e6 divided by the measured
+            window. It is NOT a percentage and it is NOT bounded by 1: throttled_usec accumulates
+            per-cfs_rq, so a group spread over several CPUs routinely exceeds 1 (stock CFS averages
+            1.8 here, the width mode 4.2). An earlier version of this script printed it under a
+            "thr%" header, where 3.50 read as 3.5% and meant 350%.
+  leaf      the same ratio for the CONTAINER LEAF cgroup rather than the parent that carries
+            cpu.max. The two can disagree completely and the difference is a result, not noise:
+            under kPFS the limit-bearing parent accumulates no throttled time at all while the
+            leaf sits at ~1.0, because a task without a slot is parked rather than throttled.
   tps/CPU   work per delivered CPU. This is the comparison that is not confounded by a
             variant failing to take its limit: a variant can lose throughput either by
             not getting CPU or by getting it and doing less with it, and these two
@@ -55,7 +63,7 @@ FIELD = re.compile(r"(\w+)=([-\d.]+)")
 
 
 def read(path):
-    """-> [(arm, cell, limit, tps, mid_cpus, thr_n, thr_win, thr_frac, mean_running)]"""
+    """-> [(arm, cell, limit, tps, mid_cpus, thr_n, thr_win, thr_frac, mean_running, c_thr_frac)]"""
     out, arm, clients = [], None, None
     for line in open(path, errors="replace"):
         line = line.replace("\r", "")
@@ -74,7 +82,7 @@ def read(path):
         out.append((arm, f"{g['wl']}@{g['lim']} c{clients}", float(g["lim"]),
                     float(g["tps"]), float(g["mid"]),
                     f.get("thr_n"), f.get("thr_win"), f.get("thr_frac"),
-                    f.get("mean_running")))
+                    f.get("mean_running"), f.get("c_thr_frac")))
     return out
 
 
@@ -101,7 +109,7 @@ def main(argv):
     # counters cannot move, and mech-pg.sh still reads a 0 out of cpu.stat for them. Reporting that
     # 0 would say "never throttled" where the truth is "ask the loader, not cpu.stat".
     reports = {}
-    for arm, _c, _l, _t, _m, thr_n, _w, _fr, _mr in rows:
+    for arm, _c, _l, _t, _m, thr_n, _w, _fr, _mr, _lf in rows:
         reports.setdefault(arm, arm not in NO_CPU_STAT_THR and thr_n is not None)
         if thr_n is not None and arm not in NO_CPU_STAT_THR:
             reports[arm] = True
@@ -116,13 +124,15 @@ def main(argv):
             allzero.add(arm)
 
     by = {}
-    for arm, cell, lim, tps, mid, thr_n, thr_win, thr_frac, mean_run in rows:
+    for arm, cell, lim, tps, mid, thr_n, thr_win, thr_frac, mean_run, leaf in rows:
         by.setdefault((arm, cell), []).append(
-            (lim, tps, mid, fnum(thr_n), fnum(thr_win), fnum(thr_frac), fnum(mean_run)))
+            (lim, tps, mid, fnum(thr_n), fnum(thr_win), fnum(thr_frac), fnum(mean_run),
+             fnum(leaf)))
 
     print(f"boots: {len(boots)}   cells: {len(by)}   R rows: {len(rows)}")
     print(f"\n{'arm':<8} {'cell':<17} {'lim':>4} {'CPU':>6} {'deliv%':>7} "
-          f"{'thr/s':>7} {'thr%':>6} {'tps':>9} {'tps/CPU':>8} {'mean_run':>8} {'n':>3}")
+          f"{'thr/s':>7} {'thr_cpu':>7} {'leaf':>6} {'tps':>9} {'tps/CPU':>8} {'mean_run':>8} "
+          f"{'n':>3}")
     quiet = set()
     for arm, cell in sorted(by, key=lambda k: (k[0], k[1])):
         v = by[(arm, cell)]
@@ -138,8 +148,13 @@ def main(argv):
         else:
             quiet.add(arm)
             thr_s = thr_p = "n/a"
+        lf = [x[7] for x in v if x[7] is not None]
+        # The leaf is shown for EVERY arm, including the sched_ext ones. Their parent counters are
+        # not accounted, but the leaf is a separate cgroup and a separate question, so it is not
+        # covered by the n/a rule above - a measured 0.00 here is a real 0.00.
+        leaf_s = f"{st.mean(lf):.2f}" if lf else "-"
         print(f"{arm:<8} {cell:<17} {lim:>4.1f} {mid:>6.2f} {100 * mid / lim:>6.1f}% "
-              f"{thr_s:>7} {thr_p:>6} {tps:>9.0f} {tps / mid:>8.0f} "
+              f"{thr_s:>7} {thr_p:>7} {leaf_s:>6} {tps:>9.0f} {tps / mid:>8.0f} "
               f"{(f'{st.mean(mr):.2f}' if mr else '-'):>8} {len(v):>3}")
 
     # Per-arm summary over the cells, which is what answers "does this variant reach its limit".

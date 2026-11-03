@@ -250,6 +250,42 @@ so prints two guard lines, `role=f1f2` for the PFS build and `role=f3` for the
 boot** used rather than a global. No driver in the tree asserts a commit any
 more.
 
+### Two cgroups report throttling, and they disagree
+
+`mech-pg.sh` reads `cpu.stat` twice per cell: from the **parent** that carries
+`cpu.max` (`thr_*`) and from the **container leaf** below it (`c_thr_*`).
+`delivery.py` shows both, because reading only one of them has already produced
+a wrong conclusion once.
+
+| arm | parent `thr_cpu` | leaf | parent events/s |
+|-----|------------------|------|-----------------|
+| `cfs` | 0.48 - 3.50, falls as the limit rises | 0.42 - 2.72 | 9.8, once per 100 ms period |
+| `kwidth` | 2.08 - 6.25 | 2.12 avg | 98.5, ten times per period |
+| `kpfs` | **0.00 at every limit** | **0.98 - 0.99 at every limit** | 0.1 - 3.5 |
+| `scx3` | not accounted | **0.00, genuinely measured** | not accounted |
+
+Three things to take from it:
+
+* `thr_cpu` is **not a percentage and not bounded by 1**. It is
+  `throttled_usec / 1e6 / window`, and `throttled_usec` accumulates per
+  `cfs_rq`, so a group spread over several CPUs exceeds 1 routinely. An earlier
+  version of this script printed the column under a `thr%` header, where stock
+  CFS's 3.50 read as 3.5% and meant 350%.
+
+* Under kPFS the limit-bearing parent accumulates **no throttled time at all**
+  while the leaf sits at ~0.99. The leaf's figure is the same at a limit of 1
+  and at a limit of 4, and a quantity that does not move with the limit is not
+  measuring the limit: it looks like one `cfs_rq` left permanently marked
+  throttled, not like the group being stopped. Neither number on its own
+  supports "kPFS does not throttle" - the parent counts 0.1-3.5 **events** per
+  second while accumulating ~0 throttled **time**, i.e. it enters the state and
+  leaves it immediately.
+
+* The leaf is **not** a way round the sched_ext `n/a`. Under `scx3` both
+  cgroups read a real 0.00, so the parent's `n/a` is not hiding a usable signal
+  somewhere else. For that arm the throttling signal is only in the loader's own
+  counters.
+
 ### `calib/delivery.py` - the reduction that needs no position balance
 
 Delivered CPU is an absolute measurement of one arm against its own cgroup limit, not a
