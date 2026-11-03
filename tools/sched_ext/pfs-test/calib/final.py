@@ -147,22 +147,40 @@ def positions(data, arm_of):
             by.setdefault((arm, cell), {}).setdefault(pos, []).append((boot, tps))
     print(f"{'arm':<8} {'cell':<16} {'pos1 mean':>10} {'n':>3} {'pos2 mean':>10} {'n':>3} "
           f"{'pos2/pos1':>10}")
+    # Cells dropped for want of both positions are COUNTED and explained below, not just skipped.
+    # An empty table reads as "measured, no difference"; it has to read as "not analysable".
+    dropped = {}
     for (arm, cell) in sorted(by):
         s = by[(arm, cell)]
         if 1 not in s or 2 not in s:
+            dropped.setdefault(arm, set()).update(sorted(s))
             continue
         m1 = st.mean(t for _, t in s[1]); m2 = st.mean(t for _, t in s[2])
         print(f"{arm:<8} {cell:<16} {m1:>10.0f} {len(s[1]):>3} {m2:>10.0f} {len(s[2]):>3} "
               f"{m2/m1:>10.3f}")
+    if dropped:
+        print("   NOT ANALYSABLE, no cell of these arms ran in both positions 1 and 2:")
+        for arm in sorted(dropped):
+            seen = ", ".join(str(p) for p in sorted(dropped[arm]))
+            print(f"     {arm:<8} occupied position(s) {{{seen}}} only")
+        print("   Position is the arm's ordinal in the boot, so with 3+ arms the middle one is")
+        print("   always position 2 and the outer two never are. Run the arms in pairs.")
 
 
 def contrast(data, ref, test):
     cells = sorted({r[2] for rows in data.values() for r in rows})
     print(f"{'cell':<16} {'two-factor ' + test + '/' + ref:>22} {'cpu ' + ref:>9} "
           f"{'cpu ' + test:>10} {'paired':>8} {'n':>3} {'t':>7} {'p':>8}")
+    # Same reason as in positions(): a cell that cannot be fitted is named, with which of the
+    # four (arm, position) combinations the fit needed and did not get.
+    missing = {}
     for cell in cells:
         pick = lambda arm, pos: [r for b, rows in data.items() for r in rows
                                  if r[1] == arm and r[2] == cell and r[0] == pos]
+        for arm in (ref, test):
+            for pos in (1, 2):
+                if not pick(arm, pos):
+                    missing.setdefault(cell, []).append(f"{arm}@pos{pos}")
         fit, cpu = {}, {}
         ok = True
         for arm in (ref, test):
@@ -193,6 +211,11 @@ def contrast(data, ref, test):
               f"{pr:>8.3f} {len(ratios):>3} "
               f"{(f'{t:.2f}' if t is not None else '-'):>7} "
               f"{(f'{p:.4f}' if p is not None else '-'):>8}")
+    if missing:
+        print(f"   NOT ANALYSABLE for {len(missing)} of {len(cells)} cell(s): the two-factor fit "
+              f"needs {ref} and {test} each in positions 1 and 2.")
+        for cell in sorted(missing):
+            print(f"     {cell:<16} never ran: {', '.join(sorted(set(missing[cell])))}")
 
 
 def report(rounds_dir, seq_dir):

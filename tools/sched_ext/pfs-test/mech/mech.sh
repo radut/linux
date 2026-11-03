@@ -44,6 +44,28 @@ case " $ARMS_M1 " in *" kwidth "*|*" cfs "*|*" scx3 "*|*" scx3b "*)
 	echo "ABORT: ARMS_M1 is the sched_pfs=1 boot and takes only kpfs, not '$ARMS_M1'"; echo MECH-DONE; exit 1 ;; esac
 case " $ARMS_M2 " in *" kpfs "*)
 	echo "ABORT: kpfs needs a sched_pfs=1 boot, so it belongs in ARMS_M1, not ARMS_M2"; echo MECH-DONE; exit 1 ;; esac
+# AT MOST TWO ARMS PER FAMILY, because the analysis keys POSITION on the arm's ordinal within the
+# boot (calib/final.py read(), "pos + 1" per "D boot ... arm=" row) and the pre-registered
+# two-factor fit compares exactly positions 1 and 2. With three arms and the usual forward/reverse
+# rotation the outer two arms occupy positions {1,3} and the MIDDLE ONE IS ALWAYS POSITION 2, so it
+# is perfectly confounded with its position and every cell is dropped for want of both positions.
+# That run completes, reports its rows, and yields empty contrast tables - which read as "measured,
+# no difference" rather than as "not analysable". Measured the hard way: a three-arm
+# "cfs kwidth scx3" campaign produced 56 rows a round and not one contrast.
+#
+# Three arms are still the right thing for DELIVERY and THROTTLING figures, which are absolute per
+# arm and need no position balance. ALLOW_UNBALANCED=1 permits it and says what the run is good
+# for, so the choice is deliberate and recorded in the log rather than discovered afterwards.
+nm2=$(set -- $ARMS_M2; echo $#)
+if [ "$nm2" -gt 2 ] && [ "${ALLOW_UNBALANCED:-0}" != 1 ]; then
+	echo "ABORT: ARMS_M2 has $nm2 arms ('$ARMS_M2'); the position-balanced contrast takes 2."
+	echo "       With 3+ arms the middle arm is always position 2, so it cannot be separated from"
+	echo "       the position effect and final.py drops every cell. Run the pairs instead:"
+	echo "         ARMS_M2=\"cfs kwidth\"   then   ARMS_M2=\"kwidth scx3\"   then   ARMS_M2=\"cfs scx3\""
+	echo "       Set ALLOW_UNBALANCED=1 if you want delivery and throttling figures only."
+	echo MECH-DONE; exit 1
+fi
+[ "$nm2" -gt 2 ] && echo "NOTE: ALLOW_UNBALANCED=1 with $nm2 arms: delivery and throttling only, no arm contrast"
 LIMITS=${LIMITS:-"4 4.001 2 2.001"}
 # Clients per cell. 16 is what mech-guest.sh has always defaulted to, so an unset CL is unchanged.
 CL=${CL:-16}
