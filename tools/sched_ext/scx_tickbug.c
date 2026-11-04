@@ -126,16 +126,20 @@ restart:
 	       (unsigned long long)(skel->rodata->slice_ns / 1000));
 
 	if (!skel->data->timer_pinned)
-		printf("WARNING: BPF_F_TIMER_CPU_PIN not available, the release timer is not pinned\n");
+		printf("WARNING: BPF_F_TIMER_CPU_PIN not available, "
+		       "the release timer is not pinned\n");
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		__u64 released = skel->bss->nr_released;
 
 		printf("[SEQ %llu]\n", seq++);
-		printf("enq    :%10" PRIu64 "   held:%10" PRIu64 " released:%10" PRIu64 " timers:%10" PRIu64 "\n",
+		printf("enq    :%10" PRIu64 "   held:%10" PRIu64
+		       " released:%10" PRIu64 " timers:%10" PRIu64 "\n",
 		       skel->bss->nr_enq, skel->bss->nr_held,
 		       skel->bss->nr_released, skel->bss->nr_timers);
-		printf("pass   :%10" PRIu64 "  local:%10" PRIu64 "     lost:%10" PRIu64 " othrcpu:%10" PRIu64 " overflow:%10" PRIu64 "\n",
+		printf("pass   :%10" PRIu64 "  local:%10" PRIu64
+		       "     lost:%10" PRIu64 " othrcpu:%10" PRIu64
+		       " overflow:%10" PRIu64 "\n",
 		       skel->bss->nr_passthru, skel->bss->nr_locals,
 		       skel->bss->nr_lost, skel->bss->nr_other_cpu,
 		       skel->bss->nr_overflow);
