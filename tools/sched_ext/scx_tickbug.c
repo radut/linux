@@ -139,10 +139,12 @@ restart:
 		       skel->bss->nr_released, skel->bss->nr_timers);
 		printf("pass   :%10" PRIu64 "  local:%10" PRIu64
 		       "     lost:%10" PRIu64 " othrcpu:%10" PRIu64
-		       " overflow:%10" PRIu64 "\n",
+		       " overflow:%10" PRIu64 " requeue:%10" PRIu64
+		       " now:%10" PRIu64 "\n",
 		       skel->bss->nr_passthru, skel->bss->nr_locals,
 		       skel->bss->nr_lost, skel->bss->nr_other_cpu,
-		       skel->bss->nr_overflow);
+		       skel->bss->nr_overflow, skel->bss->nr_requeue,
+		       skel->bss->nr_held_now);
 		/*
 		 * The mean and the worst hold are the independent variable of
 		 * the whole experiment: without them the run proves nothing.

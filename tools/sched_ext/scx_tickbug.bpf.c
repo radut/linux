@@ -59,7 +59,15 @@ bool timer_started;
 bool release_now;
 
 u64 nr_enq, nr_held, nr_released, nr_timers;
-u64 nr_passthru, nr_locals, nr_lost, nr_other_cpu, nr_overflow;
+u64 nr_passthru, nr_locals, nr_lost, nr_other_cpu, nr_overflow, nr_requeue;
+/*
+ * How many tagged tasks are held right now. The release timer only kicks when
+ * this is non-zero: a kick with nothing held would preempt whatever is running
+ * on @target_cpu, and since that is normally the task just released, the task
+ * would lose most of its CPU to its own release mechanism. The first version of
+ * this scheduler did exactly that and reported half the usage it should.
+ */
+u64 nr_held_now;
 /* Proof that the hold actually happened, and how wide it was. */
 u64 held_at, total_held_ns, max_held_ns;
 
@@ -126,6 +134,18 @@ void BPF_STRUCT_OPS(tickbug_enqueue, struct task_struct *p, u64 enq_flags)
 			 * non-zero count here did not test what it meant to.
 			 */
 			__sync_fetch_and_add(&nr_other_cpu, 1);
+		} else if (scx_bpf_task_running(p)) {
+			/*
+			 * Already on the CPU and merely re-enqueued, e.g. after
+			 * a kthread preempted it. Holding it here would take
+			 * CPU away from work already in progress, which is not
+			 * the state under test: the hold belongs at the start
+			 * of a run, not in the middle of one. Put it straight
+			 * back so it carries on.
+			 */
+			__sync_fetch_and_add(&nr_requeue, 1);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, enq_flags);
+			return;
 		} else if (bpf_map_push_elem(&hold_q, &pid, 0)) {
 			__sync_fetch_and_add(&nr_overflow, 1);
 		} else {
@@ -137,6 +157,7 @@ void BPF_STRUCT_OPS(tickbug_enqueue, struct task_struct *p, u64 enq_flags)
 			 */
 			held_at = scx_bpf_now() ?: 1;
 			__sync_fetch_and_add(&nr_held, 1);
+			__sync_fetch_and_add(&nr_held_now, 1);
 			return;
 		}
 	}
@@ -160,6 +181,7 @@ static bool release_one(void)
 		p = bpf_task_from_pid(pid);
 		if (!p) {
 			__sync_fetch_and_add(&nr_lost, 1);
+			__sync_fetch_and_sub(&nr_held_now, 1);
 			continue;
 		}
 
@@ -172,6 +194,7 @@ static bool release_one(void)
 		    is_migration_disabled(p)) {
 			scx_bpf_dsq_insert(p, SHARED_DSQ, slice_ns, 0);
 			bpf_task_release(p);
+			__sync_fetch_and_sub(&nr_held_now, 1);
 			if (!scx_bpf_dispatch_nr_slots())
 				return false;
 			continue;
@@ -179,6 +202,7 @@ static bool release_one(void)
 
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 		bpf_task_release(p);
+		__sync_fetch_and_sub(&nr_held_now, 1);
 
 		at = held_at;
 		now = scx_bpf_now();
@@ -256,6 +280,14 @@ static int release_timerfn(void *map, int *key, struct bpf_timer *timer)
 	}
 
 	/*
+	 * Nothing held means @target_cpu is either idle with an empty run
+	 * queue or busy with the task released last time. Kicking in either
+	 * case is at best pointless and at worst preempts that task.
+	 */
+	if (!nr_held_now)
+		goto rearm;
+
+	/*
 	 * Allow one held task through and make @target_cpu notice.
 	 * SCX_KICK_PREEMPT sends a reschedule IPI, which does not go through
 	 * irq_enter() and so does not run tick_irq_exit() itself: it only ends
@@ -263,6 +295,8 @@ static int release_timerfn(void *map, int *key, struct bpf_timer *timer)
 	 */
 	release_now = true;
 	scx_bpf_kick_cpu(target_cpu, SCX_KICK_PREEMPT);
+
+rearm:
 
 	__sync_fetch_and_add(&nr_timers, 1);
 
