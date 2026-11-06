@@ -192,11 +192,14 @@ idle loop, for a length of time given on the command line. That state - the
 idle task running while the run queue is not empty - is reachable by several of
 the schedulers here, but none of them holds it long enough to observe what
 depends on it. Tasks named "spin" are parked on the target CPU's run queue and
-released only by a periodic timer; everything else runs through a shared DSQ so
-the machine stays usable.
+released only by a periodic timer. Everything else runs through a shared DSQ,
+and tasks that can run on one CPU only are dispatched to it directly, so the
+machine stays usable while the test runs.
 
-This is a test scheduler, not a policy. It exists so that the idle-time
-bookkeeping skipped by an interrupt taken in that state can be measured.
+This is a test scheduler, not a policy. It reproduces the condition that
+tick_irq_exit() handles by asking is_idle_task() rather than idle_cpu(), and
+can be used to check that handling: before that change, an interrupt taken in
+this state skipped the idle-time bookkeeping of tick_nohz_irq_exit().
 
 ## scx_flatcg
 

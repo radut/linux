@@ -25,8 +25,10 @@
  * nothing measurable accumulates. Here the only thing that releases a held
  * task is a periodic timer, so the window is hold_ns wide and can be swept.
  *
- * Only tasks named by @tag_comm are held; everything else runs through a
- * shared DSQ so the machine stays usable while the test runs. @target_cpu does
+ * Only tasks named by @tag_comm are held. Everything else runs through a
+ * shared DSQ, except a task that is allowed on a single CPU, which is
+ * dispatched there directly because @target_cpu stops consuming the shared DSQ
+ * while it holds something and no other CPU could take such a task. @target_cpu does
  * not pull from that shared DSQ while it is holding something: shared work
  * running there would take the CPU out of the state under test and make the
  * hold this scheduler reports an overestimate.
@@ -256,6 +258,23 @@ void BPF_STRUCT_OPS(tickbug_enqueue, struct task_struct *p, u64 enq_flags)
 	__sync_fetch_and_add(&nr_passthru, 1);
 
 	/*
+	 * A task that is allowed on one CPU only has to be dispatched to that
+	 * CPU's local DSQ. @target_cpu does not consume SHARED_DSQ while it is
+	 * holding a task, and no other CPU may take a task pinned to
+	 * @target_cpu, so such a task left in SHARED_DSQ would starve there
+	 * until the sched_ext watchdog unloaded the scheduler.
+	 *
+	 * This covers a task pinned to one CPU, not one pinned to a subset of
+	 * CPUs that happens to contain @target_cpu: that one is still delayed
+	 * by as long as the hold lasts, which -H bounds.
+	 */
+	if (p->nr_cpus_allowed == 1) {
+		__sync_fetch_and_add(&nr_locals, 1);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, enq_flags);
+		return;
+	}
+
+	/*
 	 * A %SCX_ENQ_LAST task stays on its own CPU. put_prev_task_scx() sets
 	 * need_resched on the incoming idle task only if the enqueue landed on
 	 * the local DSQ, so a task left in a shared DSQ here would sit there
@@ -464,7 +483,6 @@ s32 BPF_STRUCT_OPS(tickbug_init_task, struct task_struct *p,
 {
 	struct task_ctx *tctx;
 
-	/* Sleepable, so this allocation can use GFP_KERNEL. */
 	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
